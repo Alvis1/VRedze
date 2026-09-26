@@ -1,0 +1,54 @@
+[package]
+name = "smb-transport"
+description = "SMB Transport implementations for `smb-rs`"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+smb-dtyp = { workspace = true, optional = true }
+smb-msg = { workspace = true, optional = true }
+
+log = { workspace = true }
+tokio = { workspace = true, features = [
+    "net",
+    "macros",
+    "io-util",
+    "time",
+], optional = true }
+tokio-util = { workspace = true, optional = true }
+futures-core = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+
+# QUIC
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, default-features = false, optional = true }
+rustls-platform-verifier = { workspace = true, default-features = false, optional = true }
+
+# RDMA
+# async-rdma = { git = "https://github.com/afiffon/async-rdma.git", rev = "878828dd", features = [
+#     "cm",
+#     "raw",
+# ], optional = true }
+
+binrw = { workspace = true }
+modular-bitfield = { workspace = true, optional = true }
+maybe-async = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+smb-tests = { workspace = true }
+
+[features]
+default = ["async", "netbios-transport"]
+async = ["tokio", "futures-core", "futures-util"]
+is_sync = ["maybe-async/is_sync"]
+
+netbios-transport = []
+quic = ["dep:quinn", "dep:rustls", "dep:rustls-platform-verifier"]
+rdma = ["dep:smb-msg", "dep:smb-dtyp", "dep:tokio-util", "dep:modular-bitfield"] # , "dep:async-rdma"]

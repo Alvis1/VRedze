@@ -1,0 +1,774 @@
+use anyhow::Context;
+use clap::{Parser, Subcommand, ValueEnum};
+use just_video::{
+    media::{Media, Source},
+    playability::{self, Assessment, Platform, Verdict},
+    readahead::ReadAhead,
+    smb::{SmbSession, SmbUrl},
+    vr,
+};
+use serde_json::json;
+use std::{io::Read, time::Instant};
+
+/// Just Video: VR playback straight from SMB shares.
+///
+/// Inputs are `smb://[domain;]user@host[:port]/share/path` or local paths. The
+/// SMB password comes from JUST_VIDEO_SMB_PASSWORD or an interactive prompt.
+#[derive(Parser)]
+#[command(version)]
+struct Cli {
+    /// Judge playability for this device instead of the one we run on.
+    #[arg(long, value_enum, global = true)]
+    platform: Option<Platform>,
+    /// Without a command, the headset app starts (browser, then playback).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Save a server for the headset browser. Asks for the password and checks it.
+    AddServer {
+        /// `smb://[domain;]user@host[:port]`
+        url: String,
+        /// Display name (default: the host).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List saved servers.
+    Servers,
+    /// Forget a saved server (by name or URL) and its password.
+    RemoveServer { server: String },
+    /// List a share directory.
+    Ls {
+        url: String,
+        /// Probe each video file and show whether (and why not) it will play.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Show container, codec and detected VR layout.
+    Info { input: String },
+    /// Play a video in the headset (OpenXR). Ctrl-C stops.
+    Play {
+        input: String,
+        #[arg(long, value_enum, default_value_t = Hw::Auto)]
+        hw: Hw,
+        /// Override the detected projection.
+        #[arg(long, value_enum)]
+        projection: Option<ProjectionArg>,
+        /// Override the detected stereo packing.
+        #[arg(long, value_enum)]
+        stereo: Option<StereoArg>,
+        /// Swap left and right eye images.
+        #[arg(long)]
+        swap_eyes: bool,
+        /// Fisheye lens field of view in degrees.
+        #[arg(long, default_value_t = 180.0)]
+        fisheye_fov: f32,
+        /// Flat screen width in metres.
+        #[arg(long, default_value_t = 3.2)]
+        screen_width: f32,
+        /// Flat screen distance in metres.
+        #[arg(long, default_value_t = 3.0)]
+        screen_distance: f32,
+        /// Save the left eye as PNG at `--screenshot-at` seconds (for testing).
+        #[arg(long)]
+        screenshot: Option<std::path::PathBuf>,
+        #[arg(long, default_value_t = 3.0)]
+        screenshot_at: f64,
+        /// Stop after this many seconds.
+        #[arg(long)]
+        duration: Option<f64>,
+        /// Start playback at this position (seconds).
+        #[arg(long, default_value_t = 0.0)]
+        start: f64,
+        /// Play even if the playability check says it will not play smoothly.
+        #[arg(long)]
+        force: bool,
+        /// Shader debug view: 1 = projection UV colours, 2 = raw YUV samples.
+        #[arg(long, default_value_t = 0, hide = true)]
+        debug_view: u32,
+        #[command(flatten)]
+        read_ahead: ReadAheadArgs,
+    },
+    /// Create an OpenXR session and report the headset, GPU and swapchain formats.
+    XrProbe,
+    /// Exercise the headset library workers without XR: open, play briefly,
+    /// stop, repeat across a folder, listing in between (hang hunting).
+    #[command(hide = true)]
+    LibraryStress {
+        /// Saved server name.
+        server: String,
+        share: String,
+        /// Folder inside the share, `/`-separated.
+        #[arg(default_value = "")]
+        folder: String,
+        #[arg(long, default_value_t = 20)]
+        rounds: usize,
+    },
+    /// Decode and play a file's audio for a few seconds (no XR), checking timestamps.
+    #[command(hide = true)]
+    AudioTest {
+        input: String,
+        #[arg(long, default_value_t = 3.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 0.3)]
+        volume: f32,
+    },
+    /// Render sample browser screens to PNG files (UI development).
+    #[command(hide = true)]
+    UiPreview { dir: std::path::PathBuf },
+    /// Measure raw sequential SMB read throughput through the read-ahead reader.
+    ReadBench {
+        url: String,
+        /// Stop after this many MiB (default: whole file).
+        #[arg(long)]
+        mib: Option<u64>,
+        #[command(flatten)]
+        read_ahead: ReadAheadArgs,
+    },
+    /// Decode video frames from the input and report throughput vs. real time.
+    Bench {
+        input: String,
+        #[arg(long, default_value_t = 600)]
+        frames: u32,
+        #[arg(long, value_enum, default_value_t = Hw::Auto)]
+        hw: Hw,
+        /// Fail instead of silently decoding in software.
+        #[arg(long)]
+        hw_only: bool,
+        /// FFmpeg decoder option, repeatable: --decoder-opt threads=8 --decoder-opt thread_type=frame
+        #[arg(long = "decoder-opt", value_name = "KEY=VALUE")]
+        decoder_opts: Vec<String>,
+        #[command(flatten)]
+        read_ahead: ReadAheadArgs,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Hw {
+    /// V4L2 (Qualcomm iris) on ARM64 / Steam Frame, Vulkan video elsewhere.
+    Auto,
+    Vulkan,
+    /// V4L2 stateful decoder (Steam Frame's Qualcomm iris).
+    V4l2,
+    Vaapi,
+    None,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ProjectionArg {
+    Flat,
+    #[value(name = "180")]
+    Vr180,
+    #[value(name = "360")]
+    Vr360,
+    Fisheye,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum StereoArg {
+    Mono,
+    Sbs,
+    Tb,
+}
+
+fn hw_backend(hw: Hw) -> Option<&'static str> {
+    match hw {
+        Hw::Auto if cfg!(target_arch = "aarch64") => Some("v4l2m2m"),
+        Hw::Auto | Hw::Vulkan => Some("vulkan"),
+        Hw::V4l2 => Some("v4l2m2m"),
+        Hw::Vaapi => Some("vaapi"),
+        Hw::None => None,
+    }
+}
+
+#[derive(clap::Args)]
+struct ReadAheadArgs {
+    /// SMB read size in KiB.
+    #[arg(long, default_value_t = 1024)]
+    block_kib: usize,
+    /// Reads kept in flight ahead of the demuxer.
+    #[arg(long, default_value_t = 32)]
+    blocks_ahead: usize,
+}
+
+impl ReadAheadArgs {
+    fn get(&self) -> ReadAhead {
+        ReadAhead {
+            block_size: self.block_kib.clamp(64, 8192) * 1024,
+            blocks_ahead: self.blocks_ahead.clamp(1, 256),
+        }
+    }
+}
+
+fn password() -> anyhow::Result<String> {
+    if let Ok(password) = std::env::var("JUST_VIDEO_SMB_PASSWORD") {
+        return Ok(password);
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return Ok(rpassword::prompt_password("SMB password: ")?);
+    }
+    Ok(String::new())
+}
+
+fn connect(url: &str) -> anyhow::Result<SmbSession> {
+    let url: SmbUrl = url.parse()?;
+    // A saved server's password is used unless one is given explicitly.
+    let password = match std::env::var("JUST_VIDEO_SMB_PASSWORD") {
+        Ok(p) => p,
+        Err(_) => match just_video::config::password(&url.server_url())? {
+            Some(p) => p,
+            None => password()?,
+        },
+    };
+    SmbSession::connect(url, password)
+}
+
+/// Opens an SMB URL or local path; returns the source and a name for detection.
+fn open_input(
+    input: &str,
+    read_ahead: ReadAhead,
+) -> anyhow::Result<(Box<dyn Source>, Option<SmbSession>)> {
+    if input.starts_with("smb://") {
+        let session = connect(input)?;
+        let path = session.url().path.clone();
+        let reader = session.open(&path, read_ahead)?;
+        Ok((Box::new(reader), Some(session)))
+    } else {
+        let file = std::fs::File::open(input).with_context(|| format!("Open {input}"))?;
+        Ok((
+            Box::new(std::io::BufReader::with_capacity(1 << 20, file)),
+            None,
+        ))
+    }
+}
+
+fn file_name(input: &str) -> &str {
+    input.rsplit(['/', '\\']).next().unwrap_or(input)
+}
+
+const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
+
+fn is_video(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+}
+
+fn badge(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Hardware => "✅",
+        Verdict::Software => "🟡",
+        Verdict::SoftwareMarginal => "⚠️",
+        Verdict::Unplayable => "⛔",
+    }
+}
+
+fn print_assessment(name: &str, a: &Assessment) {
+    println!("{} {name} — {}", badge(a.verdict), a.title);
+    for line in [&a.detail, &a.hint].into_iter().flatten() {
+        println!("     {line}");
+    }
+}
+
+fn quit_on_ctrl_c() -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    let quit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = quit.clone();
+    ctrlc::set_handler(move || flag.store(true, std::sync::atomic::Ordering::Relaxed))?;
+    Ok(quit)
+}
+
+/// When launched from Steam there is no terminal: send diagnostics to
+/// ~/.local/state/just-video/log.txt instead.
+fn log_to_file_without_terminal() {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home).join(".local/state/just-video");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("log.txt");
+    // Keep one previous log for comparison.
+    let _ = std::fs::rename(&path, dir.join("log.previous.txt"));
+    if let Ok(file) = std::fs::File::create(&path) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: dup2 onto stderr with a valid, open descriptor.
+        unsafe { libc::dup2(file.as_raw_fd(), 2) };
+    }
+}
+
+fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+    log_to_file_without_terminal();
+    eprintln!("Just Video {} starting", env!("CARGO_PKG_VERSION"));
+    let servers = just_video::config::servers()?;
+    let library =
+        just_video::library::Library::start(servers, just_video::media::default_hw_backend());
+    let navigator = just_video::ui::navigator::Navigator::new(library);
+    just_video::xr::app::run(
+        Some(navigator),
+        None,
+        just_video::xr::app::AppOptions {
+            view: Default::default(),
+            play: Default::default(),
+            quit,
+        },
+    )?;
+    eprintln!("Just Video stopped");
+    Ok(())
+}
+
+fn print(value: serde_json::Value) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let platform = cli.platform.unwrap_or_else(Platform::current);
+    let Some(command) = cli.command else {
+        let result = run_app(quit_on_ctrl_c()?);
+        if let Err(e) = &result {
+            eprintln!("Error: {e:#}");
+        }
+        return result;
+    };
+    match command {
+        Command::AddServer { url, name } => {
+            let parsed: SmbUrl = url.parse()?;
+            anyhow::ensure!(
+                parsed.share.is_empty(),
+                "Give the server only, e.g. smb://user@host (shares are browsed in the headset)"
+            );
+            let password = password()?;
+            let session = SmbSession::connect(parsed.clone(), password.clone())?;
+            let shares = session.shares()?;
+            just_video::config::save_server(
+                just_video::config::Server {
+                    name: name.unwrap_or_else(|| parsed.host.clone()),
+                    url: parsed.server_url(),
+                },
+                &password,
+            )?;
+            println!(
+                "Saved {} ({} shares: {})",
+                parsed.server_url(),
+                shares.len(),
+                shares.join(", ")
+            );
+        }
+        Command::Servers => {
+            for server in just_video::config::servers()? {
+                println!("{}\t{}", server.name, server.url);
+            }
+        }
+        Command::RemoveServer { server } => {
+            if !just_video::config::remove_server(&server)? {
+                anyhow::bail!("No saved server named {server}");
+            }
+        }
+        Command::Ls { url, check } => {
+            let session = connect(&url)?;
+            if session.url().share.is_empty() {
+                for share in session.shares()? {
+                    println!("{share}/");
+                }
+                return Ok(());
+            }
+            let path = session.url().path.clone();
+            // Header probes read little: small blocks, shallow read-ahead.
+            let probe = ReadAhead {
+                block_size: 256 * 1024,
+                blocks_ahead: 4,
+            };
+            for entry in session.list(&path)? {
+                if entry.is_dir {
+                    println!("{}/", entry.name);
+                } else if check && is_video(&entry.name) {
+                    let file = if path.is_empty() {
+                        entry.name.clone()
+                    } else {
+                        format!("{path}\\{}", entry.name)
+                    };
+                    // A broken or unreadable file is reported, never fatal for the listing.
+                    let assessment = session
+                        .open(&file, probe)
+                        .and_then(|reader| Media::open(&entry.name, reader))
+                        .map(|media| playability::assess(platform, media.info().video.as_ref()));
+                    match assessment {
+                        Ok(a) => print_assessment(&entry.name, &a),
+                        Err(e) => println!(
+                            "⛔ {} — Can't read this file\n     It may be damaged or not a video ({e:#}).",
+                            entry.name
+                        ),
+                    }
+                } else {
+                    println!("{}\t{}", entry.name, entry.size);
+                }
+            }
+        }
+        Command::Info { input } => {
+            let (source, _session) = open_input(&input, ReadAhead::default())?;
+            let media = Media::open(file_name(&input), source)?;
+            let video = media.info().video.as_ref();
+            print(json!({
+                "media": media.info(),
+                "layout": vr::detect(&input, video),
+                "playability": playability::assess(platform, video),
+            }))?;
+        }
+        Command::Play {
+            input,
+            hw,
+            projection,
+            stereo,
+            swap_eyes,
+            fisheye_fov,
+            screen_width,
+            screen_distance,
+            screenshot,
+            screenshot_at,
+            duration,
+            start,
+            force,
+            debug_view,
+            read_ahead,
+        } => {
+            let (source, _session) = open_input(&input, read_ahead.get())?;
+            let media = Media::open(file_name(&input), source)?;
+            let video = media.info().video.clone();
+            let assessment = playability::assess(platform, video.as_ref());
+            print_assessment(file_name(&input), &assessment);
+            if assessment.verdict == Verdict::Unplayable && !force {
+                anyhow::bail!("Not playing: {}", assessment.title);
+            }
+            let mut layout = vr::detect(&input, video.as_ref());
+            if let Some(p) = projection {
+                layout.projection = match p {
+                    ProjectionArg::Flat => vr::Projection::Flat,
+                    ProjectionArg::Vr180 => vr::Projection::Equirect180,
+                    ProjectionArg::Vr360 => vr::Projection::Equirect360,
+                    ProjectionArg::Fisheye => vr::Projection::Fisheye180,
+                };
+            }
+            if let Some(s) = stereo {
+                layout.stereo = match s {
+                    StereoArg::Mono => vr::Stereo::Mono,
+                    StereoArg::Sbs => vr::Stereo::SideBySide,
+                    StereoArg::Tb => vr::Stereo::TopBottom,
+                };
+            }
+            layout.swap_eyes ^= swap_eyes;
+            eprintln!(
+                "Layout: {:?} / {:?}{}",
+                layout.projection,
+                layout.stereo,
+                if layout.swap_eyes {
+                    " (eyes swapped)"
+                } else {
+                    ""
+                }
+            );
+            let mut decoder = media.into_decoder(hw_backend(hw), true, "")?;
+            if start > 0.0 {
+                decoder.seek(start)?;
+            }
+            if let Some(note) = &decoder.stats().note {
+                eprintln!("Decoder: {} ({note})", decoder.stats().decoder);
+            } else {
+                eprintln!("Decoder: {}", decoder.stats().decoder);
+            }
+            let playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
+            let stats = just_video::xr::app::run(
+                None,
+                Some(playback),
+                just_video::xr::app::AppOptions {
+                    view: just_video::xr::player::ViewOptions {
+                        fisheye_fov,
+                        screen_width,
+                        screen_distance,
+                        debug_view,
+                    },
+                    play: just_video::xr::player::PlayOptions {
+                        screenshot: screenshot.map(|p| (p, start + screenshot_at)),
+                        duration: duration.map(|d| start + d),
+                        start,
+                    },
+                    quit: quit_on_ctrl_c()?,
+                },
+            )?;
+            print(json!(stats))?;
+        }
+        Command::LibraryStress { server, share, folder, rounds } => {
+            use just_video::library::{Library, Request, Response};
+            use std::time::{Duration, Instant};
+            let servers = just_video::config::servers()?;
+            let index = servers
+                .iter()
+                .position(|s| s.name == server)
+                .ok_or_else(|| anyhow::anyhow!("No saved server {server}"))?;
+            let library = Library::start(servers, just_video::media::default_hw_backend());
+            let path: Vec<String> = folder.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+            let wait = |what: &str| -> anyhow::Result<Response> {
+                let started = Instant::now();
+                loop {
+                    if let Some(r) = library.try_recv() {
+                        eprintln!("  {what}: {:.2}s", started.elapsed().as_secs_f64());
+                        return Ok(r);
+                    }
+                    if started.elapsed() > Duration::from_secs(30) {
+                        eprintln!("HANG: {what} took over 30 s (pid {}); waiting for a debugger", std::process::id());
+                        std::thread::sleep(Duration::from_secs(600));
+                        anyhow::bail!("HANG: {what}");
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            };
+            library.send(Request::List { id: 1, server: index, share: share.clone(), path: path.clone() });
+            let Response::List { result, .. } = wait("list")? else { anyhow::bail!("unexpected") };
+            let videos: Vec<String> = result
+                .map_err(anyhow::Error::msg)?
+                .into_iter()
+                .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
+                .map(|e| e.name)
+                .collect();
+            anyhow::ensure!(!videos.is_empty(), "No videos in that folder");
+            for round in 0..rounds {
+                let name = &videos[round % videos.len()];
+                eprintln!("round {round}: {name}");
+                library.set_probe_generation(round as u64);
+                for v in &videos {
+                    let mut file = path.clone();
+                    file.push(v.clone());
+                    library.send(Request::Probe { generation: round as u64, server: index, share: share.clone(), path: file });
+                }
+                let mut file = path.clone();
+                file.push(name.clone());
+                library.send(Request::Open { id: 100 + round as u64, server: index, share: share.clone(), path: file });
+                let opened = loop {
+                    match wait("response")? {
+                        Response::Opened { result, .. } => break result.map_err(anyhow::Error::msg)?,
+                        _ => continue,
+                    }
+                };
+                let mut playback = just_video::xr::player::Playback::start(opened.decoder, opened.layout, 0.0, 0.0);
+                let started = Instant::now();
+                let mut shown = 0;
+                while started.elapsed() < Duration::from_millis(1500) {
+                    let now = started.elapsed().as_nanos() as i64 + 1_000_000_000;
+                    if playback.advance(now) {
+                        shown += 1;
+                    }
+                    std::thread::sleep(Duration::from_millis(11));
+                }
+                eprintln!("  played {shown} frames, stopping");
+                drop(playback);
+                library.send(Request::List { id: 2, server: index, share: share.clone(), path: path.clone() });
+                loop {
+                    if let Response::List { .. } = wait("list after stop")? {
+                        break;
+                    }
+                }
+            }
+            eprintln!("no hang in {rounds} rounds");
+        }
+        Command::AudioTest { input, seconds, volume } => {
+            use just_video::audio::{CHANNELS, Output, RATE};
+            let (source, _session) = open_input(&input, ReadAhead::default())?;
+            let media = Media::open(file_name(&input), source)?;
+            let mut decoder = media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
+            anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
+            let mut output = Output::open("audio-test")?;
+            let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
+            while (written as f64) < seconds * RATE as f64 {
+                if decoder.next_frame()?.is_none() {
+                    break;
+                }
+                frames += 1;
+                while let Some((samples, pts)) = decoder.take_audio(CHANNELS) {
+                    let n = samples.len() as u64 / CHANNELS as u64;
+                    if let (Some(e), Some(p)) = (expected, pts)
+                        && (p - e).abs() > 0.005
+                    {
+                        gaps += 1;
+                        eprintln!("timestamp jump: expected {e:.3}, got {p:.3}");
+                    }
+                    expected = pts.map(|p| p + n as f64 / RATE as f64);
+                    let scaled: Vec<f32> = samples.iter().map(|s| s * volume * volume).collect();
+                    output.write(&scaled)?;
+                    written += n;
+                }
+            }
+            print(json!({
+                "video_frames": frames,
+                "audio_seconds": written as f64 / RATE as f64,
+                "last_audio_pts": expected,
+                "timestamp_jumps": gaps,
+                "output_latency_ms": output.latency() * 1000.0,
+            }))?;
+        }
+        Command::UiPreview { dir } => {
+            use just_video::ui::browser::{Dialog, Icon, Row, View, render};
+            let mut fonts = just_video::ui::canvas::Fonts::load()?;
+            std::fs::create_dir_all(&dir)?;
+            let footer = "Trigger: open  ·  B: back  ·  Stick: scroll".to_string();
+            let row = |icon, label: &str, detail: &str, right: &str| Row {
+                icon,
+                label: label.into(),
+                detail: detail.into(),
+                right: right.into(),
+            };
+            let folder = View {
+                title: "NAS  ›  media  ›  Videos  ›  VR".into(),
+                rows: vec![
+                    row(Icon::Folder, "Concerts", "", ""),
+                    row(
+                        Icon::Video(Some(Verdict::Software)),
+                        "Documentary.2160p.HDR.mkv",
+                        "Plays with CPU decoding (4K 60 fps 10-bit HEVC)",
+                        "28.2 GB",
+                    ),
+                    row(
+                        Icon::Video(Some(Verdict::Hardware)),
+                        "h264.mp4",
+                        "Plays with hardware decoding (1080p 24 fps 8-bit H.264)",
+                        "1.8 GB",
+                    ),
+                    row(Icon::Video(None), "h265.mkv", "Checking…", "88.4 MB"),
+                    row(
+                        Icon::Video(Some(Verdict::Unplayable)),
+                        "concert_8k.mp4",
+                        "Can't play smoothly on Steam Frame (8K 60 fps 10-bit HEVC)",
+                        "5.1 GB",
+                    ),
+                    row(Icon::Broken, "damaged.mp4", "Can't read this file", "12 KB"),
+                    row(
+                        Icon::Video(Some(Verdict::Hardware)),
+                        "旅行_180_LR.mp4",
+                        "Plays with hardware decoding (5.7K 30 fps 8-bit HEVC)",
+                        "3.3 GB",
+                    ),
+                ],
+                footer: footer.clone(),
+                ..Default::default()
+            };
+            just_video::ui::save_png(
+                &render(&folder, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("folder.png"),
+            )?;
+            let servers = View {
+                title: "Just Video".into(),
+                rows: vec![row(Icon::Server, "NAS", "smb://user@192.168.1.10", "")],
+                footer: footer.clone(),
+                ..Default::default()
+            };
+            just_video::ui::save_png(
+                &render(&servers, &mut fonts, None, false),
+                &dir.join("servers.png"),
+            )?;
+            let mut dialog = folder.clone();
+            dialog.dialog = Some(Dialog {
+                title: "Can't play smoothly on Steam Frame".into(),
+                body: vec![
+                    "Steam Frame's hardware video decoder only handles 8-bit video in the current SteamOS, and this video is 10-bit. Decoding it on the CPU instead reaches only about 74% of the speed needed, so playback would stutter badly.".into(),
+                    "An 8-bit HEVC version or a 4K version of this video would play.".into(),
+                ],
+                button: "OK".into(),
+            });
+            just_video::ui::save_png(
+                &render(&dialog, &mut fonts, Some((800.0, 790.0)), true),
+                &dir.join("dialog.png"),
+            )?;
+            use just_video::ui::controls;
+            let state = controls::State {
+                paused: true,
+                position: 754.0,
+                duration: 5530.0,
+                curved: Some(true),
+                volume: Some(6),
+            };
+            just_video::ui::save_png(
+                &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
+                &dir.join("controls.png"),
+            )?;
+        }
+        Command::XrProbe => {
+            let xr = just_video::xr::context::XrContext::new()?;
+            print(json!({
+                "system": xr.system_name,
+                "gpu": xr.gpu_name(),
+                "views": xr.views.iter().map(|v| json!({
+                    "recommended": [v.recommended_image_rect_width, v.recommended_image_rect_height],
+                    "max": [v.max_image_rect_width, v.max_image_rect_height],
+                    "samples": v.recommended_swapchain_sample_count,
+                })).collect::<Vec<_>>(),
+                "blend_mode": format!("{:?}", xr.blend_mode),
+                "swapchain_formats": xr.swapchain_formats()?.iter().map(|f| format!("{f:?}")).collect::<Vec<_>>(),
+            }))?;
+        }
+        Command::ReadBench {
+            url,
+            mib,
+            read_ahead,
+        } => {
+            let session = connect(&url)?;
+            let path = session.url().path.clone();
+            let mut reader = session.open(&path, read_ahead.get())?;
+            let limit = mib.map_or(reader.len(), |m| (m << 20).min(reader.len()));
+            let mut buffer = vec![0u8; 256 * 1024];
+            let mut total = 0u64;
+            let start = Instant::now();
+            while total < limit {
+                let want = buffer.len().min((limit - total) as usize);
+                let n = reader.read(&mut buffer[..want])?;
+                if n == 0 {
+                    break;
+                }
+                total += n as u64;
+            }
+            let seconds = start.elapsed().as_secs_f64();
+            print(json!({
+                "bytes": total,
+                "seconds": seconds,
+                "mbit_per_second": total as f64 * 8.0 / seconds / 1e6,
+                "read_stats": reader.stats(),
+            }))?;
+        }
+        Command::Bench {
+            input,
+            frames,
+            hw,
+            hw_only,
+            decoder_opts,
+            read_ahead,
+        } => {
+            let (source, _session) = open_input(&input, read_ahead.get())?;
+            let mut media = Media::open(file_name(&input), source)?;
+            let backend = hw_backend(hw);
+            let stats = media.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
+            let fps = media.info().video.as_ref().map_or(0.0, |v| v.fps);
+            let realtime = if fps > 0.0 {
+                stats.frames_per_second / fps
+            } else {
+                0.0
+            };
+            let failed = stats.error.is_some() || stats.frames == 0;
+            print(json!({
+                "media": media.info(),
+                "layout": vr::detect(&input, media.info().video.as_ref()),
+                "playability": playability::assess(platform, media.info().video.as_ref()),
+                "decode": stats,
+                "realtime_factor": realtime,
+                "note": "Decode-only throughput including network reads; excludes rendering and audio.",
+            }))?;
+            if failed {
+                std::process::exit(2);
+            }
+        }
+    }
+    Ok(())
+}

@@ -1,0 +1,587 @@
+//! Safe wrapper over `native/media.c`: FFmpeg demux/decode over any `Read + Seek`.
+
+use anyhow::bail;
+use serde::Serialize;
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    io::{Read, Seek, SeekFrom},
+    panic::{AssertUnwindSafe, catch_unwind},
+};
+
+/// Hardware decoding backend for this platform: the V4L2 (Qualcomm iris)
+/// decoder on ARM64 / Steam Frame, Vulkan video elsewhere.
+pub fn default_hw_backend() -> Option<&'static str> {
+    if cfg!(target_arch = "aarch64") {
+        Some("v4l2m2m")
+    } else {
+        Some("vulkan")
+    }
+}
+
+pub trait Source: Read + Seek + Send {}
+impl<T: Read + Seek + Send> Source for T {}
+
+const AVSEEK_SIZE: c_int = 0x10000;
+const AVERROR_EIO: c_int = -5;
+
+#[repr(C)]
+struct RawInfo {
+    container: [c_char; 64],
+    duration_seconds: f64,
+    bit_rate: i64,
+    video_codec: [c_char; 32],
+    video_profile: [c_char; 48],
+    pixel_format: [c_char; 32],
+    width: i32,
+    height: i32,
+    bit_depth: i32,
+    fps: f64,
+    stereo_mode: [c_char; 32],
+    stereo_inverted: i32,
+    projection: [c_char; 48],
+    bound_left: u32,
+    bound_top: u32,
+    bound_right: u32,
+    bound_bottom: u32,
+    audio_codec: [c_char; 32],
+    audio_channels: i32,
+    audio_sample_rate: i32,
+}
+
+#[repr(C)]
+struct RawStats {
+    frames: i32,
+    hardware_frames: i32,
+    software_frames: i32,
+    elapsed_seconds: f64,
+    decoder: [c_char; 48],
+    hw_backend: [c_char; 16],
+    pixel_format: [c_char; 32],
+    note: [c_char; 128],
+    error: [c_char; 256],
+}
+
+type ReadFn = unsafe extern "C" fn(*mut c_void, *mut u8, c_int) -> c_int;
+type SeekFn = unsafe extern "C" fn(*mut c_void, i64, c_int) -> i64;
+
+#[repr(C)]
+struct RawMedia {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn jv_media_open(
+        name: *const c_char,
+        read: ReadFn,
+        seek: SeekFn,
+        opaque: *mut c_void,
+        info: *mut RawInfo,
+        error: *mut c_char,
+        error_size: c_int,
+    ) -> *mut RawMedia;
+    fn jv_media_decode(
+        media: *mut RawMedia,
+        hw_backend: *const c_char,
+        allow_software: c_int,
+        decoder_options: *const c_char,
+        frame_limit: c_int,
+        stats: *mut RawStats,
+    ) -> c_int;
+    fn jv_media_close(media: *mut RawMedia);
+}
+
+type BoxedSource = Box<dyn Source>;
+
+unsafe extern "C" fn read_cb(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_int {
+    // SAFETY: opaque is the stable Box<BoxedSource> owned by `Media`; FFmpeg
+    // passes a writable buffer of `size` bytes.
+    let source = unsafe { &mut *(opaque as *mut BoxedSource) };
+    let out = unsafe { std::slice::from_raw_parts_mut(buf, size.max(0) as usize) };
+    match catch_unwind(AssertUnwindSafe(|| source.read(out))) {
+        Ok(Ok(n)) => n as c_int,
+        _ => AVERROR_EIO,
+    }
+}
+
+unsafe extern "C" fn seek_cb(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+    let source = unsafe { &mut *(opaque as *mut BoxedSource) };
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        if whence == AVSEEK_SIZE {
+            let here = source.stream_position()?;
+            let end = source.seek(SeekFrom::End(0))?;
+            source.seek(SeekFrom::Start(here))?;
+            return Ok(end);
+        }
+        let from = match whence {
+            0 => SeekFrom::Start(offset.try_into().map_err(std::io::Error::other)?),
+            1 => SeekFrom::Current(offset),
+            2 => SeekFrom::End(offset),
+            _ => return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+        };
+        source.seek(from)
+    }));
+    match result {
+        Ok(Ok(position)) => position as i64,
+        _ => AVERROR_EIO as i64,
+    }
+}
+
+fn text(raw: &[c_char]) -> String {
+    // SAFETY: the C side always NUL-terminates via snprintf into zeroed arrays.
+    unsafe { CStr::from_ptr(raw.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn optional(raw: &[c_char]) -> Option<String> {
+    Some(text(raw)).filter(|s| !s.is_empty())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VideoInfo {
+    pub codec: String,
+    pub profile: Option<String>,
+    pub pixel_format: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    /// Luma bit depth (8, 10, 12); 0 when unknown.
+    pub bit_depth: u32,
+    pub fps: f64,
+    /// FFmpeg stereo3d type name, e.g. "side by side", "top and bottom".
+    pub stereo_mode: Option<String>,
+    pub stereo_inverted: bool,
+    /// FFmpeg spherical projection name, e.g. "equirectangular", "fisheye".
+    pub projection: Option<String>,
+    /// Horizontal coverage implied by equirectangular bounds, in degrees.
+    pub horizontal_degrees: Option<f64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct AudioInfo {
+    pub codec: String,
+    pub channels: u32,
+    pub sample_rate: u32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MediaInfo {
+    pub container: String,
+    pub duration_seconds: f64,
+    pub bit_rate: i64,
+    pub video: Option<VideoInfo>,
+    pub audio: Option<AudioInfo>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DecodeStats {
+    pub frames: u32,
+    pub hardware_frames: u32,
+    pub software_frames: u32,
+    pub elapsed_seconds: f64,
+    pub frames_per_second: f64,
+    pub decoder: String,
+    pub hw_backend: Option<String>,
+    pub output_pixel_format: Option<String>,
+    /// Why hardware decoding was skipped, if it was.
+    pub note: Option<String>,
+    pub error: Option<String>,
+}
+
+pub struct Media {
+    raw: *mut RawMedia,
+    // Boxed twice so the pointer handed to C stays valid while `Media` moves.
+    _source: Box<BoxedSource>,
+    info: MediaInfo,
+}
+
+// SAFETY: the FFmpeg contexts are only touched through &mut self.
+unsafe impl Send for Media {}
+
+impl Media {
+    pub fn open(name: &str, source: impl Source + 'static) -> anyhow::Result<Self> {
+        let mut source: Box<BoxedSource> = Box::new(Box::new(source));
+        let name = CString::new(name.replace('\0', ""))?;
+        let mut raw_info = std::mem::MaybeUninit::<RawInfo>::zeroed();
+        let mut error = [0 as c_char; 256];
+        // SAFETY: all pointers are valid for the call; `source` outlives `raw`.
+        let raw = unsafe {
+            jv_media_open(
+                name.as_ptr(),
+                read_cb,
+                seek_cb,
+                (&mut *source) as *mut BoxedSource as *mut c_void,
+                raw_info.as_mut_ptr(),
+                error.as_mut_ptr(),
+                error.len() as c_int,
+            )
+        };
+        if raw.is_null() {
+            bail!("{}", text(&error));
+        }
+        let r = unsafe { raw_info.assume_init() };
+        let video = optional(&r.video_codec).map(|codec| VideoInfo {
+            codec,
+            profile: optional(&r.video_profile),
+            pixel_format: optional(&r.pixel_format),
+            width: r.width.max(0) as u32,
+            height: r.height.max(0) as u32,
+            bit_depth: r.bit_depth.max(0) as u32,
+            fps: r.fps,
+            stereo_mode: optional(&r.stereo_mode),
+            stereo_inverted: r.stereo_inverted != 0,
+            projection: optional(&r.projection),
+            horizontal_degrees: optional(&r.projection).map(|_| {
+                let covered = 1.0 - (r.bound_left as f64 + r.bound_right as f64) / 4294967296.0;
+                (covered * 360.0).clamp(0.0, 360.0)
+            }),
+        });
+        let audio = optional(&r.audio_codec).map(|codec| AudioInfo {
+            codec,
+            channels: r.audio_channels.max(0) as u32,
+            sample_rate: r.audio_sample_rate.max(0) as u32,
+        });
+        Ok(Self {
+            raw,
+            _source: source,
+            info: MediaInfo {
+                container: text(&r.container),
+                duration_seconds: r.duration_seconds,
+                bit_rate: r.bit_rate,
+                video,
+                audio,
+            },
+        })
+    }
+
+    pub fn info(&self) -> &MediaInfo {
+        &self.info
+    }
+
+    /// Decodes up to `frames` video frames from the start. `hw_backend` is an
+    /// FFmpeg device type ("vulkan", "vaapi"), "v4l2m2m", or `None` for software.
+    pub fn decode(
+        &mut self,
+        hw_backend: Option<&str>,
+        allow_software: bool,
+        decoder_options: &str,
+        frames: u32,
+    ) -> anyhow::Result<DecodeStats> {
+        let backend = hw_backend.map(CString::new).transpose()?;
+        let options = CString::new(decoder_options)?;
+        let mut raw = std::mem::MaybeUninit::<RawStats>::zeroed();
+        // SAFETY: `self.raw` is live; the stats pointer is valid for the call.
+        unsafe {
+            jv_media_decode(
+                self.raw,
+                backend.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()),
+                allow_software as c_int,
+                options.as_ptr(),
+                frames.min(i32::MAX as u32) as c_int,
+                raw.as_mut_ptr(),
+            );
+        }
+        let s = unsafe { raw.assume_init() };
+        Ok(DecodeStats {
+            frames: s.frames.max(0) as u32,
+            hardware_frames: s.hardware_frames.max(0) as u32,
+            software_frames: s.software_frames.max(0) as u32,
+            elapsed_seconds: s.elapsed_seconds,
+            frames_per_second: if s.elapsed_seconds > 0.0 {
+                s.frames as f64 / s.elapsed_seconds
+            } else {
+                0.0
+            },
+            decoder: text(&s.decoder),
+            hw_backend: optional(&s.hw_backend),
+            output_pixel_format: optional(&s.pixel_format),
+            note: optional(&s.note),
+            error: optional(&s.error),
+        })
+    }
+}
+
+impl Drop for Media {
+    fn drop(&mut self) {
+        // SAFETY: closes FFmpeg before `_source` (declared later) is dropped.
+        unsafe { jv_media_close(self.raw) };
+    }
+}
+
+#[repr(C)]
+struct RawDecoder {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct RawFrame {
+    handle: *mut c_void,
+    layout: i32,
+    width: i32,
+    height: i32,
+    bits: i32,
+    plane_count: i32,
+    data: [*const u8; 3],
+    linesize: [i32; 3],
+    pts: f64,
+    matrix: i32,
+    full_range: i32,
+    transfer: i32,
+    hardware: i32,
+}
+
+unsafe extern "C" {
+    fn jv_decoder_open(
+        media: *mut RawMedia,
+        hw_backend: *const c_char,
+        allow_software: c_int,
+        decoder_options: *const c_char,
+        stats: *mut RawStats,
+    ) -> *mut RawDecoder;
+    fn jv_decoder_next(decoder: *mut RawDecoder, frame: *mut RawFrame) -> c_int;
+    fn jv_decoder_seek(decoder: *mut RawDecoder, seconds: f64) -> c_int;
+    fn jv_frame_release(handle: *mut c_void);
+    fn jv_decoder_enable_audio(decoder: *mut RawDecoder, rate: c_int, channels: c_int) -> c_int;
+    fn jv_decoder_audio_available(decoder: *const RawDecoder) -> c_int;
+    fn jv_decoder_audio_read(decoder: *mut RawDecoder, out: *mut f32, frames: c_int, pts: *mut f64) -> c_int;
+    fn jv_decoder_close(decoder: *mut RawDecoder);
+}
+
+const AVERROR_EOF: c_int = -0x20464F45; // FFERRTAG('E','O','F',' ')
+const AVERROR_PATCHWELCOME: c_int = -0x45574150; // FFERRTAG('P','A','W','E')
+
+/// How the planes of a decoded frame are arranged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaneLayout {
+    /// Y, U, V planes; 10-bit samples are LSB-aligned in 16 bits.
+    Planar,
+    /// Y plane + interleaved UV (NV12).
+    SemiPlanar,
+    /// Y + interleaved UV with 10 bits MSB-aligned in 16 bits (P010).
+    SemiPlanarMsb,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Matrix {
+    Bt709,
+    Bt601,
+    Bt2020,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transfer {
+    Sdr,
+    Pq,
+    Hlg,
+}
+
+/// One decoded picture in CPU memory. Freed when dropped.
+pub struct Frame {
+    raw: RawFrame,
+}
+
+// SAFETY: the frame's buffers are reference counted by FFmpeg and immutable
+// once decoded; freeing from another thread is allowed.
+unsafe impl Send for Frame {}
+
+impl Frame {
+    pub fn layout(&self) -> PlaneLayout {
+        match self.raw.layout {
+            0 => PlaneLayout::Planar,
+            1 => PlaneLayout::SemiPlanar,
+            _ => PlaneLayout::SemiPlanarMsb,
+        }
+    }
+
+    pub fn width(&self) -> u32 {
+        self.raw.width as u32
+    }
+
+    pub fn height(&self) -> u32 {
+        self.raw.height as u32
+    }
+
+    /// 8 or 10.
+    pub fn bits(&self) -> u32 {
+        self.raw.bits as u32
+    }
+
+    /// Seconds from the start of the stream, if known.
+    pub fn pts(&self) -> Option<f64> {
+        (self.raw.pts >= 0.0).then_some(self.raw.pts)
+    }
+
+    pub fn matrix(&self) -> Matrix {
+        match self.raw.matrix {
+            1 => Matrix::Bt601,
+            2 => Matrix::Bt2020,
+            _ => Matrix::Bt709,
+        }
+    }
+
+    pub fn full_range(&self) -> bool {
+        self.raw.full_range != 0
+    }
+
+    pub fn transfer(&self) -> Transfer {
+        match self.raw.transfer {
+            1 => Transfer::Pq,
+            2 => Transfer::Hlg,
+            _ => Transfer::Sdr,
+        }
+    }
+
+    pub fn hardware(&self) -> bool {
+        self.raw.hardware != 0
+    }
+
+    /// Bytes per sample: 1 for 8-bit, 2 for 10-bit.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.raw.bits > 8 { 2 } else { 1 }
+    }
+
+    /// Plane dimensions in texels: (width, height, components per texel).
+    pub fn plane_size(&self, plane: usize) -> (u32, u32, u32) {
+        let (w, h) = (self.width(), self.height());
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        match (self.layout(), plane) {
+            (_, 0) => (w, h, 1),
+            (PlaneLayout::Planar, _) => (cw, ch, 1),
+            _ => (cw, ch, 2),
+        }
+    }
+
+    pub fn plane_count(&self) -> usize {
+        self.raw.plane_count as usize
+    }
+
+    /// Row slices of one plane (without padding), top to bottom.
+    pub fn rows(&self, plane: usize) -> impl Iterator<Item = &[u8]> {
+        let (w, h, c) = self.plane_size(plane);
+        let row_bytes = (w * c) as usize * self.bytes_per_sample();
+        let stride = self.raw.linesize[plane] as isize;
+        let base = self.raw.data[plane];
+        (0..h as isize).map(move |y| {
+            // SAFETY: FFmpeg guarantees `height` rows of `linesize` bytes, each
+            // holding at least `row_bytes` of samples, alive until release.
+            unsafe { std::slice::from_raw_parts(base.offset(y * stride), row_bytes) }
+        })
+    }
+}
+
+impl Drop for Frame {
+    fn drop(&mut self) {
+        unsafe { jv_frame_release(self.raw.handle) };
+    }
+}
+
+/// A video decoder owning its media; pull frames with [`VideoDecoder::next_frame`].
+pub struct VideoDecoder {
+    raw: *mut RawDecoder,
+    media: Media,
+    stats: DecodeStats,
+}
+
+// SAFETY: used from one thread at a time (the decode thread).
+unsafe impl Send for VideoDecoder {}
+
+impl Media {
+    /// Opens the video decoder; same hardware-first and fallback rules as [`Media::decode`].
+    pub fn into_decoder(
+        self,
+        hw_backend: Option<&str>,
+        allow_software: bool,
+        decoder_options: &str,
+    ) -> anyhow::Result<VideoDecoder> {
+        let backend = hw_backend.map(CString::new).transpose()?;
+        let options = CString::new(decoder_options)?;
+        let mut raw = std::mem::MaybeUninit::<RawStats>::zeroed();
+        let decoder = unsafe {
+            jv_decoder_open(
+                self.raw,
+                backend.as_ref().map_or(std::ptr::null(), |b| b.as_ptr()),
+                allow_software as c_int,
+                options.as_ptr(),
+                raw.as_mut_ptr(),
+            )
+        };
+        let s = unsafe { raw.assume_init() };
+        if decoder.is_null() {
+            bail!("{}", text(&s.error));
+        }
+        Ok(VideoDecoder {
+            raw: decoder,
+            media: self,
+            stats: DecodeStats {
+                frames: 0,
+                hardware_frames: 0,
+                software_frames: 0,
+                elapsed_seconds: 0.0,
+                frames_per_second: 0.0,
+                decoder: text(&s.decoder),
+                hw_backend: optional(&s.hw_backend),
+                output_pixel_format: None,
+                note: optional(&s.note),
+                error: None,
+            },
+        })
+    }
+}
+
+impl VideoDecoder {
+    pub fn info(&self) -> &MediaInfo {
+        self.media.info()
+    }
+
+    /// Decoder name, backend and fallback note (counters are not updated).
+    pub fn stats(&self) -> &DecodeStats {
+        &self.stats
+    }
+
+    /// The next frame, or `None` at the end of the stream.
+    pub fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
+        let mut raw = std::mem::MaybeUninit::<RawFrame>::zeroed();
+        match unsafe { jv_decoder_next(self.raw, raw.as_mut_ptr()) } {
+            0 => Ok(Some(Frame {
+                raw: unsafe { raw.assume_init() },
+            })),
+            AVERROR_EOF => Ok(None),
+            AVERROR_PATCHWELCOME => bail!("Decoder produced an unsupported pixel format"),
+            code => bail!("Decoding failed (FFmpeg error {code})"),
+        }
+    }
+
+    /// Also decodes the audio track as interleaved f32 at `rate` Hz, `channels`
+    /// channels. Returns false when the file has no playable audio.
+    pub fn enable_audio(&mut self, rate: u32, channels: u32) -> bool {
+        unsafe { jv_decoder_enable_audio(self.raw, rate as c_int, channels as c_int) == 0 }
+    }
+
+    /// Takes the audio decoded so far (read alongside video frames), with the
+    /// time of its first sample in seconds from the start of the video.
+    pub fn take_audio(&mut self, channels: u32) -> Option<(Vec<f32>, Option<f64>)> {
+        let frames = unsafe { jv_decoder_audio_available(self.raw) };
+        if frames <= 0 {
+            return None;
+        }
+        let mut samples = vec![0f32; frames as usize * channels as usize];
+        let mut pts = -1.0;
+        let n = unsafe { jv_decoder_audio_read(self.raw, samples.as_mut_ptr(), frames, &mut pts) };
+        samples.truncate(n.max(0) as usize * channels as usize);
+        Some((samples, (pts >= 0.0).then_some(pts)))
+    }
+
+    /// Jumps to the keyframe at or before `seconds`; frames before the target
+    /// still arrive and should be skipped by the caller.
+    pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
+        match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
+            0 => Ok(()),
+            code => bail!("Seek failed (FFmpeg error {code})"),
+        }
+    }
+}
+
+impl Drop for VideoDecoder {
+    fn drop(&mut self) {
+        unsafe { jv_decoder_close(self.raw) };
+    }
+}

@@ -1,0 +1,202 @@
+--- a/libavcodec/aarch64/hevcdsp_init_aarch64.c
++++ b/libavcodec/aarch64/hevcdsp_init_aarch64.c
+@@ -27,6 +27,7 @@
+ #include "libavutil/aarch64/cpu.h"
+ #include "libavcodec/aarch64/h26x/dsp.h"
+ #include "libavcodec/hevc/dsp.h"
++#include "hevcdsp_pel10_neon.h"
+ 
+ void ff_hevc_v_loop_filter_chroma_8_neon(uint8_t *_pix, ptrdiff_t _stride,
+                                          const int *_tc, const uint8_t *_no_p, const uint8_t *_no_q);
+@@ -325,6 +326,14 @@
+         c->idct_dc[2]                  = ff_hevc_idct_16x16_dc_10_neon;
+         c->idct_dc[3]                  = ff_hevc_idct_32x32_dc_10_neon;
+         c->dequant                     = hevc_dequant_10_neon;
++        for (int i = 0; i < 10; i++) {
++            c->put_hevc_qpel[i][0][0]      = ff_hevc_put_hevc_pel_pixels10_neon;
++            c->put_hevc_epel[i][0][0]      = ff_hevc_put_hevc_pel_pixels10_neon;
++            c->put_hevc_qpel_bi[i][0][0]   = ff_hevc_put_hevc_pel_bi_pixels10_neon;
++            c->put_hevc_epel_bi[i][0][0]   = ff_hevc_put_hevc_pel_bi_pixels10_neon;
++            c->put_hevc_qpel_uni_w[i][0][0] = ff_hevc_put_hevc_pel_uni_w_pixels10_neon;
++            c->put_hevc_epel_uni_w[i][0][0] = ff_hevc_put_hevc_pel_uni_w_pixels10_neon;
++        }
+     }
+     if (bit_depth == 12) {
+         c->hevc_h_loop_filter_luma     = ff_hevc_h_loop_filter_luma_12_neon;
+--- a/libavcodec/aarch64/Makefile
++++ b/libavcodec/aarch64/Makefile
+@@ -78,6 +78,7 @@
+                                            aarch64/hevcdsp_dequant_neon.o      \
+                                            aarch64/hevcdsp_idct_neon.o         \
+                                            aarch64/hevcdsp_init_aarch64.o      \
++                                           aarch64/hevcdsp_pel10_neon.o        \
+                                            aarch64/h26x/epel_neon.o            \
+                                            aarch64/h26x/qpel_neon.o            \
+                                            aarch64/h26x/sao_neon.o
+--- /dev/null
++++ b/libavcodec/aarch64/hevcdsp_pel10_neon.c
+@@ -0,0 +1,133 @@
++/*
++ * HEVC 10-bit full-sample ("pel_pixels") motion compensation, AArch64 NEON.
++ *
++ * FFmpeg ships NEON for these at 8-bit only; at 10-bit they fall back to C
++ * and dominate decode time of 10-bit content (~70% on Cortex-A720/X4).
++ * Results are bit-exact with hevc/dsp_template.c / h26x/h2656_inter_template.c.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <arm_neon.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "libavcodec/hevc/dsp.h"
++#include "hevcdsp_pel10_neon.h"
++
++#define PIXEL_MAX ((1 << 10) - 1)
++
++/* dst[x] = src[x] << 4 (14-bit intermediate), dst stride MAX_PB_SIZE. */
++void ff_hevc_put_hevc_pel_pixels10_neon(int16_t *dst, const uint8_t *_src,
++                                        ptrdiff_t _srcstride, int height,
++                                        intptr_t mx, intptr_t my, int width)
++{
++    const uint16_t *src = (const uint16_t *)_src;
++    const ptrdiff_t srcstride = _srcstride / 2;
++
++    for (int y = 0; y < height; y++) {
++        int x = 0;
++        for (; x + 16 <= width; x += 16) {
++            uint16x8_t a = vld1q_u16(src + x), b = vld1q_u16(src + x + 8);
++            vst1q_s16(dst + x,     vreinterpretq_s16_u16(vshlq_n_u16(a, 4)));
++            vst1q_s16(dst + x + 8, vreinterpretq_s16_u16(vshlq_n_u16(b, 4)));
++        }
++        for (; x + 8 <= width; x += 8)
++            vst1q_s16(dst + x, vreinterpretq_s16_u16(vshlq_n_u16(vld1q_u16(src + x), 4)));
++        for (; x + 4 <= width; x += 4)
++            vst1_s16(dst + x, vreinterpret_s16_u16(vshl_n_u16(vld1_u16(src + x), 4)));
++        for (; x < width; x++)
++            dst[x] = src[x] << 4;
++        src += srcstride;
++        dst += MAX_PB_SIZE;
++    }
++}
++
++/* Clip((src << 4) + src2 + 16) >> 5). Saturating the int16 sum cannot change
++ * the clipped result: any saturated value already clips to 0 or 1023. */
++static inline int16x8_t bi8(uint16x8_t s, int16x8_t s2)
++{
++    int16x8_t sum = vqaddq_s16(vreinterpretq_s16_u16(vshlq_n_u16(s, 4)), s2);
++    int16x8_t r   = vrshrq_n_s16(sum, 5);
++    return vminq_s16(vmaxq_s16(r, vdupq_n_s16(0)), vdupq_n_s16(PIXEL_MAX));
++}
++
++void ff_hevc_put_hevc_pel_bi_pixels10_neon(uint8_t *_dst, ptrdiff_t _dststride,
++                                           const uint8_t *_src, ptrdiff_t _srcstride,
++                                           const int16_t *src2, int height,
++                                           intptr_t mx, intptr_t my, int width)
++{
++    const uint16_t *src = (const uint16_t *)_src;
++    uint16_t *dst = (uint16_t *)_dst;
++    const ptrdiff_t srcstride = _srcstride / 2, dststride = _dststride / 2;
++
++    for (int y = 0; y < height; y++) {
++        int x = 0;
++        for (; x + 16 <= width; x += 16) {
++            int16x8_t a = bi8(vld1q_u16(src + x),     vld1q_s16(src2 + x));
++            int16x8_t b = bi8(vld1q_u16(src + x + 8), vld1q_s16(src2 + x + 8));
++            vst1q_u16(dst + x,     vreinterpretq_u16_s16(a));
++            vst1q_u16(dst + x + 8, vreinterpretq_u16_s16(b));
++        }
++        for (; x + 8 <= width; x += 8)
++            vst1q_u16(dst + x, vreinterpretq_u16_s16(bi8(vld1q_u16(src + x), vld1q_s16(src2 + x))));
++        for (; x + 4 <= width; x += 4) {
++            int16x8_t r = bi8(vcombine_u16(vld1_u16(src + x), vdup_n_u16(0)),
++                              vcombine_s16(vld1_s16(src2 + x), vdup_n_s16(0)));
++            vst1_u16(dst + x, vreinterpret_u16_s16(vget_low_s16(r)));
++        }
++        for (; x < width; x++) {
++            int v = ((src[x] << 4) + src2[x] + 16) >> 5;
++            dst[x] = v < 0 ? 0 : v > PIXEL_MAX ? PIXEL_MAX : v;
++        }
++        src  += srcstride;
++        dst  += dststride;
++        src2 += MAX_PB_SIZE;
++    }
++}
++
++/* Clip((((src << 4) * wx + (1 << (shift - 1))) >> shift) + (ox << 2)),
++ * shift = denom + 4. vrshlq by -shift is exactly (v + round) >> shift. */
++static inline uint16x4_t uni_w4(uint16x4_t s, int16x4_t wx, int32x4_t neg_shift, int32x4_t ox)
++{
++    int32x4_t v = vmull_s16(vreinterpret_s16_u16(vshl_n_u16(s, 4)), wx);
++    v = vaddq_s32(vrshlq_s32(v, neg_shift), ox);
++    return vqmovun_s32(vminq_s32(v, vdupq_n_s32(PIXEL_MAX)));
++}
++
++void ff_hevc_put_hevc_pel_uni_w_pixels10_neon(uint8_t *_dst, ptrdiff_t _dststride,
++                                              const uint8_t *_src, ptrdiff_t _srcstride,
++                                              int height, int denom, int wx, int ox,
++                                              intptr_t mx, intptr_t my, int width)
++{
++    const uint16_t *src = (const uint16_t *)_src;
++    uint16_t *dst = (uint16_t *)_dst;
++    const ptrdiff_t srcstride = _srcstride / 2, dststride = _dststride / 2;
++    const int shift = denom + 4;
++    const int16x4_t wxv = vdup_n_s16(wx);
++    const int32x4_t neg_shift = vdupq_n_s32(-shift);
++    const int32x4_t oxv = vdupq_n_s32(ox * 4);
++
++    for (int y = 0; y < height; y++) {
++        int x = 0;
++        for (; x + 8 <= width; x += 8) {
++            uint16x8_t s = vld1q_u16(src + x);
++            uint16x4_t lo = uni_w4(vget_low_u16(s),  wxv, neg_shift, oxv);
++            uint16x4_t hi = uni_w4(vget_high_u16(s), wxv, neg_shift, oxv);
++            vst1q_u16(dst + x, vcombine_u16(lo, hi));
++        }
++        for (; x + 4 <= width; x += 4)
++            vst1_u16(dst + x, uni_w4(vld1_u16(src + x), wxv, neg_shift, oxv));
++        for (; x < width; x++) {
++            int v = ((((src[x] << 4) * wx) + (1 << (shift - 1))) >> shift) + ox * 4;
++            dst[x] = v < 0 ? 0 : v > PIXEL_MAX ? PIXEL_MAX : v;
++        }
++        src += srcstride;
++        dst += dststride;
++    }
++}
+--- /dev/null
++++ b/libavcodec/aarch64/hevcdsp_pel10_neon.h
+@@ -0,0 +1,28 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#ifndef AVCODEC_AARCH64_HEVCDSP_PEL10_NEON_H
++#define AVCODEC_AARCH64_HEVCDSP_PEL10_NEON_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++void ff_hevc_put_hevc_pel_pixels10_neon(int16_t *dst, const uint8_t *src,
++                                        ptrdiff_t srcstride, int height,
++                                        intptr_t mx, intptr_t my, int width);
++void ff_hevc_put_hevc_pel_bi_pixels10_neon(uint8_t *dst, ptrdiff_t dststride,
++                                           const uint8_t *src, ptrdiff_t srcstride,
++                                           const int16_t *src2, int height,
++                                           intptr_t mx, intptr_t my, int width);
++void ff_hevc_put_hevc_pel_uni_w_pixels10_neon(uint8_t *dst, ptrdiff_t dststride,
++                                              const uint8_t *src, ptrdiff_t srcstride,
++                                              int height, int denom, int wx, int ox,
++                                              intptr_t mx, intptr_t my, int width);
++
++#endif /* AVCODEC_AARCH64_HEVCDSP_PEL10_NEON_H */
