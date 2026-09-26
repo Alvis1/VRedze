@@ -118,3 +118,8 @@ Generated media, machine reports and local dependency sysroots are ignored.
 
 See [hardware gate](docs/hardware-validation.md), [architecture](docs/architecture.md)
 and [remaining work](docs/roadmap.md).
+
+## License
+
+MIT (see `LICENSE`). Bundled and linked third-party components keep their own
+licenses, listed in `THIRD_PARTY_NOTICES.md`. FFmpeg is used under the LGPL.
