@@ -1,5 +1,8 @@
-| AI Disclaimer: Text below is AI generated, sorry I'm lazy. 
-| Most of the code is as well. AI contributions are welcome (as to not be a hypocrite).  
+```
+AI Disclaimer: Text below is AI generated, sorry I'm lazy.
+Most of the code is as well.
+AI contributions are welcome (as to not be a hypocrite).  
+```
 
 # Just Video
 
