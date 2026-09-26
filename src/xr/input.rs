@@ -1,6 +1,6 @@
-//! Controller input: an aim ray per hand, select (trigger), back (B),
-//! play/pause (A) and scroll (thumbstick). Bindings are suggested for the
-//! Steam Frame controller, Index controllers and the generic simple profile.
+//! Controller input: an aim ray per hand (smoothed), select (trigger or A),
+//! back (B), scroll (thumbstick; grip held = faster). Bindings are suggested for the Steam
+//! Frame controller, Index controllers and the generic simple profile.
 
 use super::context::XrContext;
 use openxr as xr;
@@ -19,7 +19,10 @@ pub struct InputState {
     /// Select held down, per hand (dragging).
     pub select_held: [bool; 2],
     pub back: bool,
-    pub pause: bool,
+    /// Thumbstick pressed in (reset view) this frame.
+    pub reset: bool,
+    /// Grip (lower trigger) held on either hand: a modifier, e.g. fast scroll.
+    pub grip: bool,
     /// Thumbstick vertical deflection (-1..1, up positive), strongest hand.
     pub scroll: f32,
 }
@@ -29,10 +32,65 @@ pub struct Input {
     aim: xr::Action<xr::Posef>,
     select: xr::Action<bool>,
     back: xr::Action<bool>,
-    pause: xr::Action<bool>,
+    reset: xr::Action<bool>,
+    grip: xr::Action<bool>,
     scroll: xr::Action<xr::Vector2f>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
+    /// Per hand: origin and direction filters.
+    filters: [[OneEuro; 2]; 2],
+}
+
+/// One Euro filter (Casiez et al.): heavy smoothing while still, little lag
+/// when moving fast. Filters a 3-vector.
+#[derive(Clone, Copy)]
+struct OneEuro {
+    min_cutoff: f32,
+    beta: f32,
+    value: Option<[f32; 3]>,
+    speed: [f32; 3],
+    time: i64,
+}
+
+impl OneEuro {
+    const fn new(min_cutoff: f32, beta: f32) -> Self {
+        Self {
+            min_cutoff,
+            beta,
+            value: None,
+            speed: [0.0; 3],
+            time: 0,
+        }
+    }
+
+    fn alpha(cutoff: f32, dt: f32) -> f32 {
+        let tau = 1.0 / (2.0 * std::f32::consts::PI * cutoff);
+        1.0 / (1.0 + tau / dt)
+    }
+
+    fn filter(&mut self, x: [f32; 3], time: i64) -> [f32; 3] {
+        let Some(prev) = self.value else {
+            self.value = Some(x);
+            self.time = time;
+            return x;
+        };
+        let dt = ((time - self.time) as f32 / 1e9).clamp(1e-4, 0.1);
+        self.time = time;
+        let a_d = Self::alpha(1.0, dt);
+        let mut out = [0.0; 3];
+        for i in 0..3 {
+            let raw_speed = (x[i] - prev[i]) / dt;
+            self.speed[i] += a_d * (raw_speed - self.speed[i]);
+            let cutoff = self.min_cutoff + self.beta * self.speed[i].abs();
+            out[i] = prev[i] + Self::alpha(cutoff, dt) * (x[i] - prev[i]);
+        }
+        self.value = Some(out);
+        out
+    }
+
+    fn reset(&mut self) {
+        self.value = None;
+    }
 }
 
 fn rotate(q: xr::Quaternionf, v: [f32; 3]) -> [f32; 3] {
@@ -61,14 +119,16 @@ impl Input {
         let aim = set.create_action::<xr::Posef>("aim", "Pointer", &hands)?;
         let select = set.create_action::<bool>("select", "Select", &hands)?;
         let back = set.create_action::<bool>("back", "Back", &hands)?;
-        let pause = set.create_action::<bool>("pause", "Play / pause", &hands)?;
+        let reset = set.create_action::<bool>("reset", "Reset view", &hands)?;
+        let grip = set.create_action::<bool>("grip", "Modifier", &hands)?;
         let scroll = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
 
         let binding = |action: &str, path: xr::Path| match action {
             "aim" => xr::Binding::new(&aim, path),
             "select" => xr::Binding::new(&select, path),
             "back" => xr::Binding::new(&back, path),
-            "pause" => xr::Binding::new(&pause, path),
+            "reset" => xr::Binding::new(&reset, path),
+            "grip" => xr::Binding::new(&grip, path),
             _ => xr::Binding::new(&scroll, path),
         };
         // Suggests every binding the runtime accepts for `profile` (each is
@@ -80,7 +140,10 @@ impl Input {
                 for (action, input) in wanted {
                     let path = xr_.string_to_path(&format!("/user/hand/{hand}/input/{input}"))?;
                     if xr_
-                        .suggest_interaction_profile_bindings(profile_path, &[binding(action, path)])
+                        .suggest_interaction_profile_bindings(
+                            profile_path,
+                            &[binding(action, path)],
+                        )
                         .is_ok()
                     {
                         accepted.push((*action, path));
@@ -97,11 +160,14 @@ impl Input {
             ("aim", "aim/pose"),
             ("select", "trigger/click"),
             ("select", "trigger/value"),
+            ("select", "a/click"),
+            ("select", "x/click"),
             ("back", "b/click"),
             ("back", "y/click"),
-            ("pause", "a/click"),
-            ("pause", "x/click"),
             ("scroll", "thumbstick"),
+            ("reset", "thumbstick/click"),
+            ("grip", "squeeze/click"),
+            ("grip", "squeeze/value"),
         ];
         for profile in [
             "/interaction_profiles/valve/frame_controller",
@@ -115,7 +181,11 @@ impl Input {
         }
         suggest(
             "/interaction_profiles/khr/simple_controller",
-            &[("aim", "aim/pose"), ("select", "select/click"), ("back", "menu/click")],
+            &[
+                ("aim", "aim/pose"),
+                ("select", "select/click"),
+                ("back", "menu/click"),
+            ],
         )?;
         ctx.session.attach_action_sets(&[&set])?;
         let spaces = [
@@ -127,15 +197,18 @@ impl Input {
             aim,
             select,
             back,
-            pause,
+            reset,
+            grip,
             scroll,
             hands,
             spaces,
+            // Direction: unit vector (rad/s-ish speeds); origin: metres.
+            filters: [[OneEuro::new(3.0, 6.0), OneEuro::new(1.5, 0.6)]; 2],
         })
     }
 
     pub fn poll(
-        &self,
+        &mut self,
         ctx: &XrContext,
         space: &xr::Space,
         time: xr::Time,
@@ -151,7 +224,9 @@ impl Input {
             let held = self.select.state(&ctx.session, hand)?;
             state.select_held[i] = held.is_active && held.current_state;
             state.back |= pressed(&self.back, hand)?;
-            state.pause |= pressed(&self.pause, hand)?;
+            state.reset |= pressed(&self.reset, hand)?;
+            let grip = self.grip.state(&ctx.session, hand)?;
+            state.grip |= grip.is_active && grip.current_state;
             let stick = self.scroll.state(&ctx.session, hand)?;
             if stick.is_active && stick.current_state.y.abs() > state.scroll.abs() {
                 state.scroll = stick.current_state.y;
@@ -163,10 +238,18 @@ impl Input {
                     && flags.contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
                 {
                     let p = location.pose.position;
+                    let t = time.as_nanos();
+                    let origin = self.filters[i][0].filter([p.x, p.y, p.z], t);
+                    let d = self.filters[i][1]
+                        .filter(rotate(location.pose.orientation, [0.0, 0.0, -1.0]), t);
+                    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6);
                     state.rays[i] = Some(Ray {
-                        origin: [p.x, p.y, p.z],
-                        direction: rotate(location.pose.orientation, [0.0, 0.0, -1.0]),
+                        origin,
+                        direction: [d[0] / len, d[1] / len, d[2] / len],
                     });
+                } else {
+                    self.filters[i][0].reset();
+                    self.filters[i][1].reset();
                 }
             }
         }
@@ -177,6 +260,28 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_euro_smooths_jitter_but_follows_motion() {
+        let mut f = OneEuro::new(3.0, 6.0);
+        let step = 11_111_111; // 90 Hz
+        // Holding still with ±0.004 noise (~0.25° on a unit vector).
+        let mut max_dev = 0.0f32;
+        for i in 0..200 {
+            let noise = if i % 2 == 0 { 0.004 } else { -0.004 };
+            let out = f.filter([noise, 0.0, -1.0], i * step);
+            if i > 20 {
+                max_dev = max_dev.max(out[0].abs());
+            }
+        }
+        assert!(max_dev < 0.001, "jitter left: {max_dev}");
+        // A fast turn is followed within a few frames.
+        let mut out = [0.0; 3];
+        for i in 200..210 {
+            out = f.filter([0.5, 0.0, -0.8], i * step);
+        }
+        assert!((out[0] - 0.5).abs() < 0.05, "lagging: {out:?}");
+    }
 
     #[test]
     fn rotation_turns_forward_vector() {

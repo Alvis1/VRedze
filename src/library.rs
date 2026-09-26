@@ -3,7 +3,7 @@
 //! channel. Navigation and opening use one worker, playability probes another,
 //! so a slow probe never delays browsing.
 
-use crate::config::Server;
+use crate::config::{self, LayoutOverride, Server};
 use crate::media::{Media, VideoDecoder};
 use crate::playability::{self, Assessment, Platform};
 use crate::readahead::ReadAhead;
@@ -23,25 +23,44 @@ pub type Path = Vec<String>;
 pub enum Request {
     Shares {
         id: u64,
-        server: usize,
+        server: Server,
     },
     List {
         id: u64,
-        server: usize,
+        server: Server,
         share: String,
         path: Path,
     },
     Probe {
         generation: u64,
-        server: usize,
+        server: Server,
         share: String,
         path: Path,
     },
     Open {
         id: u64,
-        server: usize,
+        server: Server,
         share: String,
         path: Path,
+    },
+    Rename {
+        id: u64,
+        server: Server,
+        share: String,
+        path: Path,
+        new_name: String,
+    },
+    Delete {
+        id: u64,
+        server: Server,
+        share: String,
+        path: Path,
+    },
+    /// Checks the login (and that shares can be listed), then saves the server.
+    AddServer {
+        id: u64,
+        server: Server,
+        password: String,
     },
 }
 
@@ -50,6 +69,8 @@ pub struct Opened {
     pub layout: Layout,
     pub assessment: Assessment,
     pub name: String,
+    /// Where this file's layout override is stored.
+    pub key: String,
 }
 
 pub enum Response {
@@ -70,10 +91,15 @@ pub enum Response {
         id: u64,
         result: Result<Box<Opened>, String>,
     },
+    /// Rename or delete finished.
+    Changed { id: u64, result: Result<(), String> },
+    ServerAdded {
+        id: u64,
+        result: Result<Server, String>,
+    },
 }
 
 pub struct Library {
-    pub servers: Vec<Server>,
     main: mpsc::Sender<Request>,
     probes: mpsc::Sender<Request>,
     responses: mpsc::Receiver<Response>,
@@ -81,37 +107,65 @@ pub struct Library {
     probe_generation: Arc<AtomicU64>,
 }
 
-type Sessions = Arc<Mutex<HashMap<usize, Arc<SmbSession>>>>;
+/// What a connection is used for. Browsing and playability probes keep one
+/// connection each per server; every playing video gets its own (see Open).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Purpose {
+    Browse,
+    Probe,
+}
+
+type Sessions = Arc<Mutex<HashMap<(String, Purpose), Arc<SmbSession>>>>;
+
+/// Key of a file's saved layout override.
+pub fn file_key(server: &Server, share: &str, path: &Path) -> String {
+    format!("{}/{share}/{}", server.url, path.join("/"))
+}
+
+fn connect(server: &Server, password: Option<String>) -> Result<Arc<SmbSession>, String> {
+    let url: SmbUrl = server.url.parse().map_err(|e| format!("{e:#}"))?;
+    let password = match password {
+        Some(p) => p,
+        None => config::password(&server.url)
+            .map_err(|e| format!("{e:#}"))?
+            .unwrap_or_default(),
+    };
+    Ok(Arc::new(SmbSession::connect(url, password).map_err(
+        |e| format!("Can't connect to {}: {e:#}", server.name),
+    )?))
+}
 
 fn session(
-    servers: &[Server],
     sessions: &Sessions,
-    index: usize,
+    server: &Server,
+    purpose: Purpose,
 ) -> Result<Arc<SmbSession>, String> {
-    if let Some(s) = sessions.lock().expect("sessions").get(&index) {
+    let key = (server.url.clone(), purpose);
+    if let Some(s) = sessions.lock().expect("sessions").get(&key) {
         return Ok(s.clone());
     }
-    let server = servers.get(index).ok_or("Unknown server")?;
-    let url: SmbUrl = server.url.parse().map_err(|e| format!("{e:#}"))?;
-    let password = crate::config::password(&server.url)
-        .map_err(|e| format!("{e:#}"))?
-        .unwrap_or_default();
-    let session = Arc::new(
-        SmbSession::connect(url, password)
-            .map_err(|e| format!("Can't connect to {}: {e:#}", server.name))?,
-    );
+    let session = connect(server, None)?;
     sessions
         .lock()
         .expect("sessions")
-        .insert(index, session.clone());
+        .insert(key, session.clone());
     Ok(session)
 }
 
 /// Forgets a server connection after a failure so the next request reconnects;
 /// a broken connection must never wedge browsing until the app restarts.
-fn evict(sessions: &Sessions, index: usize) {
-    if sessions.lock().expect("sessions").remove(&index).is_some() {
-        eprintln!("Library: reconnecting to server {index} on next request");
+fn evict(sessions: &Sessions, server: &Server, purpose: Purpose) {
+    // Dropping a wedged session can block on its logoff; never here.
+    if let Some(session) = sessions
+        .lock()
+        .expect("sessions")
+        .remove(&(server.url.clone(), purpose))
+    {
+        eprintln!(
+            "Library: reconnecting to {} ({purpose:?}) on next request",
+            server.name
+        );
+        crate::xr::app::drop_in_background(session);
     }
 }
 
@@ -119,48 +173,62 @@ fn smb_path(path: &Path) -> String {
     path.join("\\")
 }
 
-fn open_media(
-    session: &SmbSession,
-    share: &str,
-    path: &Path,
-    read_ahead: ReadAhead,
-) -> anyhow::Result<Media> {
-    let reader = session.open_in(share, &smb_path(path), read_ahead)?;
-    Media::open(path.last().map_or("", String::as_str), reader)
-}
-
-fn handle(request: Request, servers: &[Server], sessions: &Sessions, hw: Option<&str>) -> Response {
+fn handle(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
     let started = std::time::Instant::now();
     let (server, what) = match &request {
-        Request::Shares { server, .. } => (*server, "shares"),
-        Request::List { server, .. } => (*server, "list"),
-        Request::Probe { server, .. } => (*server, "probe"),
-        Request::Open { server, .. } => (*server, "open"),
+        Request::Shares { server, .. } => (server.clone(), "shares"),
+        Request::List { server, .. } => (server.clone(), "list"),
+        Request::Probe { server, .. } => (server.clone(), "probe"),
+        Request::Open { server, .. } => (server.clone(), "open"),
+        Request::Rename { server, .. } => (server.clone(), "rename"),
+        Request::Delete { server, .. } => (server.clone(), "delete"),
+        Request::AddServer { server, .. } => (server.clone(), "add server"),
     };
-    let response = run(request, servers, sessions, hw);
+    let response = run(request, sessions, hw);
     let failure = match &response {
         Response::Shares { result: Err(e), .. }
         | Response::List { result: Err(e), .. }
-        | Response::Opened { result: Err(e), .. } => Some(e.clone()),
+        | Response::Opened { result: Err(e), .. }
+        | Response::Changed { result: Err(e), .. }
+        | Response::ServerAdded { result: Err(e), .. } => Some(e.clone()),
         // A bad file is not a connection problem; a stalled server is.
-        Response::Probe { result: Err(e), .. } if e.contains("stopped sending") || e.contains("timed out") => Some(e.clone()),
+        Response::Probe { result: Err(e), .. }
+            if e.contains("stopped sending") || e.contains("did not answer") =>
+        {
+            Some(e.clone())
+        }
         _ => None,
     };
     if let Some(e) = failure {
-        eprintln!("Library: {what} failed after {:.1}s: {e}", started.elapsed().as_secs_f64());
-        evict(sessions, server);
+        eprintln!(
+            "Library: {what} failed after {:.1}s: {e}",
+            started.elapsed().as_secs_f64()
+        );
+        // Only unanswered requests mean the connection itself is broken.
+        if e.contains("did not answer") || e.contains("stopped sending") {
+            match what {
+                "probe" => evict(sessions, &server, Purpose::Probe),
+                // A video has its own connection, which closes with it.
+                "open" | "add server" => {}
+                _ => evict(sessions, &server, Purpose::Browse),
+            }
+        }
     } else if started.elapsed().as_secs_f64() > 2.0 {
-        eprintln!("Library: {what} took {:.1}s", started.elapsed().as_secs_f64());
+        eprintln!(
+            "Library: {what} took {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
     }
     response
 }
 
-fn run(request: Request, servers: &[Server], sessions: &Sessions, hw: Option<&str>) -> Response {
+fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
     let err = |e: anyhow::Error| format!("{e:#}");
     match request {
         Request::Shares { id, server } => Response::Shares {
             id,
-            result: session(servers, sessions, server).and_then(|s| s.shares().map_err(err)),
+            result: session(sessions, &server, Purpose::Browse)
+                .and_then(|s| s.shares().map_err(err)),
         },
         Request::List {
             id,
@@ -169,7 +237,7 @@ fn run(request: Request, servers: &[Server], sessions: &Sessions, hw: Option<&st
             path,
         } => Response::List {
             id,
-            result: session(servers, sessions, server)
+            result: session(sessions, &server, Purpose::Browse)
                 .and_then(|s| s.list_in(&share, &smb_path(&path)).map_err(err)),
         },
         Request::Probe {
@@ -183,8 +251,9 @@ fn run(request: Request, servers: &[Server], sessions: &Sessions, hw: Option<&st
                 block_size: 256 * 1024,
                 blocks_ahead: 4,
             };
-            let result = session(servers, sessions, server).and_then(|s| {
-                open_media(&s, &share, &path, probe)
+            let result = session(sessions, &server, Purpose::Probe).and_then(|s| {
+                let reader = s.open_in(&share, &smb_path(&path), probe).map_err(err)?;
+                Media::open(path.last().map_or("", String::as_str), reader)
                     .map(|m| playability::assess(Platform::current(), m.info().video.as_ref()))
                     .map_err(err)
             });
@@ -200,35 +269,99 @@ fn run(request: Request, servers: &[Server], sessions: &Sessions, hw: Option<&st
             share,
             path,
         } => {
-            let result = session(servers, sessions, server).and_then(|s| {
-                let media = open_media(&s, &share, &path, ReadAhead::default()).map_err(err)?;
+            // A dedicated connection per video: if it wedges, only this video
+            // is affected, and it closes when the video does.
+            let key = file_key(&server, &share, &path);
+            let result = connect(&server, None).and_then(|s| {
+                let reader = s
+                    .open_owned(&share, &smb_path(&path), ReadAhead::default())
+                    .map_err(err)?;
+                let media =
+                    Media::open(path.last().map_or("", String::as_str), reader).map_err(err)?;
                 let name = path.last().cloned().unwrap_or_default();
                 let video = media.info().video.clone();
                 let assessment = playability::assess(Platform::current(), video.as_ref());
-                let layout = vr::detect(&name, video.as_ref());
+                let mut layout = vr::detect(&name, video.as_ref());
+                if let Ok(Some(saved)) = config::layout_override(&key) {
+                    saved.apply(&mut layout);
+                }
+                // The last video's decoder closes in the background; wait for
+                // it, or the hardware decoder is still busy.
+                if !crate::media::wait_for_decoders_closed(std::time::Duration::from_secs(10)) {
+                    eprintln!("Library: the previous video's decoder is still closing");
+                }
                 let decoder = media.into_decoder(hw, true, "").map_err(err)?;
                 Ok(Box::new(Opened {
                     decoder,
                     layout,
                     assessment,
                     name,
+                    key,
                 }))
             });
             Response::Opened { id, result }
+        }
+        Request::Rename {
+            id,
+            server,
+            share,
+            path,
+            new_name,
+        } => {
+            let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
+                s.rename_in(&share, &smb_path(&path), &new_name)
+                    .map_err(err)?;
+                // Keep a saved VR layout with the file.
+                let mut renamed = path.clone();
+                if let Some(last) = renamed.last_mut() {
+                    *last = new_name.clone();
+                }
+                let _ = config::move_layout_override(
+                    &file_key(&server, &share, &path),
+                    &file_key(&server, &share, &renamed),
+                );
+                Ok(())
+            });
+            Response::Changed { id, result }
+        }
+        Request::Delete {
+            id,
+            server,
+            share,
+            path,
+        } => {
+            let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
+                s.delete_in(&share, &smb_path(&path)).map_err(err)?;
+                let _ = config::save_layout_override(&file_key(&server, &share, &path), None);
+                Ok(())
+            });
+            Response::Changed { id, result }
+        }
+        Request::AddServer {
+            id,
+            server,
+            password,
+        } => {
+            let result = connect(&server, Some(password.clone())).and_then(|s| {
+                s.shares().map_err(err)?;
+                config::save_server(server.clone(), &password).map_err(err)?;
+                Ok(server)
+            });
+            Response::ServerAdded { id, result }
         }
     }
 }
 
 impl Library {
     /// `hw` is the preferred hardware backend for playback (see `media::default_hw_backend`).
-    pub fn start(servers: Vec<Server>, hw: Option<&'static str>) -> Self {
+    pub fn start(hw: Option<&'static str>) -> Self {
         let sessions: Sessions = Default::default();
         let probe_generation = Arc::new(AtomicU64::new(0));
         let (response_tx, responses) = mpsc::channel();
         let mut senders = Vec::new();
         for name in ["library", "probe"] {
             let (tx, rx) = mpsc::channel::<Request>();
-            let (servers, sessions, out) = (servers.clone(), sessions.clone(), response_tx.clone());
+            let (sessions, out) = (sessions.clone(), response_tx.clone());
             let current = probe_generation.clone();
             std::thread::Builder::new()
                 .name(name.into())
@@ -239,7 +372,7 @@ impl Library {
                         {
                             continue;
                         }
-                        if out.send(handle(request, &servers, &sessions, hw)).is_err() {
+                        if out.send(handle(request, &sessions, hw)).is_err() {
                             return;
                         }
                     }
@@ -250,7 +383,6 @@ impl Library {
         let probes = senders.pop().expect("probe worker");
         let main = senders.pop().expect("main worker");
         Self {
-            servers,
             main,
             probes,
             responses,
@@ -274,5 +406,13 @@ impl Library {
 
     pub fn try_recv(&self) -> Option<Response> {
         self.responses.try_recv().ok()
+    }
+}
+
+impl LayoutOverride {
+    pub fn apply(&self, layout: &mut Layout) {
+        layout.projection = self.projection;
+        layout.stereo = self.stereo;
+        layout.swap_eyes = self.swap_eyes;
     }
 }

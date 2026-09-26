@@ -37,7 +37,11 @@ impl XrContext {
         extensions.khr_vulkan_enable2 = true;
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
-        if available.other.iter().any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes()) {
+        if available
+            .other
+            .iter()
+            .any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes())
+        {
             extensions.other.push(FRAME_CONTROLLER.into());
             eprintln!("OpenXR: enabled {FRAME_CONTROLLER}");
         } else {

@@ -2,20 +2,36 @@
 //! drawn into a canvas that is shown on an OpenXR quad layer.
 
 use super::canvas::{Canvas, Fonts, Rgb};
+use super::form::{self, Form};
 use crate::playability::Verdict;
 
 pub const WIDTH: u32 = 1600;
 pub const HEIGHT: u32 = 1000;
 const HEADER: f32 = 120.0;
-const FOOTER: f32 = 64.0;
+const BOTTOM: f32 = 24.0;
 const ROW: f32 = 88.0;
 const PAD: f32 = 32.0;
+const CRUMB_SIZE: f32 = 40.0;
+const CRUMB_SEP: &str = "  ›  ";
+/// Unlock button and row actions, from the right edge of a row.
+const LOCK_W: f32 = 76.0;
+const ACTION_W: f32 = 150.0;
+/// The scrollbar's grab zone at the right edge of the list.
+const SCROLL_W: f32 = 64.0;
+/// Header tool buttons (e.g. "Select", "Delete 3").
+const TOOL_W: f32 = 220.0;
+const TOOL_GAP: f32 = 12.0;
+const ICON_TOOL_W: f32 = 84.0;
+
+/// Shown top right so installs can be told apart.
+pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
 
 const BG: Rgb = [0x15, 0x17, 0x1c];
 const ROW_BG: Rgb = [0x1d, 0x21, 0x28];
 const HOVER: Rgb = [0x2c, 0x33, 0x40];
 const TEXT: Rgb = [0xe8, 0xea, 0xed];
 const SUBTLE: Rgb = [0x9a, 0xa0, 0xa6];
+const FAINT: Rgb = [0x5f, 0x63, 0x68];
 const ACCENT: Rgb = [0x4f, 0x8c, 0xff];
 const GREEN: Rgb = [0x34, 0xc7, 0x59];
 const YELLOW: Rgb = [0xff, 0xcc, 0x00];
@@ -32,6 +48,28 @@ pub enum Icon {
     Video(Option<Verdict>),
     /// A file that could not be read.
     Broken,
+    Add,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Rename,
+    /// Delete a file or folder.
+    Delete,
+    Edit,
+    /// Remove a saved server.
+    Remove,
+}
+
+impl Action {
+    fn label(self) -> &'static str {
+        match self {
+            Action::Rename => "Rename",
+            Action::Delete => "Delete",
+            Action::Edit => "Edit",
+            Action::Remove => "Remove",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -40,36 +78,117 @@ pub struct Row {
     pub label: String,
     pub detail: String,
     pub right: String,
+    /// A lock toggle (servers): `Some(unlocked)`.
+    pub lock: Option<bool>,
+    /// Buttons at the right end, left to right.
+    pub actions: Vec<Action>,
+    /// A checkbox in place of the icon (selecting what to delete).
+    pub checked: Option<bool>,
+}
+
+impl Row {
+    pub fn new(icon: Icon, label: impl Into<String>) -> Self {
+        Self {
+            icon,
+            label: label.into(),
+            detail: String::new(),
+            right: String::new(),
+            lock: None,
+            actions: Vec::new(),
+            checked: None,
+        }
+    }
+}
+
+/// A button in the header, right-aligned.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    pub label: String,
+    pub danger: bool,
+    /// Drawn as a square icon button instead of the label.
+    pub icon: Option<ToolIcon>,
+    /// Toggled on (e.g. edit mode).
+    pub active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolIcon {
+    /// Edit mode: rename and delete on each row.
+    Edit,
+    /// Select several entries to delete.
+    Select,
+}
+
+impl Tool {
+    pub fn text(label: impl Into<String>, danger: bool) -> Self {
+        Self {
+            label: label.into(),
+            danger,
+            icon: None,
+            active: false,
+        }
+    }
+
+    pub fn icon(icon: ToolIcon, active: bool) -> Self {
+        Self {
+            label: String::new(),
+            danger: false,
+            icon: Some(icon),
+            active,
+        }
+    }
+
+    fn width(&self) -> f32 {
+        if self.icon.is_some() {
+            ICON_TOOL_W
+        } else {
+            TOOL_W
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct Dialog {
     pub title: String,
     pub body: Vec<String>,
-    pub button: String,
+    /// Left to right; the last one is the primary action.
+    pub buttons: Vec<String>,
+    /// The primary button is destructive (drawn red).
+    pub danger: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct View {
-    pub title: String,
+    /// Breadcrumb path; the last entry is the current place.
+    pub crumbs: Vec<String>,
     pub rows: Vec<Row>,
     /// Shown instead of rows (loading, errors, empty folders).
     pub status: Option<String>,
+    /// Small line at the bottom (e.g. "Opening …").
+    pub notice: Option<String>,
     pub dialog: Option<Dialog>,
+    pub form: Option<Form>,
+    pub tools: Vec<Tool>,
     /// First visible row (fractional while scrolling).
     pub scroll: f32,
-    pub footer: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Row(usize),
-    DialogButton,
+    Crumb(usize),
+    Lock(usize),
+    RowAction(usize, Action),
+    Tool(usize),
+    /// The scrollbar: scroll with [`scroll_at`].
+    ScrollBar,
+    DialogButton(usize),
+    Form(form::Hit),
     Nothing,
 }
 
 pub fn visible_rows() -> f32 {
-    (HEIGHT as f32 - HEADER - FOOTER) / ROW
+    (HEIGHT as f32 - HEADER - BOTTOM) / ROW
 }
 
 impl View {
@@ -82,38 +201,153 @@ impl View {
     }
 }
 
-fn dialog_button_rect() -> (f32, f32, f32, f32) {
-    let (w, h) = (280.0, 80.0);
-    (WIDTH as f32 / 2.0 - w / 2.0, HEIGHT as f32 - 250.0, w, h)
-}
+type Rect = (f32, f32, f32, f32);
 
-fn inside((x, y, w, h): (f32, f32, f32, f32), px: f32, py: f32) -> bool {
+fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
 }
 
+fn dialog_buttons(n: usize) -> Vec<Rect> {
+    let (w, h, gap) = (280.0, 80.0, 24.0);
+    let total = n as f32 * w + (n.saturating_sub(1)) as f32 * gap;
+    let x0 = WIDTH as f32 / 2.0 - total / 2.0;
+    (0..n)
+        .map(|i| (x0 + i as f32 * (w + gap), HEIGHT as f32 - 250.0, w, h))
+        .collect()
+}
+
+fn tools_width(view: &View) -> f32 {
+    view.tools.iter().map(|t| t.width() + TOOL_GAP).sum()
+}
+
+fn tool_rect(view: &View, k: usize) -> Rect {
+    let right: f32 = view.tools[k..].iter().map(|t| t.width() + TOOL_GAP).sum();
+    (
+        WIDTH as f32 - PAD - right + TOOL_GAP,
+        36.0,
+        view.tools[k].width(),
+        62.0,
+    )
+}
+
+fn scroll_track() -> (f32, f32) {
+    (HEADER, HEIGHT as f32 - BOTTOM - HEADER)
+}
+
+fn thumb_height(view: &View) -> f32 {
+    (visible_rows() / view.rows.len().max(1) as f32 * scroll_track().1).max(60.0)
+}
+
+/// The scroll position that puts the scrollbar's thumb under canvas `y`.
+pub fn scroll_at(view: &View, y: f32) -> f32 {
+    let (top, track) = scroll_track();
+    let thumb = thumb_height(view);
+    let f = ((y - top - thumb / 2.0) / (track - thumb).max(1.0)).clamp(0.0, 1.0);
+    f * view.max_scroll()
+}
+
+/// Rows moved by a vertical drag of `dy` canvas pixels.
+pub fn rows_for_drag(dy: f32) -> f32 {
+    dy / ROW
+}
+
+/// Horizontal extent of each breadcrumb, as drawn.
+pub fn crumb_spans(view: &View, fonts: &mut Fonts) -> Vec<(f32, f32)> {
+    let max_w = crumb_limit(view, fonts);
+    let mut x = PAD;
+    let mut spans = Vec::new();
+    for (i, crumb) in view.crumbs.iter().enumerate() {
+        let w = fonts.measure(crumb, CRUMB_SIZE).min(max_w);
+        spans.push((x, x + w));
+        x += w;
+        if i + 1 < view.crumbs.len() {
+            x += fonts.measure(CRUMB_SEP, CRUMB_SIZE);
+        }
+    }
+    spans
+}
+
+fn crumb_limit(view: &View, fonts: &mut Fonts) -> f32 {
+    // Room left of the tools and build label, shared by at most a few long names.
+    let right = (fonts.measure(BUILD, 20.0) + 40.0).max(tools_width(view) + 24.0);
+    ((WIDTH as f32 - 2.0 * PAD - right) / 3.0).max(160.0)
+}
+
+fn row_rect(view: &View, i: usize) -> Rect {
+    let y = HEADER + (i as f32 - view.scroll) * ROW;
+    (PAD, y + 4.0, WIDTH as f32 - 2.0 * PAD - SCROLL_W, ROW - 8.0)
+}
+
+fn lock_rect(view: &View, i: usize) -> Rect {
+    let (x, y, w, h) = row_rect(view, i);
+    (x + w - LOCK_W - 8.0, y + 6.0, LOCK_W, h - 12.0)
+}
+
+/// The `k`th action button of row `i` (buttons sit left of the lock, if any).
+fn action_rect(view: &View, i: usize, k: usize) -> Rect {
+    let (x, y, w, h) = row_rect(view, i);
+    let right = if view.rows[i].lock.is_some() {
+        lock_rect(view, i).0 - 10.0
+    } else {
+        x + w - 8.0
+    };
+    let from_right = (view.rows[i].actions.len() - k) as f32;
+    (
+        right - from_right * (ACTION_W + 10.0) + 10.0,
+        y + 6.0,
+        ACTION_W,
+        h - 12.0,
+    )
+}
+
 /// What the pointer at canvas pixel (x, y) would activate.
-pub fn hit(view: &View, x: f32, y: f32) -> Hit {
-    if view.dialog.is_some() {
-        return if inside(dialog_button_rect(), x, y) {
-            Hit::DialogButton
+pub fn hit(view: &View, crumbs: &[(f32, f32)], x: f32, y: f32) -> Hit {
+    if let Some(f) = &view.form {
+        return Hit::Form(form::hit(f, WIDTH as f32, x, y));
+    }
+    if let Some(dialog) = &view.dialog {
+        return dialog_buttons(dialog.buttons.len())
+            .into_iter()
+            .position(|r| inside(r, x, y))
+            .map_or(Hit::Nothing, Hit::DialogButton);
+    }
+    if y < HEADER - 10.0 {
+        if let Some(k) = (0..view.tools.len()).find(|&k| inside(tool_rect(view, k), x, y)) {
+            return Hit::Tool(k);
+        }
+        // The last crumb is where we are: not a link.
+        let last = view.crumbs.len().saturating_sub(1);
+        return crumbs
+            .iter()
+            .position(|&(a, b)| x >= a - 8.0 && x <= b + 8.0 && y > 30.0)
+            .filter(|&i| i < last)
+            .map_or(Hit::Nothing, Hit::Crumb);
+    }
+    if view.status.is_some() || y > HEIGHT as f32 - BOTTOM || x < PAD || x > WIDTH as f32 - PAD {
+        return Hit::Nothing;
+    }
+    if x > WIDTH as f32 - PAD - SCROLL_W + 8.0 {
+        return if view.max_scroll() > 0.0 {
+            Hit::ScrollBar
         } else {
             Hit::Nothing
         };
     }
-    if view.status.is_some()
-        || y < HEADER
-        || y > HEIGHT as f32 - FOOTER
-        || x < PAD
-        || x > WIDTH as f32 - PAD
-    {
+    let index = ((y - HEADER) / ROW + view.scroll).floor();
+    if index < 0.0 || index as usize >= view.rows.len() {
         return Hit::Nothing;
     }
-    let index = ((y - HEADER) / ROW + view.scroll).floor();
-    if index >= 0.0 && (index as usize) < view.rows.len() {
-        Hit::Row(index as usize)
-    } else {
-        Hit::Nothing
+    let i = index as usize;
+    let row = &view.rows[i];
+    if row.lock.is_some() && inside(lock_rect(view, i), x, y) {
+        return Hit::Lock(i);
     }
+    for (k, action) in row.actions.iter().enumerate() {
+        if inside(action_rect(view, i, k), x, y) {
+            return Hit::RowAction(i, *action);
+        }
+    }
+    Hit::Row(i)
 }
 
 fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
@@ -147,7 +381,57 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.circle(cx, cy, 16.0, RED);
             canvas.rect(cx - 9.0, cy - 3.0, 18.0, 6.0, 2.0, BG);
         }
+        Icon::Add => {
+            canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
+            canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
+        }
     }
+}
+
+/// A pencil pointing down-left.
+fn draw_pencil(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
+    for i in 0..26 {
+        let t = i as f32;
+        canvas.rect(cx - 13.0 + t, cy + 13.0 - t - 4.0, 9.0, 9.0, 2.0, color);
+    }
+    // Tip.
+    canvas.rect(cx - 19.0, cy + 13.0, 6.0, 6.0, 1.0, color);
+}
+
+fn draw_checkbox(canvas: &mut Canvas, cx: f32, cy: f32, checked: bool) {
+    if checked {
+        canvas.rect(cx - 18.0, cy - 18.0, 36.0, 36.0, 7.0, RED);
+        // A tick from two strokes of small squares.
+        for i in 0..8 {
+            let t = i as f32;
+            canvas.rect(cx - 11.0 + t, cy - 1.0 + t, 5.0, 5.0, 1.0, TEXT);
+        }
+        for i in 0..14 {
+            let t = i as f32;
+            canvas.rect(cx - 4.0 + t, cy + 6.0 - t * 1.2, 5.0, 5.0, 1.0, TEXT);
+        }
+    } else {
+        canvas.rect(cx - 18.0, cy - 18.0, 36.0, 36.0, 7.0, SUBTLE);
+        canvas.rect(cx - 14.0, cy - 14.0, 28.0, 28.0, 5.0, ROW_BG);
+    }
+}
+
+/// A padlock, open or closed.
+fn draw_lock(canvas: &mut Canvas, cx: f32, cy: f32, open: bool, color: Rgb) {
+    canvas.rect(cx - 16.0, cy - 2.0, 32.0, 24.0, 5.0, color);
+    let shackle_x = if open { cx + 2.0 } else { cx - 11.0 };
+    // Shackle: an arch from two posts and a top bar.
+    canvas.rect(shackle_x, cy - 20.0, 5.0, 20.0, 2.0, color);
+    canvas.rect(
+        shackle_x + 17.0,
+        cy - (if open { 26.0 } else { 20.0 }),
+        5.0,
+        if open { 14.0 } else { 20.0 },
+        2.0,
+        color,
+    );
+    canvas.rect(shackle_x, cy - 22.0, 22.0, 5.0, 2.0, color);
+    canvas.circle(cx, cy + 9.0, 3.5, BG);
 }
 
 /// Renders the panel; `pointer` highlights what it hovers and, with
@@ -158,30 +442,21 @@ pub fn render(
     pointer: Option<(f32, f32)>,
     draw_cursor: bool,
 ) -> Canvas {
-    let cursor = pointer;
     let mut canvas = Canvas::new(WIDTH, HEIGHT);
     canvas.clear(BG);
     let w = WIDTH as f32;
-    fonts.draw(
-        &mut canvas,
-        &view.title,
-        PAD,
-        78.0,
-        46.0,
-        TEXT,
-        w - 2.0 * PAD,
-    );
-    canvas.rect(
-        PAD,
-        HEADER - 8.0,
-        w - 2.0 * PAD,
-        2.0,
-        0.0,
-        [0x2a, 0x2f, 0x38],
-    );
+    let crumbs = crumb_spans(view, fonts);
+    let hover = pointer.map(|(x, y)| hit(view, &crumbs, x, y));
+    let bottom = HEIGHT as f32 - BOTTOM;
 
-    let hover = cursor.map(|(x, y)| hit(view, x, y));
-    if let Some(status) = &view.status {
+    if let Some(f) = &view.form {
+        let form_hover = match hover {
+            Some(Hit::Form(h)) => h,
+            _ => form::Hit::Nothing,
+        };
+        fonts.draw(&mut canvas, &f.title, PAD, 78.0, 46.0, TEXT, w - 2.0 * PAD);
+        form::render(&mut canvas, fonts, f, form_hover);
+    } else if let Some(status) = &view.status {
         let lines = fonts.wrap(status, 36.0, w - 4.0 * PAD);
         for (i, line) in lines.iter().enumerate() {
             fonts.draw(
@@ -196,35 +471,84 @@ pub fn render(
         }
     } else {
         let first = view.scroll.floor() as usize;
-        let offset = (view.scroll - view.scroll.floor()) * ROW;
-        let bottom = HEIGHT as f32 - FOOTER;
         for (i, row) in view.rows.iter().enumerate().skip(first) {
-            let y = HEADER + (i - first) as f32 * ROW - offset;
-            if y > bottom {
+            let (rx, ry, rw, rh) = row_rect(view, i);
+            if ry > bottom {
                 break;
             }
-            let hovered = hover == Some(Hit::Row(i));
-            canvas.rect(
-                PAD,
-                y + 4.0,
-                w - 2.0 * PAD - 24.0,
-                ROW - 8.0,
-                14.0,
-                if hovered { HOVER } else { ROW_BG },
-            );
-            draw_icon(&mut canvas, &row.icon, PAD + 48.0, y + ROW / 2.0);
-            let right_w = if row.right.is_empty() {
+            let hovered = matches!(hover, Some(Hit::Row(r)) if r == i);
+            canvas.rect(rx, ry, rw, rh, 14.0, if hovered { HOVER } else { ROW_BG });
+            let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
+            match row.checked {
+                Some(checked) => draw_checkbox(&mut canvas, icon_x, icon_y, checked),
+                None => draw_icon(&mut canvas, &row.icon, icon_x, icon_y),
+            }
+            let mut right_edge = rx + rw - 24.0;
+            if let Some(unlocked) = row.lock {
+                let lock = lock_rect(view, i);
+                let lock_hover = hover == Some(Hit::Lock(i));
+                if lock_hover || unlocked {
+                    let fill = if unlocked { [0x3a, 0x2c, 0x14] } else { HOVER };
+                    canvas.rect(lock.0, lock.1, lock.2, lock.3, 12.0, fill);
+                }
+                let color = if unlocked {
+                    ORANGE
+                } else if lock_hover {
+                    TEXT
+                } else {
+                    FAINT
+                };
+                draw_lock(
+                    &mut canvas,
+                    lock.0 + lock.2 / 2.0,
+                    lock.1 + lock.3 / 2.0 + 2.0,
+                    unlocked,
+                    color,
+                );
+                right_edge = lock.0 - 16.0;
+            }
+            for (k, action) in row.actions.iter().enumerate() {
+                let (ax, ay, aw, ah) = action_rect(view, i, k);
+                let color = if matches!(action, Action::Remove | Action::Delete) {
+                    RED
+                } else {
+                    ACCENT
+                };
+                let hovered = hover == Some(Hit::RowAction(i, *action));
+                let fill = if hovered {
+                    color
+                } else {
+                    [color[0] / 3, color[1] / 3, color[2] / 3]
+                };
+                canvas.rect(ax, ay, aw, ah, 12.0, fill);
+                let label = action.label();
+                let lw = fonts.measure(label, 30.0);
+                fonts.draw(
+                    &mut canvas,
+                    label,
+                    ax + (aw - lw) / 2.0,
+                    ay + ah / 2.0 + 11.0,
+                    30.0,
+                    TEXT,
+                    aw,
+                );
+                if k == 0 {
+                    right_edge = ax - 16.0;
+                }
+            }
+            let unlocked = !row.actions.is_empty();
+            let right_w = if row.right.is_empty() || unlocked {
                 0.0
             } else {
                 fonts.measure(&row.right, 28.0) + 24.0
             };
-            let text_w = w - 2.0 * PAD - 24.0 - 100.0 - right_w - 24.0;
+            let text_w = right_edge - right_w - (PAD + 96.0);
             if row.detail.is_empty() {
                 fonts.draw(
                     &mut canvas,
                     &row.label,
                     PAD + 96.0,
-                    y + 56.0,
+                    ry + 52.0,
                     36.0,
                     TEXT,
                     text_w,
@@ -234,7 +558,7 @@ pub fn render(
                     &mut canvas,
                     &row.label,
                     PAD + 96.0,
-                    y + 42.0,
+                    ry + 38.0,
                     34.0,
                     TEXT,
                     text_w,
@@ -243,7 +567,7 @@ pub fn render(
                     &mut canvas,
                     &row.detail,
                     PAD + 96.0,
-                    y + 74.0,
+                    ry + 70.0,
                     24.0,
                     SUBTLE,
                     text_w,
@@ -253,44 +577,120 @@ pub fn render(
                 fonts.draw(
                     &mut canvas,
                     &row.right,
-                    w - PAD - 24.0 - right_w,
-                    y + 56.0,
+                    right_edge - right_w + 12.0,
+                    ry + 52.0,
                     28.0,
                     SUBTLE,
                     right_w,
                 );
             }
         }
-        // Cover rows that scrolled under the header or footer.
+        // Cover rows that scrolled under the header or off the bottom.
         canvas.rect(0.0, 0.0, w, HEADER - 8.0, 0.0, BG);
-        fonts.draw(
-            &mut canvas,
-            &view.title,
-            PAD,
-            78.0,
-            46.0,
-            TEXT,
-            w - 2.0 * PAD,
-        );
-        canvas.rect(0.0, bottom, w, FOOTER, 0.0, BG);
+        canvas.rect(0.0, bottom, w, BOTTOM, 0.0, BG);
         let max = view.max_scroll();
         if max > 0.0 {
-            let track = bottom - HEADER;
-            let thumb = (visible_rows() / view.rows.len() as f32 * track).max(40.0);
-            let top = HEADER + view.scroll / max * (track - thumb);
-            canvas.rect(w - PAD - 10.0, HEADER, 8.0, track, 4.0, [0x2a, 0x2f, 0x38]);
-            canvas.rect(w - PAD - 10.0, top, 8.0, thumb, 4.0, SUBTLE);
+            let (track_top, track) = scroll_track();
+            let thumb = thumb_height(view);
+            let top = track_top + view.scroll / max * (track - thumb);
+            let hovered = hover == Some(Hit::ScrollBar);
+            let (bar_w, color) = if hovered {
+                (18.0, TEXT)
+            } else {
+                (10.0, SUBTLE)
+            };
+            let x = w - PAD - SCROLL_W / 2.0 + 4.0 - bar_w / 2.0;
+            canvas.rect(x, track_top, bar_w, track, bar_w / 2.0, [0x2a, 0x2f, 0x38]);
+            canvas.rect(x, top, bar_w, thumb, bar_w / 2.0, color);
         }
     }
+
+    // Header: breadcrumbs (links except the last) and the build number.
+    if view.form.is_none() {
+        for (k, tool) in view.tools.iter().enumerate() {
+            let (x, y, tw, th) = tool_rect(view, k);
+            let hovered = hover == Some(Hit::Tool(k));
+            let fill = match (tool.danger, tool.active, hovered) {
+                (true, _, true) => [0xff, 0x6b, 0x60],
+                (true, _, false) => RED,
+                (false, true, true) => [0x6b, 0xa0, 0xff],
+                (false, true, false) => ACCENT,
+                (false, false, true) => HOVER,
+                (false, false, false) => [0x2a, 0x2f, 0x38],
+            };
+            canvas.rect(x, y, tw, th, 14.0, fill);
+            let (cx, cy) = (x + tw / 2.0, y + th / 2.0);
+            match tool.icon {
+                Some(ToolIcon::Edit) => draw_pencil(&mut canvas, cx, cy, TEXT),
+                Some(ToolIcon::Select) => {
+                    // A ticked box beside two list lines.
+                    draw_checkbox(&mut canvas, cx - 12.0, cy, true);
+                    canvas.rect(cx + 12.0, cy - 12.0, 16.0, 5.0, 2.0, TEXT);
+                    canvas.rect(cx + 12.0, cy + 7.0, 16.0, 5.0, 2.0, TEXT);
+                }
+                None => {
+                    let lw = fonts.measure(&tool.label, 30.0);
+                    fonts.draw(
+                        &mut canvas,
+                        &tool.label,
+                        cx - lw / 2.0,
+                        cy + 11.0,
+                        30.0,
+                        TEXT,
+                        tw,
+                    );
+                }
+            }
+        }
+        let limit = crumb_limit(view, fonts);
+        let last = view.crumbs.len().saturating_sub(1);
+        for (i, crumb) in view.crumbs.iter().enumerate() {
+            let (x0, x1) = crumbs[i];
+            let hovered = hover == Some(Hit::Crumb(i));
+            if hovered {
+                canvas.rect(x0 - 10.0, 34.0, x1 - x0 + 20.0, 60.0, 10.0, HOVER);
+            }
+            let color = if i == last || hovered { TEXT } else { SUBTLE };
+            fonts.draw(&mut canvas, crumb, x0, 78.0, CRUMB_SIZE, color, limit);
+            if i < last {
+                fonts.draw(&mut canvas, CRUMB_SEP, x1, 78.0, CRUMB_SIZE, FAINT, 200.0);
+            }
+        }
+    }
+    // Above the tools, so both fit.
+    let build_w = fonts.measure(BUILD, 20.0);
+    let build_y = if view.tools.is_empty() { 44.0 } else { 26.0 };
     fonts.draw(
         &mut canvas,
-        &view.footer,
-        PAD,
-        HEIGHT as f32 - 22.0,
-        26.0,
-        SUBTLE,
-        w - 2.0 * PAD,
+        BUILD,
+        w - PAD - build_w,
+        build_y,
+        20.0,
+        FAINT,
+        build_w + 2.0,
     );
+    if view.form.is_none() {
+        canvas.rect(
+            PAD,
+            HEADER - 8.0,
+            w - 2.0 * PAD,
+            2.0,
+            0.0,
+            [0x2a, 0x2f, 0x38],
+        );
+    }
+    if let Some(notice) = &view.notice {
+        canvas.rect(0.0, HEIGHT as f32 - 60.0, w, 60.0, 0.0, BG);
+        fonts.draw(
+            &mut canvas,
+            notice,
+            PAD,
+            HEIGHT as f32 - 22.0,
+            26.0,
+            SUBTLE,
+            w - 2.0 * PAD,
+        );
+    }
 
     if let Some(dialog) = &view.dialog {
         // Dim the list behind the dialog.
@@ -318,29 +718,33 @@ pub fn render(
             }
             y += 16.0;
         }
-        let rect = dialog_button_rect();
-        let hovered = hover == Some(Hit::DialogButton);
-        canvas.rect(
-            rect.0,
-            rect.1,
-            rect.2,
-            rect.3,
-            16.0,
-            if hovered { [0x6b, 0xa0, 0xff] } else { ACCENT },
-        );
-        let label_w = fonts.measure(&dialog.button, 34.0);
-        fonts.draw(
-            &mut canvas,
-            &dialog.button,
-            rect.0 + (rect.2 - label_w) / 2.0,
-            rect.1 + 53.0,
-            34.0,
-            TEXT,
-            rect.2,
-        );
+        let rects = dialog_buttons(dialog.buttons.len());
+        for (i, (label, rect)) in dialog.buttons.iter().zip(&rects).enumerate() {
+            let primary = i + 1 == dialog.buttons.len();
+            let hovered = hover == Some(Hit::DialogButton(i));
+            let color = match (primary, dialog.danger, hovered) {
+                (true, true, true) => [0xff, 0x6b, 0x60],
+                (true, true, false) => RED,
+                (true, false, true) => [0x6b, 0xa0, 0xff],
+                (true, false, false) => ACCENT,
+                (false, _, true) => HOVER,
+                (false, _, false) => [0x2a, 0x2f, 0x38],
+            };
+            canvas.rect(rect.0, rect.1, rect.2, rect.3, 16.0, color);
+            let label_w = fonts.measure(label, 34.0);
+            fonts.draw(
+                &mut canvas,
+                label,
+                rect.0 + (rect.2 - label_w) / 2.0,
+                rect.1 + 53.0,
+                34.0,
+                TEXT,
+                rect.2,
+            );
+        }
     }
 
-    if let Some((x, y)) = cursor.filter(|_| draw_cursor) {
+    if let Some((x, y)) = pointer.filter(|_| draw_cursor) {
         canvas.circle(x, y, 12.0, [0xff, 0xff, 0xff]);
         canvas.circle(x, y, 8.0, ACCENT);
     }
@@ -367,31 +771,89 @@ pub fn format_size(bytes: u64) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn hit_testing_follows_scroll_and_dialog() {
-        let mut view = View {
+    fn view() -> View {
+        View {
+            crumbs: vec!["Just Video".into(), "PC".into(), "media".into()],
             rows: (0..30)
-                .map(|i| Row {
-                    icon: Icon::Folder,
-                    label: format!("{i}"),
-                    detail: String::new(),
-                    right: String::new(),
-                })
+                .map(|i| Row::new(Icon::Folder, format!("{i}")))
                 .collect(),
             ..Default::default()
-        };
-        assert_eq!(hit(&view, 400.0, HEADER + 10.0), Hit::Row(0));
+        }
+    }
+
+    #[test]
+    fn hit_testing_follows_scroll_and_dialog() {
+        let mut view = view();
+        let crumbs = [(32.0, 200.0), (260.0, 320.0), (380.0, 500.0)];
+        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + 10.0), Hit::Row(0));
         view.scroll = 5.0;
-        assert_eq!(hit(&view, 400.0, HEADER + ROW + 10.0), Hit::Row(6));
-        assert_eq!(hit(&view, 400.0, 10.0), Hit::Nothing);
+        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + ROW + 10.0), Hit::Row(6));
+        assert_eq!(hit(&view, &crumbs, 100.0, 70.0), Hit::Crumb(0));
+        assert_eq!(
+            hit(&view, &crumbs, 450.0, 70.0),
+            Hit::Nothing,
+            "current place is not a link"
+        );
         view.dialog = Some(Dialog {
             title: String::new(),
             body: vec![],
-            button: "OK".into(),
+            buttons: vec!["Cancel".into(), "Delete".into()],
+            danger: true,
         });
-        let (x, y, w, h) = dialog_button_rect();
-        assert_eq!(hit(&view, x + w / 2.0, y + h / 2.0), Hit::DialogButton);
-        assert_eq!(hit(&view, 400.0, HEADER + 10.0), Hit::Nothing);
+        let rects = dialog_buttons(2);
+        let (x, y, w, h) = rects[1];
+        assert_eq!(
+            hit(&view, &crumbs, x + w / 2.0, y + h / 2.0),
+            Hit::DialogButton(1)
+        );
+        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + 10.0), Hit::Nothing);
+    }
+
+    #[test]
+    fn scrollbar_is_not_a_row() {
+        let view = view();
+        let x = WIDTH as f32 - PAD - SCROLL_W / 2.0;
+        assert_eq!(hit(&view, &[], x, HEADER + 10.0), Hit::ScrollBar);
+        assert_eq!(scroll_at(&view, 0.0), 0.0);
+        assert_eq!(scroll_at(&view, HEIGHT as f32), view.max_scroll());
+        let short = View {
+            rows: view.rows[..3].to_vec(),
+            ..view.clone()
+        };
+        assert_eq!(hit(&short, &[], x, HEADER + 10.0), Hit::Nothing);
+    }
+
+    #[test]
+    fn locks_actions_and_tools() {
+        let mut view = view();
+        view.rows[2].lock = Some(true);
+        view.rows[2].actions = vec![Action::Edit, Action::Remove];
+        let (x, y, w, h) = lock_rect(&view, 2);
+        assert_eq!(hit(&view, &[], x + w / 2.0, y + h / 2.0), Hit::Lock(2));
+        for (k, action) in [Action::Edit, Action::Remove].into_iter().enumerate() {
+            let (ax, ay, aw, ah) = action_rect(&view, 2, k);
+            assert_eq!(
+                hit(&view, &[], ax + aw / 2.0, ay + ah / 2.0),
+                Hit::RowAction(2, action)
+            );
+        }
+        let (ax, ay, aw, ah) = action_rect(&view, 2, 0);
+        assert_eq!(
+            hit(&view, &[], ax + aw / 2.0, ay + ah / 2.0 + ROW),
+            Hit::Row(3),
+            "no actions on row 3"
+        );
+        view.tools = vec![
+            Tool::icon(ToolIcon::Edit, true),
+            Tool::text("Cancel", false),
+            Tool::text("Delete 2", true),
+        ];
+        for k in 0..3 {
+            let (tx, ty, tw, th) = tool_rect(&view, k);
+            assert_eq!(hit(&view, &[], tx + tw / 2.0, ty + th / 2.0), Hit::Tool(k));
+        }
+        let (tx, _, tw, _) = tool_rect(&view, 2);
+        assert!(tx + tw <= WIDTH as f32 - PAD + 0.5);
     }
 
     #[test]

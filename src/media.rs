@@ -342,7 +342,12 @@ unsafe extern "C" {
     fn jv_frame_release(handle: *mut c_void);
     fn jv_decoder_enable_audio(decoder: *mut RawDecoder, rate: c_int, channels: c_int) -> c_int;
     fn jv_decoder_audio_available(decoder: *const RawDecoder) -> c_int;
-    fn jv_decoder_audio_read(decoder: *mut RawDecoder, out: *mut f32, frames: c_int, pts: *mut f64) -> c_int;
+    fn jv_decoder_audio_read(
+        decoder: *mut RawDecoder,
+        out: *mut f32,
+        frames: c_int,
+        pts: *mut f64,
+    ) -> c_int;
     fn jv_decoder_close(decoder: *mut RawDecoder);
 }
 
@@ -508,6 +513,7 @@ impl Media {
         if decoder.is_null() {
             bail!("{}", text(&s.error));
         }
+        OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(VideoDecoder {
             raw: decoder,
             media: self,
@@ -583,5 +589,22 @@ impl VideoDecoder {
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         unsafe { jv_decoder_close(self.raw) };
+        OPEN_DECODERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
+}
+
+/// Decoders not yet closed. The hardware decoder has buffers for only one 8K
+/// stream: opening a new one before the last closed falls back to the CPU.
+static OPEN_DECODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Waits (up to `limit`) until every earlier decoder has closed.
+pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    while OPEN_DECODERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        if started.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    true
 }

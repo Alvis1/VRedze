@@ -47,19 +47,31 @@ pub struct Placement {
     /// Flat/curved screen distance in metres.
     pub distance: f32,
     pub curved: bool,
+    /// Size multiplier: screen width for flat/curved, magnification for VR180/360.
+    pub zoom: f32,
 }
 
 impl Placement {
     pub fn new(options: &ViewOptions) -> Self {
-        Self { yaw: 0.0, pitch: 0.0, distance: options.screen_distance, curved: false }
+        Self {
+            yaw: 0.0,
+            pitch: 0.0,
+            distance: options.screen_distance,
+            curved: false,
+            zoom: 1.0,
+        }
     }
 
     /// Rotation matrix (columns) of the placement: yaw about +Y, then pitch about +X.
-    fn rotation(&self) -> [[f32; 3]; 3] {
+    pub fn rotation(&self) -> [[f32; 3]; 3] {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
         // R = Ry(yaw) * Rx(pitch)
-        [[cy, 0.0, -sy], [sy * sp, cp, cy * sp], [sy * cp, -sp, cy * cp]]
+        [
+            [cy, 0.0, -sy],
+            [sy * sp, cp, cy * sp],
+            [sy * cp, -sp, cy * cp],
+        ]
     }
 }
 
@@ -84,7 +96,13 @@ mod tests {
 
     #[test]
     fn placement_turns_the_screen_direction() {
-        let mut p = Placement { yaw: std::f32::consts::FRAC_PI_2, pitch: 0.0, distance: 3.0, curved: false };
+        let mut p = Placement {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            distance: 3.0,
+            curved: false,
+            zoom: 1.0,
+        };
         // Yaw 90° (left) moves the screen's forward (-Z) to -X.
         let f = apply(p.rotation(), [0.0, 0.0, -1.0]);
         assert!((f[0] + 1.0).abs() < 1e-5 && f[2].abs() < 1e-5, "{f:?}");
@@ -137,7 +155,12 @@ impl AudioShared {
     }
 }
 
-fn spawn_audio(name: String, chunks: mpsc::Receiver<AudioChunk>, shared: Arc<AudioShared>, stop: Arc<AtomicBool>) {
+fn spawn_audio(
+    name: String,
+    chunks: mpsc::Receiver<AudioChunk>,
+    shared: Arc<AudioShared>,
+    stop: Arc<AtomicBool>,
+) {
     std::thread::Builder::new()
         .name("audio".into())
         .spawn(move || {
@@ -169,7 +192,9 @@ fn spawn_audio(name: String, chunks: mpsc::Receiver<AudioChunk>, shared: Arc<Aud
                 let slice = (rate as usize / 100) * channels;
                 let mut offset = 0;
                 while offset < chunk.samples.len() {
-                    if stop.load(Ordering::Relaxed) || chunk.generation != shared.generation.load(Ordering::Relaxed) {
+                    if stop.load(Ordering::Relaxed)
+                        || chunk.generation != shared.generation.load(Ordering::Relaxed)
+                    {
                         break;
                     }
                     if shared.paused.load(Ordering::Relaxed) {
@@ -181,7 +206,10 @@ fn spawn_audio(name: String, chunks: mpsc::Receiver<AudioChunk>, shared: Arc<Aud
                     let level = f32::from_bits(shared.volume.load(Ordering::Relaxed));
                     // Perceptual curve: bar steps sound evenly spaced.
                     let gain = level * level;
-                    let scaled: Vec<f32> = chunk.samples[offset..end].iter().map(|s| s * gain).collect();
+                    let scaled: Vec<f32> = chunk.samples[offset..end]
+                        .iter()
+                        .map(|s| s * gain)
+                        .collect();
                     if let Err(e) = out.write(&scaled) {
                         eprintln!("{e:#}");
                         return;
@@ -189,7 +217,8 @@ fn spawn_audio(name: String, chunks: mpsc::Receiver<AudioChunk>, shared: Arc<Aud
                     offset = end;
                     let written_until = chunk.pts + (offset / channels) as f64 / rate;
                     let heard = written_until - out.latency();
-                    *shared.clock.lock().expect("audio clock") = Some((chunk.generation, heard, Instant::now()));
+                    *shared.clock.lock().expect("audio clock") =
+                        Some((chunk.generation, heard, Instant::now()));
                 }
             }
         })
@@ -240,8 +269,14 @@ fn spawn_decoder(
                             * crate::audio::CHANNELS as usize)
                             .min(samples.len());
                         if skip < samples.len() {
-                            let pts = pts + (skip / crate::audio::CHANNELS as usize) as f64 / crate::audio::RATE as f64;
-                            let _ = audio.send(AudioChunk { generation, pts, samples: samples[skip..].to_vec() });
+                            let pts = pts
+                                + (skip / crate::audio::CHANNELS as usize) as f64
+                                    / crate::audio::RATE as f64;
+                            let _ = audio.send(AudioChunk {
+                                generation,
+                                pts,
+                                samples: samples[skip..].to_vec(),
+                            });
                         }
                     }
                 }
@@ -281,7 +316,11 @@ fn spawn_decoder(
             }
         })
         .expect("spawn decode thread");
-    DecodeThread { frames, control, requested }
+    DecodeThread {
+        frames,
+        control,
+        requested,
+    }
 }
 
 pub struct Playback {
@@ -357,7 +396,9 @@ impl Playback {
 
     pub fn set_volume(&self, volume: f32) {
         if let Some(audio) = &self.audio {
-            audio.volume.store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+            audio
+                .volume
+                .store(volume.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -391,7 +432,9 @@ impl Playback {
     pub fn seek(&mut self, seconds: f64) {
         let target = seconds.clamp(0.0, (self.duration - 0.5).max(0.0));
         self.generation += 1;
-        self.decode.requested.store(self.generation, Ordering::Relaxed);
+        self.decode
+            .requested
+            .store(self.generation, Ordering::Relaxed);
         if let Some(audio) = &self.audio {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
@@ -429,7 +472,9 @@ impl Playback {
                     Err(mpsc::TryRecvError::Empty) => {}
                 }
             }
-            let Some(candidate) = self.next.as_ref() else { break };
+            let Some(candidate) = self.next.as_ref() else {
+                break;
+            };
             let pts = candidate.pts().unwrap_or(self.last_pts + 1.0 / self.fps);
             if media_time.is_some_and(|t| pts > t) {
                 break;
@@ -460,11 +505,15 @@ impl Playback {
 
     /// Keeps the video clock on the audio clock (what is actually heard).
     fn sync_to_audio(&mut self, now: i64) {
-        let (Some(audio), Some(start)) = (&self.audio, self.clock_start.as_mut()) else { return };
+        let (Some(audio), Some(start)) = (&self.audio, self.clock_start.as_mut()) else {
+            return;
+        };
         if self.paused_at.is_some() {
             return;
         }
-        let Some((generation, heard)) = audio.heard_now() else { return };
+        let Some((generation, heard)) = audio.heard_now() else {
+            return;
+        };
         if generation != self.generation {
             return;
         }
@@ -472,13 +521,19 @@ impl Playback {
         const DISPLAY_LEAD: f64 = 0.02;
         let video = (now - *start) as f64 / 1e9;
         let error = video - (heard + DISPLAY_LEAD);
-        let correction = if error.abs() > 0.25 { error } else { error * 0.1 };
+        let correction = if error.abs() > 0.25 {
+            error
+        } else {
+            error * 0.1
+        };
         *start += (correction * 1e9) as i64;
     }
 
     /// True once the stream ended and its last frame has been shown for a second.
     pub fn finished(&self, now: i64) -> bool {
-        self.ended && self.next.is_none() && self.media_time(now).is_none_or(|t| t > self.last_pts + 1.0)
+        self.ended
+            && self.next.is_none()
+            && self.media_time(now).is_none_or(|t| t > self.last_pts + 1.0)
     }
 }
 
@@ -571,11 +626,11 @@ pub fn eye_params(
             options.fisheye_fov.to_radians(),
         ],
         screen: [
-            options.screen_width,
-            options.screen_width / aspect.max(0.1),
+            options.screen_width * placement.zoom,
+            options.screen_width * placement.zoom / aspect.max(0.1),
             placement.distance,
             0.0,
         ],
-        tex: [w, h, options.debug_view as f32, 0.0],
+        tex: [w, h, options.debug_view as f32, placement.zoom],
     }
 }

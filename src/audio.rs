@@ -97,7 +97,14 @@ impl Output {
             if stream.is_null() {
                 bail!("Can't open audio output (PulseAudio error {error})");
             }
-            Ok(Self { _library: library, stream, write, latency, flush, free })
+            Ok(Self {
+                _library: library,
+                stream,
+                write,
+                latency,
+                flush,
+                free,
+            })
         }
     }
 
@@ -105,7 +112,12 @@ impl Output {
     pub fn write(&mut self, samples: &[f32]) -> anyhow::Result<()> {
         let mut error = 0;
         let ret = unsafe {
-            (self.write)(self.stream, samples.as_ptr() as *const c_void, size_of_val(samples), &mut error)
+            (self.write)(
+                self.stream,
+                samples.as_ptr() as *const c_void,
+                size_of_val(samples),
+                &mut error,
+            )
         };
         if ret < 0 {
             bail!("Audio write failed (PulseAudio error {error})");
@@ -117,7 +129,11 @@ impl Output {
     pub fn latency(&mut self) -> f64 {
         let mut error = 0;
         let usec = unsafe { (self.latency)(self.stream, &mut error) };
-        if usec == u64::MAX { 0.0 } else { usec as f64 / 1e6 }
+        if usec == u64::MAX {
+            0.0
+        } else {
+            usec as f64 / 1e6
+        }
     }
 
     /// Drops queued audio (after a seek).

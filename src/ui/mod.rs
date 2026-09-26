@@ -3,6 +3,7 @@
 pub mod browser;
 pub mod canvas;
 pub mod controls;
+pub mod form;
 pub mod navigator;
 
 /// Saves a canvas as PNG (UI previews and tests).

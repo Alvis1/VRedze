@@ -17,7 +17,8 @@ struct Eye {
     mode: vec4<f32>,
     // Flat screen: x width, y height, z distance, w center height (metres).
     screen: vec4<f32>,
-    // xy: luma texture size in texels; z: debug view (0 off, 1 projection UV, 2 raw luma).
+    // xy: luma texture size in texels; z: debug view (0 off, 1 projection UV, 2 raw luma);
+    // w: zoom (magnification for spherical and fisheye video).
     tex: vec4<f32>,
 }
 
@@ -82,15 +83,17 @@ fn project(origin: vec3<f32>, d: vec3<f32>) -> vec3<f32> {
         let uv = vec2<f32>(arc / eye.screen.x + 0.5, 0.5 - (p.y - eye.screen.w) / eye.screen.y);
         return vec3<f32>(uv, select(0.0, 1.0, p.z < 0.0));
     }
+    // Zooming a spherical video magnifies it around the view centre.
+    let zoom = select(eye.tex.w, 1.0, eye.tex.w <= 0.0);
     if kind == 3u {
         // Equidistant fisheye centred on -Z.
-        let theta = acos(clamp(-d.z, -1.0, 1.0));
+        let theta = acos(clamp(-d.z, -1.0, 1.0)) / zoom;
         let r = theta / (eye.mode.w * 0.5) * 0.5;
         let phi = atan2(d.y, d.x);
         return vec3<f32>(0.5 + r * cos(phi), 0.5 - r * sin(phi), select(0.0, 1.0, r <= 0.5));
     }
-    let lon = atan2(d.x, -d.z);
-    let lat = asin(clamp(d.y, -1.0, 1.0));
+    let lon = atan2(d.x, -d.z) / zoom;
+    let lat = asin(clamp(d.y, -1.0, 1.0)) / zoom;
     let v = 0.5 - lat / PI;
     if kind == 1u {
         return vec3<f32>(lon / PI + 0.5, v, select(0.0, 1.0, abs(lon) <= PI * 0.5));

@@ -133,6 +133,21 @@ pub struct SmbSession {
     connected: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+/// Longest a browsing request may take. A request that never completes means
+/// the connection is wedged (smb-rs can run out of credits); the caller then
+/// drops this session and reconnects.
+const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn run_with_deadline<T>(
+    runtime: &Runtime,
+    what: &str,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    runtime
+        .block_on(async { tokio::time::timeout(REQUEST_DEADLINE, future).await })
+        .map_err(|_| anyhow::anyhow!("The server did not answer ({what})"))?
+}
+
 impl SmbSession {
     /// Authenticates with the server: against the URL's share if it names one,
     /// otherwise against IPC$ (which also enables share listing).
@@ -167,13 +182,17 @@ impl SmbSession {
             connected: Default::default(),
         };
         if session.url.share.is_empty() {
-            runtime
-                .block_on(session.client().ipc_connect(
-                    &session.url.server(),
-                    &session.url.login_name(),
-                    session.password.clone(),
-                ))
-                .with_context(|| format!("Sign in to {}", session.url.host))?;
+            run_with_deadline(&runtime, "sign in", async {
+                Ok(session
+                    .client()
+                    .ipc_connect(
+                        &session.url.server(),
+                        &session.url.login_name(),
+                        session.password.clone(),
+                    )
+                    .await?)
+            })
+            .with_context(|| format!("Sign in to {}", session.url.host))?;
         } else {
             session.ensure_share(&session.url.share.clone())?;
         }
@@ -195,13 +214,13 @@ impl SmbSession {
             return Ok(());
         }
         let unc = self.url.unc(share, "")?;
-        self.runtime
-            .block_on(self.client().share_connect(
-                &unc,
-                &self.url.login_name(),
-                self.password.clone(),
-            ))
-            .with_context(|| format!("Open share \\\\{}\\{share}", self.url.host))?;
+        run_with_deadline(&self.runtime, "open share", async {
+            Ok(self
+                .client()
+                .share_connect(&unc, &self.url.login_name(), self.password.clone())
+                .await?)
+        })
+        .with_context(|| format!("Open share \\\\{}\\{share}", self.url.host))?;
         connected.insert(share.to_string());
         Ok(())
     }
@@ -209,7 +228,7 @@ impl SmbSession {
     /// Disk shares on the server, without administrative ones (`C$`, `IPC$`).
     pub fn shares(&self) -> anyhow::Result<Vec<String>> {
         let server = self.url.server();
-        let mut names = self.runtime.block_on(async {
+        let mut names = run_with_deadline(&self.runtime, "list shares", async {
             if !self.connected.lock().expect("share set").contains("IPC$") {
                 self.client()
                     .ipc_connect(&server, &self.url.login_name(), self.password.clone())
@@ -257,7 +276,7 @@ impl SmbSession {
     pub fn list_in(&self, share: &str, path: &str) -> anyhow::Result<Vec<Entry>> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
-        self.runtime.block_on(async {
+        run_with_deadline(&self.runtime, "list folder", async {
             let access = DirAccessMask::new()
                 .with_list_directory(true)
                 .with_synchronize(true);
@@ -301,9 +320,110 @@ impl SmbSession {
         path: &str,
         options: ReadAhead,
     ) -> anyhow::Result<SmbReader> {
+        let (file, len) = self.open_file(share, path)?;
+        Ok(ReadAheadReader::new(
+            self.runtime.clone(),
+            SmbFile {
+                file,
+                _session: None,
+            },
+            len,
+            options,
+        ))
+    }
+
+    /// Like [`SmbSession::open_in`], but the reader keeps this session alive:
+    /// give each playing video its own session, so a wedged connection only
+    /// affects that video and closes with it.
+    pub fn open_owned(
+        self: &Arc<Self>,
+        share: &str,
+        path: &str,
+        options: ReadAhead,
+    ) -> anyhow::Result<SmbReader> {
+        let (file, len) = self.open_file(share, path)?;
+        Ok(ReadAheadReader::new(
+            self.runtime.clone(),
+            SmbFile {
+                file,
+                _session: Some(self.clone()),
+            },
+            len,
+            options,
+        ))
+    }
+
+    /// Renames `path` (backslash separated, inside `share`) to `new_name` in
+    /// the same folder.
+    pub fn rename_in(&self, share: &str, path: &str, new_name: &str) -> anyhow::Result<()> {
+        ensure!(
+            !new_name.is_empty()
+                && !new_name.contains(['\\', '/'])
+                && new_name != "."
+                && new_name != "..",
+            "Names can't be empty or contain slashes"
+        );
+        let target = match path.rsplit_once('\\') {
+            Some((parent, _)) => format!("{parent}\\{new_name}"),
+            None => new_name.to_string(),
+        };
+        self.modify(share, path, "rename", |handle| {
+            Box::pin(async move {
+                handle
+                    .set_info(smb::FileRenameInformation {
+                        replace_if_exists: false.into(),
+                        root_directory: 0,
+                        file_name: target.into(),
+                    })
+                    .await
+            })
+        })
+    }
+
+    /// Deletes a file or an empty folder.
+    pub fn delete_in(&self, share: &str, path: &str) -> anyhow::Result<()> {
+        self.modify(share, path, "delete", |handle| {
+            Box::pin(async move {
+                handle
+                    .set_info(smb::FileDispositionInformation::default())
+                    .await
+            })
+        })
+    }
+
+    fn modify(
+        &self,
+        share: &str,
+        path: &str,
+        what: &str,
+        change: impl FnOnce(&smb::ResourceHandle) -> BoxFuture<'_, smb::Result<()>>,
+    ) -> anyhow::Result<()> {
         self.ensure_share(share)?;
         let unc = self.url.unc(share, path)?;
-        let file = self.runtime.block_on(async {
+        run_with_deadline(&self.runtime, what, async {
+            let access = FileAccessMask::new()
+                .with_delete(true)
+                .with_synchronize(true);
+            let resource = self
+                .client()
+                .create_file(&unc, &FileCreateArgs::make_open_existing(access))
+                .await
+                .map_err(|e| explain_write_error(&e.to_string()))?;
+            let handle = match (resource.as_file(), resource.as_dir()) {
+                (Some(f), _) => f.handle(),
+                (_, Some(d)) => d.handle(),
+                _ => bail!("Not a file or folder"),
+            };
+            let result = change(handle).await;
+            let _ = handle.close().await;
+            result.map_err(|e| explain_write_error(&e.to_string()))
+        })
+    }
+
+    fn open_file(&self, share: &str, path: &str) -> anyhow::Result<(File, u64)> {
+        self.ensure_share(share)?;
+        let unc = self.url.unc(share, path)?;
+        let file = run_with_deadline(&self.runtime, "open file", async {
             let args =
                 FileCreateArgs::make_open_existing(FileAccessMask::new().with_generic_read(true));
             let resource = self.client().create_file(&unc, &args).await?;
@@ -311,12 +431,7 @@ impl SmbSession {
             anyhow::Ok(resource.unwrap_file())
         })?;
         let len = self.runtime.block_on(smb::GetLen::get_len(&file))?;
-        Ok(ReadAheadReader::new(
-            self.runtime.clone(),
-            SmbFile(file),
-            len,
-            options,
-        ))
+        Ok((file, len))
     }
 }
 
@@ -324,14 +439,40 @@ impl Drop for SmbSession {
     fn drop(&mut self) {
         let _guard = self.runtime.enter();
         if let Some(client) = self.client.take() {
-            let _ = self.runtime.block_on(client.close());
+            // A wedged connection may never answer the logoff.
+            let _ = self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.close()).await
+            });
             drop(client);
         }
     }
 }
 
+/// Turns SMB status codes from changing files into plain explanations.
+fn explain_write_error(message: &str) -> anyhow::Error {
+    let m = message.to_ascii_lowercase();
+    let text = if m.contains("0xc0000022") {
+        "The server doesn't allow changing this (you have no write permission here)."
+    } else if m.contains("0xc0000035") {
+        "Something with that name already exists."
+    } else if m.contains("0xc0000101") {
+        "The folder isn't empty. Only empty folders can be deleted."
+    } else if m.contains("0xc0000043") {
+        "The file is in use (maybe playing somewhere). Try again later."
+    } else if m.contains("0xc0000034") || m.contains("0xc000003a") {
+        "It's no longer there (renamed or deleted elsewhere)."
+    } else {
+        return anyhow::anyhow!("{message}");
+    };
+    anyhow::anyhow!("{text}")
+}
+
 /// An open SMB file as a read-ahead block source.
-pub struct SmbFile(File);
+pub struct SmbFile {
+    file: File,
+    /// Keeps a dedicated session (and its connection) alive while reading.
+    _session: Option<Arc<SmbSession>>,
+}
 
 impl BlockSource for SmbFile {
     fn fetch(self: Arc<Self>, offset: u64, len: usize) -> BoxFuture<'static, io::Result<Vec<u8>>> {
@@ -340,7 +481,7 @@ impl BlockSource for SmbFile {
             let mut filled = 0;
             while filled < len {
                 let n = self
-                    .0
+                    .file
                     .read_block(&mut buffer[filled..], offset + filled as u64, None, false)
                     .await?;
                 if n == 0 {
@@ -358,7 +499,8 @@ impl BlockSource for SmbFile {
     fn close(&self) -> BoxFuture<'_, ()> {
         // Closing marks the handle closed, so late drops of aborted reads are no-ops.
         Box::pin(async {
-            let _ = self.0.close().await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.file.close()).await;
         })
     }
 }
@@ -397,7 +539,10 @@ mod tests {
     #[test]
     fn server_only_url() {
         let url: SmbUrl = "smb://alice@192.168.1.10".parse().unwrap();
-        assert_eq!((url.host.as_str(), url.share.as_str()), ("192.168.1.10", ""));
+        assert_eq!(
+            (url.host.as_str(), url.share.as_str()),
+            ("192.168.1.10", "")
+        );
         assert_eq!(url.server_url(), "smb://alice@192.168.1.10");
         let url: SmbUrl = "smb://W;bob@nas:4445/".parse().unwrap();
         assert_eq!(url.server_url(), "smb://W;bob@nas:4445");

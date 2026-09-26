@@ -3,9 +3,9 @@
 //! The result is a suggestion: the player keeps a per-file manual override.
 
 use crate::media::VideoInfo;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Projection {
     Flat,
@@ -15,7 +15,7 @@ pub enum Projection {
     Fisheye180,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stereo {
     Mono,

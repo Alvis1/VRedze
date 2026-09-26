@@ -49,3 +49,5 @@ codegen-units = 1
 [patch.crates-io]
 # TCP_NODELAY fix (see third_party/smb-transport/PATCHED.md).
 smb-transport = { path = "third_party/smb-transport" }
+# Credit leak on async (STATUS_PENDING) responses (see third_party/smb/PATCHED.md).
+smb = { path = "third_party/smb" }

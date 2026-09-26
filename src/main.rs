@@ -105,6 +105,9 @@ enum Command {
         folder: String,
         #[arg(long, default_value_t = 20)]
         rounds: usize,
+        /// Seeks per round while playing.
+        #[arg(long, default_value_t = 0)]
+        seeks: usize,
     },
     /// Decode and play a file's audio for a few seconds (no XR), checking timestamps.
     #[command(hide = true)]
@@ -304,10 +307,12 @@ fn log_to_file_without_terminal() {
 
 fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     log_to_file_without_terminal();
-    eprintln!("Just Video {} starting", env!("CARGO_PKG_VERSION"));
-    let servers = just_video::config::servers()?;
-    let library =
-        just_video::library::Library::start(servers, just_video::media::default_hw_backend());
+    eprintln!(
+        "Just Video {} ({}) starting",
+        env!("CARGO_PKG_VERSION"),
+        just_video::ui::browser::BUILD
+    );
+    let library = just_video::library::Library::start(just_video::media::default_hw_backend());
     let navigator = just_video::ui::navigator::Navigator::new(library);
     just_video::xr::app::run(
         Some(navigator),
@@ -503,16 +508,25 @@ fn main() -> anyhow::Result<()> {
             )?;
             print(json!(stats))?;
         }
-        Command::LibraryStress { server, share, folder, rounds } => {
+        Command::LibraryStress {
+            server,
+            share,
+            folder,
+            rounds,
+            seeks,
+        } => {
             use just_video::library::{Library, Request, Response};
             use std::time::{Duration, Instant};
-            let servers = just_video::config::servers()?;
-            let index = servers
-                .iter()
-                .position(|s| s.name == server)
+            let index = just_video::config::servers()?
+                .into_iter()
+                .find(|s| s.name == server)
                 .ok_or_else(|| anyhow::anyhow!("No saved server {server}"))?;
-            let library = Library::start(servers, just_video::media::default_hw_backend());
-            let path: Vec<String> = folder.split('/').filter(|p| !p.is_empty()).map(String::from).collect();
+            let library = Library::start(just_video::media::default_hw_backend());
+            let path: Vec<String> = folder
+                .split('/')
+                .filter(|p| !p.is_empty())
+                .map(String::from)
+                .collect();
             let wait = |what: &str| -> anyhow::Result<Response> {
                 let started = Instant::now();
                 loop {
@@ -521,15 +535,25 @@ fn main() -> anyhow::Result<()> {
                         return Ok(r);
                     }
                     if started.elapsed() > Duration::from_secs(30) {
-                        eprintln!("HANG: {what} took over 30 s (pid {}); waiting for a debugger", std::process::id());
+                        eprintln!(
+                            "HANG: {what} took over 30 s (pid {}); waiting for a debugger",
+                            std::process::id()
+                        );
                         std::thread::sleep(Duration::from_secs(600));
                         anyhow::bail!("HANG: {what}");
                     }
                     std::thread::sleep(Duration::from_millis(5));
                 }
             };
-            library.send(Request::List { id: 1, server: index, share: share.clone(), path: path.clone() });
-            let Response::List { result, .. } = wait("list")? else { anyhow::bail!("unexpected") };
+            library.send(Request::List {
+                id: 1,
+                server: index.clone(),
+                share: share.clone(),
+                path: path.clone(),
+            });
+            let Response::List { result, .. } = wait("list")? else {
+                anyhow::bail!("unexpected")
+            };
             let videos: Vec<String> = result
                 .map_err(anyhow::Error::msg)?
                 .into_iter()
@@ -544,43 +568,99 @@ fn main() -> anyhow::Result<()> {
                 for v in &videos {
                     let mut file = path.clone();
                     file.push(v.clone());
-                    library.send(Request::Probe { generation: round as u64, server: index, share: share.clone(), path: file });
+                    library.send(Request::Probe {
+                        generation: round as u64,
+                        server: index.clone(),
+                        share: share.clone(),
+                        path: file,
+                    });
                 }
                 let mut file = path.clone();
                 file.push(name.clone());
-                library.send(Request::Open { id: 100 + round as u64, server: index, share: share.clone(), path: file });
+                library.send(Request::Open {
+                    id: 100 + round as u64,
+                    server: index.clone(),
+                    share: share.clone(),
+                    path: file,
+                });
                 let opened = loop {
                     match wait("response")? {
-                        Response::Opened { result, .. } => break result.map_err(anyhow::Error::msg)?,
+                        Response::Opened { result, .. } => {
+                            break result.map_err(anyhow::Error::msg)?;
+                        }
                         _ => continue,
                     }
                 };
-                let mut playback = just_video::xr::player::Playback::start(opened.decoder, opened.layout, 0.0, 0.0);
+                let mut playback = just_video::xr::player::Playback::start(
+                    opened.decoder,
+                    opened.layout,
+                    0.0,
+                    0.05,
+                );
                 let started = Instant::now();
                 let mut shown = 0;
-                while started.elapsed() < Duration::from_millis(1500) {
+                let play_for = Duration::from_millis(4000 + 1500 * seeks as u64);
+                let mut next_seek = 1;
+                let mut last_progress = Instant::now();
+                while started.elapsed() < play_for {
                     let now = started.elapsed().as_nanos() as i64 + 1_000_000_000;
                     if playback.advance(now) {
                         shown += 1;
+                        last_progress = Instant::now();
+                    }
+                    if next_seek <= seeks
+                        && started.elapsed() > Duration::from_millis(1500 * next_seek as u64)
+                    {
+                        let target = playback.duration * (next_seek as f64 * 0.37).fract();
+                        eprintln!("  seek {next_seek} -> {target:.0}s");
+                        playback.seek(target);
+                        next_seek += 1;
+                    }
+                    if last_progress.elapsed() > Duration::from_secs(10) {
+                        eprintln!(
+                            "HANG: playback made no progress for 10 s (pid {}); waiting for a debugger",
+                            std::process::id()
+                        );
+                        std::thread::sleep(Duration::from_secs(600));
+                        anyhow::bail!("HANG: playback stalled");
                     }
                     std::thread::sleep(Duration::from_millis(11));
                 }
                 eprintln!("  played {shown} frames, stopping");
-                drop(playback);
-                library.send(Request::List { id: 2, server: index, share: share.clone(), path: path.clone() });
+                just_video::xr::app::drop_in_background(playback);
+                library.send(Request::List {
+                    id: 2,
+                    server: index.clone(),
+                    share: share.clone(),
+                    path: path.clone(),
+                });
                 loop {
                     if let Response::List { .. } = wait("list after stop")? {
+                        break;
+                    }
+                }
+                library.send(Request::Shares {
+                    id: 3,
+                    server: index.clone(),
+                });
+                loop {
+                    if let Response::Shares { .. } = wait("shares after stop")? {
                         break;
                     }
                 }
             }
             eprintln!("no hang in {rounds} rounds");
         }
-        Command::AudioTest { input, seconds, volume } => {
+        Command::AudioTest {
+            input,
+            seconds,
+            volume,
+        } => {
             use just_video::audio::{CHANNELS, Output, RATE};
             let (source, _session) = open_input(&input, ReadAhead::default())?;
             let media = Media::open(file_name(&input), source)?;
-            let mut decoder = media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
+            let mut decoder =
+                media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
             anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
             let mut output = Output::open("audio-test")?;
             let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
@@ -612,18 +692,22 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{Dialog, Icon, Row, View, render};
+            use just_video::ui::browser::{
+                Action, Dialog, Icon, Row, Tool, ToolIcon, View, render,
+            };
+            use just_video::ui::form::{Field, Form};
             let mut fonts = just_video::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
-            let footer = "Trigger: open  ·  B: back  ·  Stick: scroll".to_string();
             let row = |icon, label: &str, detail: &str, right: &str| Row {
-                icon,
-                label: label.into(),
                 detail: detail.into(),
                 right: right.into(),
+                checked: Some(label.starts_with('h')),
+                ..Row::new(icon, label)
             };
+            let crumbs = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             let folder = View {
-                title: "NAS  ›  media  ›  Videos  ›  VR".into(),
+                crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
+                tools: vec![Tool::text("Cancel", false), Tool::text("Delete 2", true)],
                 rows: vec![
                     row(Icon::Folder, "Concerts", "", ""),
                     row(
@@ -653,7 +737,6 @@ fn main() -> anyhow::Result<()> {
                         "3.3 GB",
                     ),
                 ],
-                footer: footer.clone(),
                 ..Default::default()
             };
             just_video::ui::save_png(
@@ -661,11 +744,62 @@ fn main() -> anyhow::Result<()> {
                 &dir.join("folder.png"),
             )?;
             let servers = View {
-                title: "Just Video".into(),
-                rows: vec![row(Icon::Server, "NAS", "smb://user@192.168.1.10", "")],
-                footer: footer.clone(),
+                crumbs: crumbs(&["Just Video"]),
+                rows: vec![
+                    Row {
+                        detail: "smb://user@192.168.1.10".into(),
+                        lock: Some(true),
+                        actions: vec![
+                            just_video::ui::browser::Action::Edit,
+                            just_video::ui::browser::Action::Remove,
+                        ],
+                        ..Row::new(Icon::Server, "NAS")
+                    },
+                    Row {
+                        detail: "smb://user@10.0.0.2".into(),
+                        lock: Some(false),
+                        ..Row::new(Icon::Server, "PC")
+                    },
+                    Row {
+                        detail: "A Windows PC, NAS or Samba server on your network".into(),
+                        ..Row::new(Icon::Add, "Add server")
+                    },
+                ],
                 ..Default::default()
             };
+            // Edit mode: rename/delete on each row.
+            let mut editing = folder.clone();
+            editing.tools = vec![
+                Tool::icon(ToolIcon::Select, false),
+                Tool::icon(ToolIcon::Edit, true),
+            ];
+            for row in &mut editing.rows {
+                row.checked = None;
+                row.actions = vec![Action::Rename, Action::Delete];
+            }
+            just_video::ui::save_png(
+                &render(&editing, &mut fonts, Some((700.0, 400.0)), true),
+                &dir.join("editing.png"),
+            )?;
+            let mut adding = servers.clone();
+            adding.form = Some(Form::new(
+                "Add server",
+                ["Address", "User", "Password", "Name"]
+                    .iter()
+                    .zip(["192.168.1.10", "user", "secret", ""])
+                    .map(|(label, value)| Field {
+                        label: label.to_string(),
+                        value: value.into(),
+                        secret: *label == "Password",
+                        placeholder: "optional".into(),
+                    })
+                    .collect(),
+                "Connect",
+            ));
+            just_video::ui::save_png(
+                &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
+                &dir.join("form.png"),
+            )?;
             just_video::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
                 &dir.join("servers.png"),
@@ -677,7 +811,8 @@ fn main() -> anyhow::Result<()> {
                     "Steam Frame's hardware video decoder only handles 8-bit video in the current SteamOS, and this video is 10-bit. Decoding it on the CPU instead reaches only about 74% of the speed needed, so playback would stutter badly.".into(),
                     "An 8-bit HEVC version or a 4K version of this video would play.".into(),
                 ],
-                button: "OK".into(),
+                buttons: vec!["OK".into()],
+                danger: false,
             });
             just_video::ui::save_png(
                 &render(&dialog, &mut fonts, Some((800.0, 790.0)), true),
@@ -689,11 +824,24 @@ fn main() -> anyhow::Result<()> {
                 position: 754.0,
                 duration: 5530.0,
                 curved: Some(true),
-                volume: Some(6),
+                projection: just_video::vr::Projection::Flat,
+                stereo: just_video::vr::Stereo::SideBySide,
+                swap_eyes: false,
+                has_previous: true,
+                has_next: false,
+                more: false,
             };
             just_video::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
+            )?;
+            let more = controls::State {
+                more: true,
+                ..state
+            };
+            just_video::ui::save_png(
+                &controls::render(&more, &mut fonts, controls::Hit::Pick(3)),
+                &dir.join("controls-more.png"),
             )?;
         }
         Command::XrProbe => {
@@ -724,9 +872,26 @@ fn main() -> anyhow::Result<()> {
             let start = Instant::now();
             while total < limit {
                 let want = buffer.len().min((limit - total) as usize);
-                let n = reader.read(&mut buffer[..want])?;
+                let n = match reader.read(&mut buffer[..want]) {
+                    Ok(n) => n,
+                    Err(e) => anyhow::bail!(
+                        "{e} at {:.2} GB after {:.1}s ({:?})",
+                        total as f64 / 1e9,
+                        start.elapsed().as_secs_f64(),
+                        reader.stats()
+                    ),
+                };
                 if n == 0 {
                     break;
+                }
+                // Progress every 512 MiB.
+                if (total + n as u64) >> 29 != total >> 29 {
+                    eprintln!(
+                        "{:.1} GB  {:.0} Mbit/s  stalled {:.1}s",
+                        (total + n as u64) as f64 / 1e9,
+                        (total + n as u64) as f64 * 8.0 / start.elapsed().as_secs_f64() / 1e6,
+                        reader.stats().stall_seconds
+                    );
                 }
                 total += n as u64;
             }

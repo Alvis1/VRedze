@@ -61,9 +61,13 @@ enum Block {
     Ready(Vec<u8>),
 }
 
-/// How long a read may wait for its block before failing (the request
-/// itself keeps running: cancelling it would leak SMB credits).
-const BLOCK_WAIT: Duration = Duration::from_secs(30);
+/// How often a read waiting for its block logs (the request itself keeps
+/// running: cancelling it would leak SMB credits).
+const BLOCK_WAIT: Duration = Duration::from_secs(10);
+/// How long a read may wait in total before failing.
+const STALL_LIMIT: Duration = Duration::from_secs(45);
+/// Failed block reads are retried this many times.
+const READ_RETRIES: u32 = 3;
 /// How long closing waits for outstanding reads.
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
@@ -151,7 +155,9 @@ impl<S: BlockSource> ReadAheadReader<S> {
         // pile up requests; the block needed now is always requested.
         for index in current..end {
             if !self.blocks.contains_key(&index) {
-                if index != current && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead {
+                if index != current
+                    && self.in_flight.load(Ordering::SeqCst) >= self.options.blocks_ahead
+                {
                     break;
                 }
                 self.spawn(index);
@@ -168,17 +174,29 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
         let size = self.options.block_size as u64;
         let index = self.pos / size;
         self.schedule(index);
-        let block = self.blocks.get_mut(&index).expect("scheduled block");
-        if let Block::Pending(handle) = block {
+        let mut retries = 0;
+        let mut waited = Duration::ZERO;
+        loop {
+            let block = self.blocks.get_mut(&index).expect("scheduled block");
+            let Block::Pending(handle) = block else { break };
             let started = Instant::now();
             let result = self
                 .runtime
                 .block_on(async { tokio::time::timeout(BLOCK_WAIT, &mut *handle).await });
+            waited += started.elapsed();
             self.stats.stall_seconds += started.elapsed().as_secs_f64();
             match result {
                 Ok(Ok(Ok(data))) => *block = Block::Ready(data),
+                // Keep the request running (see `detached`) and keep waiting:
+                // a slow server is better than a broken video.
+                Err(_) if waited < STALL_LIMIT => {
+                    eprintln!(
+                        "Read-ahead: waited {:.0}s for data at {}",
+                        waited.as_secs_f64(),
+                        self.pos
+                    );
+                }
                 Err(_) => {
-                    // Keep the request running (see `detached`); report the stall.
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "The server stopped sending data",
@@ -186,13 +204,23 @@ impl<S: BlockSource> Read for ReadAheadReader<S> {
                 }
                 Ok(failed) => {
                     self.blocks.remove(&index);
-                    return Err(match failed {
+                    let error = match failed {
                         Ok(e) => e.err().unwrap_or_else(|| io::Error::other("read failed")),
                         Err(e) => io::Error::other(e),
-                    });
+                    };
+                    // A failed request is retried; a truncated packet would
+                    // corrupt or stop the video.
+                    if retries >= READ_RETRIES {
+                        return Err(error);
+                    }
+                    retries += 1;
+                    eprintln!("Read-ahead: retrying read at {} ({error})", self.pos);
+                    std::thread::sleep(Duration::from_millis(200 * retries as u64));
+                    self.spawn(index);
                 }
             }
         }
+        let block = self.blocks.get_mut(&index).expect("scheduled block");
         let Block::Ready(data) = block else {
             unreachable!()
         };
@@ -328,7 +356,10 @@ mod tests {
     /// Regression: aborting SMB reads leaked credits and hung the connection.
     #[test]
     fn reads_are_never_cancelled() {
-        let options = ReadAhead { block_size: 1000, blocks_ahead: 8 };
+        let options = ReadAhead {
+            block_size: 1000,
+            blocks_ahead: 8,
+        };
         let (mut r, data) = reader(100_000, 20, options);
         let completed = r.source.completed.clone();
         let mut buf = [0u8; 10];
@@ -341,6 +372,51 @@ mod tests {
         assert!(requests <= 16 + 1, "in-flight cap exceeded: {requests}");
         drop(r);
         assert_eq!(completed.load(Ordering::SeqCst) as u64, requests);
+    }
+
+    /// Fails every block's first request.
+    struct Flaky {
+        data: Vec<u8>,
+        failed: std::sync::Mutex<std::collections::HashSet<u64>>,
+    }
+
+    impl BlockSource for Flaky {
+        fn fetch(
+            self: Arc<Self>,
+            offset: u64,
+            len: usize,
+        ) -> BoxFuture<'static, io::Result<Vec<u8>>> {
+            Box::pin(async move {
+                if self.failed.lock().unwrap().insert(offset) {
+                    return Err(io::Error::other("network hiccup"));
+                }
+                Ok(self.data[offset as usize..offset as usize + len].to_vec())
+            })
+        }
+    }
+
+    #[test]
+    fn failed_reads_are_retried() {
+        let data: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_time()
+                .build()
+                .unwrap(),
+        );
+        let source = Flaky {
+            data: data.clone(),
+            failed: Default::default(),
+        };
+        let options = ReadAhead {
+            block_size: 4096,
+            blocks_ahead: 2,
+        };
+        let mut r = ReadAheadReader::new(runtime, source, data.len() as u64, options);
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

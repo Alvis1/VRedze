@@ -94,6 +94,40 @@ pub fn remove_server(name_or_url: &str) -> anyhow::Result<bool> {
     Ok(true)
 }
 
+/// A user's choice of how to show one file (when metadata and name are wrong).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LayoutOverride {
+    pub projection: crate::vr::Projection,
+    pub stereo: crate::vr::Stereo,
+    pub swap_eyes: bool,
+}
+
+pub fn layout_override(key: &str) -> anyhow::Result<Option<LayoutOverride>> {
+    let all: BTreeMap<String, LayoutOverride> = read_json("layouts.json")?;
+    Ok(all.get(key).copied())
+}
+
+/// Saves (or with `None`, forgets) the override for a file.
+pub fn save_layout_override(key: &str, layout: Option<LayoutOverride>) -> anyhow::Result<()> {
+    let mut all: BTreeMap<String, LayoutOverride> = read_json("layouts.json")?;
+    let changed = match layout {
+        Some(l) => all.insert(key.to_string(), l) != Some(l),
+        None => all.remove(key).is_some(),
+    };
+    if changed {
+        write_json("layouts.json", &all, false)?;
+    }
+    Ok(())
+}
+
+pub fn move_layout_override(from: &str, to: &str) -> anyhow::Result<()> {
+    if let Some(l) = layout_override(from)? {
+        save_layout_override(from, None)?;
+        save_layout_override(to, Some(l))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +149,20 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        let key = "smb://alice@192.168.1.10/media/VR/clip.mp4";
+        assert_eq!(layout_override(key).unwrap(), None);
+        let l = LayoutOverride {
+            projection: crate::vr::Projection::Equirect180,
+            stereo: crate::vr::Stereo::SideBySide,
+            swap_eyes: false,
+        };
+        save_layout_override(key, Some(l)).unwrap();
+        move_layout_override(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();
+        assert_eq!(layout_override(key).unwrap(), None);
+        assert_eq!(
+            layout_override("smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap(),
+            Some(l)
+        );
         assert!(remove_server("PC").unwrap());
         assert!(servers().unwrap().is_empty());
         assert_eq!(password(&server.url).unwrap(), None);
