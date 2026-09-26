@@ -1,6 +1,9 @@
+| AI Disclaimer: Text below is AI generated, sorry I'm lazy. 
+| Most of the code is as well. AI contributions are welcome (as to not be a hypocrite).  
+
 # Just Video
 
-A VR video player for Steam Frame that streams straight from SMB shares.
+A VR video player for Steam Frame that streams straight from SMB shares. (You make butter.)
 
 ## Build
 
