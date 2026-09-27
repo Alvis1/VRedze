@@ -44,6 +44,11 @@ enum Item {
         assessment: Option<Assessment>,
         broken: Option<String>,
     },
+    /// A file that isn't a video: shown dimmed, can be renamed or deleted.
+    File {
+        name: String,
+        size: u64,
+    },
 }
 
 impl Item {
@@ -51,12 +56,15 @@ impl Item {
         match self {
             Item::Server(s) => &s.name,
             Item::AddServer => "",
-            Item::Share(n) | Item::Dir(n) | Item::Video { name: n, .. } => n,
+            Item::Share(n)
+            | Item::Dir(n)
+            | Item::Video { name: n, .. }
+            | Item::File { name: n, .. } => n,
         }
     }
 
     fn is_entry(&self) -> bool {
-        matches!(self, Item::Dir(_) | Item::Video { .. })
+        matches!(self, Item::Dir(_) | Item::Video { .. } | Item::File { .. })
     }
 }
 
@@ -304,6 +312,11 @@ impl Navigator {
                         right: format_size(*size),
                         ..Row::new(Icon::Video(None), name)
                     },
+                    Item::File { name, size } => Row {
+                        right: format_size(*size),
+                        dimmed: true,
+                        ..Row::new(Icon::File, name)
+                    },
                 };
                 if item.is_entry() {
                     match selecting {
@@ -384,11 +397,15 @@ impl Navigator {
                         Ok(entries) => {
                             self.items = entries
                                 .into_iter()
-                                .filter(|e| e.is_dir || is_video(&e.name))
                                 .filter(|e| !e.name.starts_with('.'))
                                 .map(|e| {
                                     if e.is_dir {
                                         Item::Dir(e.name)
+                                    } else if !is_video(&e.name) {
+                                        Item::File {
+                                            name: e.name,
+                                            size: e.size,
+                                        }
                                     } else {
                                         Item::Video {
                                             name: e.name,
@@ -412,7 +429,7 @@ impl Navigator {
                                 }
                             }
                             self.view.status = if self.items.is_empty() {
-                                Some("No videos or folders here.".into())
+                                Some("This folder is empty.".into())
                             } else {
                                 None
                             };
@@ -1163,12 +1180,20 @@ mod tests {
             assessment: None,
             broken: broken.then(|| "bad".to_string()),
         };
+        let file = Item::File {
+            name: "notes.txt".into(),
+            size: 1,
+        };
         nav.items
-            .extend([video("a", false), video("b", true), video("c", false)]);
+            .extend([video("a", false), video("b", true), file, video("c", false)]);
         nav.playing = Some(1);
         assert!(!nav.has_adjacent(-1), "a folder is not a video");
-        assert_eq!(nav.adjacent(1), Some(3), "skips the broken one");
-        nav.playing = Some(3);
+        assert_eq!(
+            nav.adjacent(1),
+            Some(4),
+            "skips the broken one and the file"
+        );
+        nav.playing = Some(4);
         assert!(!nav.has_adjacent(1));
     }
 }

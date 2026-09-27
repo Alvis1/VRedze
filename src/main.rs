@@ -826,6 +826,11 @@ fn main() -> anyhow::Result<()> {
                         "5.1 GB",
                     ),
                     row(Icon::Broken, "damaged.mp4", "Can't read this file", "12 KB"),
+                    Row {
+                        dimmed: true,
+                        checked: None,
+                        ..row(Icon::File, "notes.txt", "", "2 KB")
+                    },
                     row(
                         Icon::Video(Some(Verdict::Hardware)),
                         "旅行_180_LR.mp4",

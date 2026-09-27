@@ -49,6 +49,8 @@ pub enum Icon {
     Video(Option<Verdict>),
     /// A file that could not be read.
     Broken,
+    /// A file that isn't a video.
+    File,
     Add,
 }
 
@@ -98,6 +100,8 @@ pub struct Row {
     pub actions: Vec<Action>,
     /// A checkbox in place of the icon (selecting what to delete).
     pub checked: Option<bool>,
+    /// Greyed out: listed, but not something to open (non-video files).
+    pub dimmed: bool,
 }
 
 impl Row {
@@ -110,6 +114,7 @@ impl Row {
             lock: None,
             actions: Vec::new(),
             checked: None,
+            dimmed: false,
         }
     }
 }
@@ -396,6 +401,14 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.circle(cx, cy, 16.0, RED);
             canvas.rect(cx - 9.0, cy - 3.0, 18.0, 6.0, 2.0, BG);
         }
+        Icon::File => {
+            // A page with a folded top-right corner.
+            canvas.rect(cx - 16.0, cy - 20.0, 32.0, 40.0, 4.0, FAINT);
+            canvas.rect(cx - 12.0, cy - 16.0, 24.0, 32.0, 2.0, ROW_BG);
+            canvas.rect(cx + 2.0, cy - 21.0, 15.0, 15.0, 0.0, ROW_BG);
+            canvas.rect(cx + 2.0, cy - 20.0, 4.0, 14.0, 1.0, FAINT);
+            canvas.rect(cx + 2.0, cy - 10.0, 14.0, 4.0, 1.0, FAINT);
+        }
         Icon::Add => {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
@@ -501,7 +514,11 @@ pub fn render(
             if ry > bottom {
                 break;
             }
-            let hovered = matches!(hover, Some(Hit::Row(r)) if r == i);
+            // A dimmed row opens nothing, so it only lights up while selecting.
+            let hovered = matches!(hover, Some(Hit::Row(r)) if r == i)
+                && (!row.dimmed || row.checked.is_some());
+            let label_color = if row.dimmed { FAINT } else { TEXT };
+            let detail_color = if row.dimmed { FAINT } else { SUBTLE };
             canvas.rect(rx, ry, rw, rh, 14.0, if hovered { HOVER } else { ROW_BG });
             let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
             match row.checked {
@@ -579,7 +596,7 @@ pub fn render(
                     PAD + 96.0,
                     ry + 52.0,
                     36.0,
-                    TEXT,
+                    label_color,
                     text_w,
                 );
             } else {
@@ -589,7 +606,7 @@ pub fn render(
                     PAD + 96.0,
                     ry + 38.0,
                     34.0,
-                    TEXT,
+                    label_color,
                     text_w,
                 );
                 fonts.draw(
@@ -598,7 +615,7 @@ pub fn render(
                     PAD + 96.0,
                     ry + 70.0,
                     24.0,
-                    SUBTLE,
+                    detail_color,
                     text_w,
                 );
             }
@@ -609,7 +626,7 @@ pub fn render(
                     right_edge - right_w + 12.0,
                     ry + 52.0,
                     28.0,
-                    SUBTLE,
+                    detail_color,
                     right_w,
                 );
             }
