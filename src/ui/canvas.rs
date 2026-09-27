@@ -57,6 +57,47 @@ impl Canvas {
         }
     }
 
+    /// A see-through rounded rectangle on a transparent canvas, written as
+    /// premultiplied alpha (what OpenXR's alpha-blended layers expect).
+    #[allow(clippy::too_many_arguments)]
+    pub fn translucent_rect(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radius: f32,
+        color: Rgb,
+        opacity: f32,
+    ) {
+        let r = radius.min(w / 2.0).min(h / 2.0).max(0.0);
+        let (x0, y0) = (x.floor().max(0.0) as i32, y.floor().max(0.0) as i32);
+        let (x1, y1) = (
+            ((x + w).ceil() as i32).min(self.width as i32),
+            ((y + h).ceil() as i32).min(self.height as i32),
+        );
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+                let qx = (cx - (x + w / 2.0)).abs() - (w / 2.0 - r);
+                let qy = (cy - (y + h / 2.0)).abs() - (h / 2.0 - r);
+                let outside =
+                    (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - r;
+                let a = (0.5 - outside).clamp(0.0, 1.0) * opacity;
+                if a <= 0.0 {
+                    continue;
+                }
+                let i = ((py as u32 * self.width + px as u32) * 4) as usize;
+                for (k, c) in color.iter().enumerate() {
+                    let dst = self.pixels[i + k] as f32;
+                    self.pixels[i + k] = (*c as f32 * a + dst * (1.0 - a)).round() as u8;
+                }
+                let dst = self.pixels[i + 3] as f32 / 255.0;
+                self.pixels[i + 3] = ((a + dst * (1.0 - a)) * 255.0).round() as u8;
+            }
+        }
+    }
+
     pub fn circle(&mut self, cx: f32, cy: f32, radius: f32, color: Rgb) {
         self.rect(
             cx - radius,

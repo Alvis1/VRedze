@@ -2,6 +2,7 @@
 
 pub mod browser;
 pub mod canvas;
+pub mod captions;
 pub mod controls;
 pub mod form;
 pub mod navigator;

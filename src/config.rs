@@ -95,11 +95,38 @@ pub fn remove_server(name_or_url: &str) -> anyhow::Result<bool> {
 }
 
 /// A user's choice of how to show one file (when metadata and name are wrong).
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LayoutOverride {
     pub projection: crate::vr::Projection,
     pub stereo: crate::vr::Stereo,
     pub swap_eyes: bool,
+    /// Picture corrections (older saves have none).
+    #[serde(default)]
+    pub image: ImageAdjust,
+}
+
+/// Picture corrections for one file.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ImageAdjust {
+    /// Added to every channel (-0.5..0.5; 0 = unchanged).
+    pub brightness: f32,
+    /// Around mid grey (0.5..2; 1 = unchanged).
+    pub contrast: f32,
+    /// 0 = grey, 1 = unchanged, 2 = double.
+    pub saturation: f32,
+    /// Quarter turns clockwise (0..=3).
+    pub rotation: u8,
+}
+
+impl Default for ImageAdjust {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            saturation: 1.0,
+            rotation: 0,
+        }
+    }
 }
 
 pub fn layout_override(key: &str) -> anyhow::Result<Option<LayoutOverride>> {
@@ -126,6 +153,79 @@ pub fn move_layout_override(from: &str, to: &str) -> anyhow::Result<()> {
         save_layout_override(to, Some(l))?;
     }
     Ok(())
+}
+
+/// A video format: projection and stereo layout.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Format {
+    pub projection: crate::vr::Projection,
+    pub stereo: crate::vr::Stereo,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Settings {
+    /// None: never changed (use the defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    favourite_formats: Option<Vec<Format>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    captions: Option<CaptionSettings>,
+}
+
+/// Subtitle size and position, the same for every video.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CaptionSettings {
+    /// Size multiplier (1 = default).
+    pub scale: f32,
+    /// Raised by this share of the screen's height (0 = default, negative = lower).
+    pub raise: f32,
+}
+
+impl Default for CaptionSettings {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            raise: 0.0,
+        }
+    }
+}
+
+pub fn caption_settings() -> CaptionSettings {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.captions)
+        .unwrap_or_default()
+}
+
+pub fn save_caption_settings(captions: CaptionSettings) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.captions = Some(captions);
+    write_json("settings.json", &settings, false)
+}
+
+/// Formats the format button cycles through. Default: flat 2D and VR180 3D.
+pub fn favourite_formats() -> Vec<Format> {
+    use crate::vr::{Projection, Stereo};
+    let saved = read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.favourite_formats);
+    saved.filter(|f| !f.is_empty()).unwrap_or_else(|| {
+        vec![
+            Format {
+                projection: Projection::Flat,
+                stereo: Stereo::Mono,
+            },
+            Format {
+                projection: Projection::Equirect180,
+                stereo: Stereo::SideBySide,
+            },
+        ]
+    })
+}
+
+pub fn save_favourite_formats(formats: &[Format]) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.favourite_formats = Some(formats.to_vec());
+    write_json("settings.json", &settings, false)
 }
 
 #[cfg(test)]
@@ -155,6 +255,7 @@ mod tests {
             projection: crate::vr::Projection::Equirect180,
             stereo: crate::vr::Stereo::SideBySide,
             swap_eyes: false,
+            image: ImageAdjust::default(),
         };
         save_layout_override(key, Some(l)).unwrap();
         move_layout_override(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();

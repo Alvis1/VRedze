@@ -71,6 +71,61 @@ pub struct Opened {
     pub name: String,
     /// Where this file's layout override is stored.
     pub key: String,
+    /// Subtitle files next to the video (`movie.srt`, `movie.en.srt`).
+    pub external_subtitles: Vec<ExternalSubtitles>,
+    /// Saved picture corrections for this file.
+    pub image: config::ImageAdjust,
+}
+
+pub struct ExternalSubtitles {
+    /// File name, e.g. `movie.en.srt`.
+    pub name: String,
+    pub cues: Vec<crate::subtitles::Cue>,
+}
+
+/// Loads the .srt files next to `path`. Missing or unreadable ones are
+/// skipped: subtitles must never stop a video from playing.
+fn load_sidecars(session: &SmbSession, share: &str, path: &Path) -> Vec<ExternalSubtitles> {
+    use std::io::Read;
+    let Some((video, folder)) = path.split_last() else {
+        return Vec::new();
+    };
+    let entries = match session.list_in(share, &smb_path(&folder.to_vec())) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Subtitles: can't list the folder: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut names: Vec<String> = entries
+        .into_iter()
+        .filter(|e| !e.is_dir && e.size <= 8 << 20 && crate::subtitles::is_sidecar(video, &e.name))
+        .map(|e| e.name)
+        .collect();
+    // `movie.srt` first, then language variants.
+    names.sort_by_key(|n| (n.len(), n.clone()));
+    let small = ReadAhead {
+        block_size: 256 * 1024,
+        blocks_ahead: 4,
+    };
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let mut file = folder.to_vec();
+            file.push(name.clone());
+            let mut bytes = Vec::new();
+            let read = session
+                .open_in(share, &smb_path(&file), small)
+                .and_then(|mut r| Ok(r.read_to_end(&mut bytes)?));
+            if let Err(e) = read {
+                eprintln!("Subtitles: can't read {name}: {e:#}");
+                return None;
+            }
+            let cues = crate::subtitles::parse_srt(&crate::subtitles::decode_text(&bytes));
+            eprintln!("Subtitles: {name}: {} cues", cues.len());
+            (!cues.is_empty()).then_some(ExternalSubtitles { name, cues })
+        })
+        .collect()
 }
 
 pub enum Response {
@@ -273,6 +328,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
             // is affected, and it closes when the video does.
             let key = file_key(&server, &share, &path);
             let result = connect(&server, None).and_then(|s| {
+                let external_subtitles = load_sidecars(&s, &share, &path);
                 let reader = s
                     .open_owned(&share, &smb_path(&path), ReadAhead::default())
                     .map_err(err)?;
@@ -282,9 +338,11 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                 let video = media.info().video.clone();
                 let assessment = playability::assess(Platform::current(), video.as_ref());
                 let mut layout = vr::detect(&name, video.as_ref());
-                if let Ok(Some(saved)) = config::layout_override(&key) {
+                let saved = config::layout_override(&key).ok().flatten();
+                if let Some(saved) = saved {
                     saved.apply(&mut layout);
                 }
+                let image = saved.map(|s| s.image).unwrap_or_default();
                 // The last video's decoder closes in the background; wait for
                 // it, or the hardware decoder is still busy.
                 if !crate::media::wait_for_decoders_closed(std::time::Duration::from_secs(10)) {
@@ -297,6 +355,8 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     assessment,
                     name,
                     key,
+                    external_subtitles,
+                    image,
                 }))
             });
             Response::Opened { id, result }

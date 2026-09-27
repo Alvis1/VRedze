@@ -45,7 +45,15 @@ impl XrContext {
             extensions.other.push(FRAME_CONTROLLER.into());
             eprintln!("OpenXR: enabled {FRAME_CONTROLLER}");
         } else {
-            eprintln!("OpenXR: runtime does not offer {FRAME_CONTROLLER}");
+            let names: Vec<String> = available
+                .other
+                .iter()
+                .map(|e| String::from_utf8_lossy(e).into_owned())
+                .collect();
+            eprintln!(
+                "OpenXR: runtime does not offer {FRAME_CONTROLLER} (offers {})",
+                names.join(", ")
+            );
         }
         let xr = entry.create_instance(
             &xr::ApplicationInfo {

@@ -1,5 +1,6 @@
 //! Controller input: an aim ray per hand (smoothed), select (trigger or A),
-//! back (B), scroll (thumbstick; grip held = faster). Bindings are suggested for the Steam
+//! back (B), scroll (thumbstick; grip held = faster), seek (left D-pad or a
+//! sideways stick flick). Bindings are suggested for the Steam
 //! Frame controller, Index controllers and the generic simple profile.
 
 use super::context::XrContext;
@@ -23,6 +24,9 @@ pub struct InputState {
     pub reset: bool,
     /// Grip (lower trigger) held on either hand: a modifier, e.g. fast scroll.
     pub grip: bool,
+    /// Seek pressed this frame: -1 back, +1 forward (D-pad left/right, or a
+    /// sideways thumbstick flick where the D-pad isn't available).
+    pub seek: i32,
     /// Thumbstick vertical deflection (-1..1, up positive), strongest hand.
     pub scroll: f32,
 }
@@ -34,9 +38,13 @@ pub struct Input {
     back: xr::Action<bool>,
     reset: xr::Action<bool>,
     grip: xr::Action<bool>,
+    seek_back: xr::Action<bool>,
+    seek_forward: xr::Action<bool>,
     scroll: xr::Action<xr::Vector2f>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
+    /// Per hand: a sideways stick flick must return to centre before the next.
+    flick_ready: [bool; 2],
     /// Per hand: origin and direction filters.
     filters: [[OneEuro; 2]; 2],
 }
@@ -121,6 +129,9 @@ impl Input {
         let back = set.create_action::<bool>("back", "Back", &hands)?;
         let reset = set.create_action::<bool>("reset", "Reset view", &hands)?;
         let grip = set.create_action::<bool>("grip", "Modifier", &hands)?;
+        let seek_back = set.create_action::<bool>("seek_back", "Back 5 seconds", &hands)?;
+        let seek_forward =
+            set.create_action::<bool>("seek_forward", "Forward 5 seconds", &hands)?;
         let scroll = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
 
         let binding = |action: &str, path: xr::Path| match action {
@@ -129,55 +140,98 @@ impl Input {
             "back" => xr::Binding::new(&back, path),
             "reset" => xr::Binding::new(&reset, path),
             "grip" => xr::Binding::new(&grip, path),
+            "seek_back" => xr::Binding::new(&seek_back, path),
+            "seek_forward" => xr::Binding::new(&seek_forward, path),
             _ => xr::Binding::new(&scroll, path),
         };
         // Suggests every binding the runtime accepts for `profile` (each is
         // checked on its own first, since one bad path rejects the whole set).
-        let suggest = |profile: &str, wanted: &[(&str, &str)]| -> anyhow::Result<usize> {
-            let profile_path = xr_.string_to_path(profile)?;
-            let mut accepted = Vec::new();
-            for hand in ["left", "right"] {
-                for (action, input) in wanted {
-                    let path = xr_.string_to_path(&format!("/user/hand/{hand}/input/{input}"))?;
-                    if xr_
-                        .suggest_interaction_profile_bindings(
-                            profile_path,
-                            &[binding(action, path)],
-                        )
-                        .is_ok()
-                    {
-                        accepted.push((*action, path));
+        // An input is for both hands unless prefixed "left:" or "right:".
+        // Nothing is suggested unless all of `required` were accepted, so a
+        // profile we only half know can't replace a working one.
+        let suggest =
+            |profile: &str, wanted: &[(&str, &str)], required: &[&str]| -> anyhow::Result<usize> {
+                let profile_path = xr_.string_to_path(profile)?;
+                let mut accepted = Vec::new();
+                for hand in ["left", "right"] {
+                    for (action, input) in wanted {
+                        let input = match input.split_once(':') {
+                            Some((only, rest)) if only == hand => rest,
+                            Some(_) => continue,
+                            None => input,
+                        };
+                        let path =
+                            xr_.string_to_path(&format!("/user/hand/{hand}/input/{input}"))?;
+                        if xr_
+                            .suggest_interaction_profile_bindings(
+                                profile_path,
+                                &[binding(action, path)],
+                            )
+                            .is_ok()
+                        {
+                            accepted.push((*action, path));
+                        }
                     }
                 }
-            }
-            let list: Vec<_> = accepted.iter().map(|(a, p)| binding(a, *p)).collect();
-            if !list.is_empty() {
-                xr_.suggest_interaction_profile_bindings(profile_path, &list)?;
-            }
-            Ok(list.len())
-        };
-        let full = [
+                if let Some(missing) = required
+                    .iter()
+                    .find(|r| !accepted.iter().any(|(a, _)| a == *r))
+                {
+                    anyhow::bail!("no binding for {missing}");
+                }
+                let list: Vec<_> = accepted.iter().map(|(a, p)| binding(a, *p)).collect();
+                if !list.is_empty() {
+                    xr_.suggest_interaction_profile_bindings(profile_path, &list)?;
+                }
+                Ok(list.len())
+            };
+        let required = ["aim", "select", "back"];
+        // Steam Frame controllers: A/B on the right, a D-pad on the left.
+        let frame = [
             ("aim", "aim/pose"),
             ("select", "trigger/click"),
             ("select", "trigger/value"),
-            ("select", "a/click"),
-            ("select", "x/click"),
-            ("back", "b/click"),
-            ("back", "y/click"),
+            ("select", "right:a/click"),
+            ("back", "right:b/click"),
+            ("scroll", "thumbstick"),
+            ("reset", "thumbstick/click"),
+            ("grip", "squeeze/click"),
+            ("grip", "squeeze/value"),
+            ("grip", "grip/click"),
+            ("seek_back", "left:dpad_left/click"),
+            ("seek_forward", "left:dpad_right/click"),
+        ];
+        for profile in [
+            "/interaction_profiles/valve/frame_controller",
+            "/interaction_profiles/valve/frame_controller_valve",
+        ] {
+            match suggest(profile, &frame, &required) {
+                Ok(n) => eprintln!("Input: {profile}: {n} bindings"),
+                Err(e) => eprintln!("Input: {profile} not used: {e}"),
+            }
+        }
+        // Index bindings, which SteamVR maps Frame controllers onto when the
+        // native profile isn't available. The Frame's left D-pad arrives as
+        // the left A (down) and B (left/right/up), so A and B count only on
+        // the right: the D-pad must not stop the video.
+        let index = [
+            ("aim", "aim/pose"),
+            ("select", "trigger/click"),
+            ("select", "trigger/value"),
+            ("select", "right:a/click"),
+            ("back", "right:b/click"),
             ("scroll", "thumbstick"),
             ("reset", "thumbstick/click"),
             ("grip", "squeeze/click"),
             ("grip", "squeeze/value"),
         ];
-        for profile in [
-            "/interaction_profiles/valve/frame_controller",
-            "/interaction_profiles/valve/frame_controller_valve",
+        match suggest(
             "/interaction_profiles/valve/index_controller",
-        ] {
-            match suggest(profile, &full) {
-                Ok(n) => eprintln!("Input: {profile}: {n} bindings"),
-                Err(e) => eprintln!("Input: {profile} bindings not accepted: {e}"),
-            }
+            &index,
+            &required,
+        ) {
+            Ok(n) => eprintln!("Input: index_controller: {n} bindings"),
+            Err(e) => eprintln!("Input: index_controller not used: {e}"),
         }
         suggest(
             "/interaction_profiles/khr/simple_controller",
@@ -186,6 +240,7 @@ impl Input {
                 ("select", "select/click"),
                 ("back", "menu/click"),
             ],
+            &[],
         )?;
         ctx.session.attach_action_sets(&[&set])?;
         let spaces = [
@@ -199,9 +254,12 @@ impl Input {
             back,
             reset,
             grip,
+            seek_back,
+            seek_forward,
             scroll,
             hands,
             spaces,
+            flick_ready: [true; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
             filters: [[OneEuro::new(3.0, 6.0), OneEuro::new(1.5, 0.6)]; 2],
         })
@@ -227,9 +285,25 @@ impl Input {
             state.reset |= pressed(&self.reset, hand)?;
             let grip = self.grip.state(&ctx.session, hand)?;
             state.grip |= grip.is_active && grip.current_state;
+            if pressed(&self.seek_back, hand)? {
+                state.seek = -1;
+            }
+            if pressed(&self.seek_forward, hand)? {
+                state.seek = 1;
+            }
             let stick = self.scroll.state(&ctx.session, hand)?;
-            if stick.is_active && stick.current_state.y.abs() > state.scroll.abs() {
-                state.scroll = stick.current_state.y;
+            if stick.is_active {
+                let (x, y) = (stick.current_state.x, stick.current_state.y);
+                if y.abs() > state.scroll.abs() {
+                    state.scroll = y;
+                }
+                // A clearly sideways flick seeks; it must return to centre first.
+                if x.abs() < 0.3 {
+                    self.flick_ready[i] = true;
+                } else if self.flick_ready[i] && x.abs() > 0.8 && x.abs() > 2.0 * y.abs() {
+                    self.flick_ready[i] = false;
+                    state.seek = if x > 0.0 { 1 } else { -1 };
+                }
             }
             if self.aim.is_active(&ctx.session, hand)? {
                 let location = self.spaces[i].locate(space, time)?;

@@ -7,7 +7,7 @@ use super::player::{Placement, PlayOptions, PlayStats, Playback, ViewOptions, ey
 use super::renderer::{QuadTarget, Renderer};
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
-use crate::ui::{browser, controls};
+use crate::ui::{browser, captions, controls};
 use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
@@ -165,6 +165,22 @@ fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
     }
 }
 
+/// The dialog panel: above the control bar, in the same plane, as wide.
+fn dialog_panel(bar: &Panel) -> Panel {
+    let size = [
+        bar.size[0],
+        bar.size[0] * controls::DIALOG_HEIGHT as f32 / controls::DIALOG_WIDTH as f32,
+    ];
+    let [_, up, _] = bar.basis();
+    let lift = bar.size[1] / 2.0 + bar.size[0] * 0.02 + size[1] / 2.0;
+    Panel {
+        center: [0, 1, 2].map(|i| bar.center[i] + up[i] * lift),
+        size,
+        pixels: [controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT],
+        ..*bar
+    }
+}
+
 /// A white-ringed blue dot with premultiplied alpha.
 fn cursor_image() -> Vec<u8> {
     let mut pixels = vec![0u8; (CURSOR_PX * CURSOR_PX * 4) as usize];
@@ -248,13 +264,26 @@ const LONG_PRESS_NS: i64 = 600_000_000;
 /// Canvas pixels the pointer must move before a press on the list scrolls it.
 const LIST_DRAG_PX: f32 = 24.0;
 
+/// A select press on the control bar, acted on at release (or long press).
+struct ControlPress {
+    hand: usize,
+    hit: controls::Hit,
+    since: i64,
+    long: bool,
+}
+
 /// Remembers the format chosen for a file.
-fn save_layout(key: Option<&String>, layout: &crate::vr::Layout) {
+fn save_layout(
+    key: Option<&String>,
+    layout: &crate::vr::Layout,
+    image: &crate::config::ImageAdjust,
+) {
     let Some(key) = key else { return };
     let saved = crate::config::LayoutOverride {
         projection: layout.projection,
         stereo: layout.stereo,
         swap_eyes: layout.swap_eyes,
+        image: *image,
     };
     if let Err(e) = crate::config::save_layout_override(key, Some(saved)) {
         eprintln!("Can't save the format: {e:#}");
@@ -277,6 +306,68 @@ const CLICK_NS: i64 = 400_000_000;
 
 /// Where `ray` meets the video (flat or curved screen, or a point 5 m out
 /// for spherical video), for showing the cursor on it.
+/// Flat screen size (metres) for a `width`-wide screen showing a video of
+/// `video` pixels in `stereo` layout.
+fn screen_size(
+    video: (u32, u32),
+    stereo: crate::vr::Stereo,
+    width: f32,
+    quarter_turns: u8,
+) -> [f32; 2] {
+    let (w, h) = video;
+    let mut aspect = match stereo {
+        crate::vr::Stereo::SideBySide => w as f32 / 2.0 / h.max(1) as f32,
+        crate::vr::Stereo::TopBottom => w as f32 / (h as f32 / 2.0).max(1.0),
+        crate::vr::Stereo::Mono => w as f32 / h.max(1) as f32,
+    };
+    if quarter_turns % 2 == 1 {
+        aspect = 1.0 / aspect.max(0.01);
+    }
+    [width, width / aspect.max(0.1)]
+}
+
+/// Where subtitles go: over the bottom of a flat screen, just in front of it;
+/// for VR180/360, 2 m ahead in the view's direction, below its centre.
+fn caption_pose(
+    placement: &Placement,
+    projection: Projection,
+    screen: [f32; 2],
+    settings: crate::config::CaptionSettings,
+) -> (xr::Posef, [f32; 2]) {
+    let flat = projection == Projection::Flat;
+    // The layer grows with the chosen size; its bottom edge stays put.
+    let quad_w = settings.scale
+        * if flat {
+            screen[0] * captions::SCREEN_SHARE
+        } else {
+            1.5
+        };
+    let quad_h = quad_w * captions::HEIGHT as f32 / captions::WIDTH as f32;
+    let (y, depth) = if flat {
+        // A curved screen bends towards us: stay in front of its nearest part.
+        let d = placement.distance;
+        let depth = if placement.curved {
+            (d * d - quad_w * quad_w / 4.0).max(0.01).sqrt()
+        } else {
+            d
+        };
+        let bottom = -screen[1] / 2.0 + screen[1] * (0.04 + settings.raise);
+        (bottom + quad_h / 2.0, depth - 0.02)
+    } else {
+        (-0.45 + 0.9 * settings.raise + quad_h / 2.0 - 0.14, 2.0)
+    };
+    let mut panel = Panel {
+        center: [0.0; 3],
+        yaw: placement.yaw,
+        tilt: placement.pitch,
+        size: [quad_w, quad_h],
+        pixels: [captions::WIDTH, captions::HEIGHT],
+    };
+    let [_, up, normal] = panel.basis();
+    panel.center = [0, 1, 2].map(|i| up[i] * y - normal[i] * depth);
+    (panel.pose(), panel.size)
+}
+
 fn video_hit(
     ray: &Ray,
     placement: &Placement,
@@ -398,6 +489,12 @@ pub fn run(
         None => None,
     };
     let mut controls_target = renderer.create_quad(&ctx, controls::WIDTH, controls::HEIGHT)?;
+    let mut captions_target = renderer.create_quad(&ctx, captions::WIDTH, captions::HEIGHT)?;
+    let mut dialog_target =
+        renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
+    // The caption on screen, and where it goes this frame.
+    let mut caption_drawn: Option<crate::subtitles::Caption> = None;
+    let mut caption_at: Option<(xr::Posef, [f32; 2])> = None;
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
 
@@ -420,7 +517,18 @@ pub fn run(
     let mut press: Option<Press> = None;
     let mut browser_press: Option<BrowserPress> = None;
     // The control bar shows the page with every format.
-    let mut controls_more = false;
+    // The dialog open above the control bar, and what it last showed.
+    let mut dialog: Option<controls::Dialog> = None;
+    let mut dialog_drawn: Option<(controls::State, controls::Hit)> = None;
+    // Subtitle size and position (the same for every video).
+    let mut caption_settings = crate::config::caption_settings();
+    let mut list_page = 0usize;
+    let mut control_press: Option<ControlPress> = None;
+    // Formats the format button steps through.
+    let mut favourites: Vec<controls::Format> = crate::config::favourite_formats()
+        .into_iter()
+        .map(|f| (f.projection, f.stereo))
+        .collect();
     // Previous (-1) or next (+1) video requested from the control bar.
     let mut switch_video: Option<isize> = None;
 
@@ -547,13 +655,18 @@ pub fn run(
                         "Playing {} as {:?} / {:?}",
                         opened.name, opened.layout.projection, opened.layout.stereo
                     );
-                    mode = Mode::Playing(Box::new(Playback::start(
+                    let mut playback = Playback::start(
                         opened.decoder,
                         opened.layout,
                         0.0,
                         // Full level: the headset's volume buttons set loudness.
                         1.0,
-                    )));
+                    );
+                    playback.add_external_subtitles(opened.external_subtitles);
+                    playback.image = opened.image;
+                    renderer.set_adjust(&playback.image);
+                    dialog = None;
+                    mode = Mode::Playing(Box::new(playback));
                     ctx.frame_stream
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
                     continue;
@@ -655,52 +768,71 @@ pub fn run(
                     paused: playback.paused(),
                     position: playback.position().floor(),
                     duration: playback.duration,
-                    curved: curved_applies.then_some(placement.curved),
-                    projection: playback.layout.projection,
-                    stereo: playback.layout.stereo,
-                    swap_eyes: playback.layout.swap_eyes,
                     has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
                     has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
-                    more: controls_more,
+                    curved: curved_applies.then_some(placement.curved),
+                    format: (playback.layout.projection, playback.layout.stereo),
+                    favourites: favourites.clone(),
+                    swap_eyes: playback.layout.swap_eyes,
+                    subtitle_tracks: playback.subtitle_labels(),
+                    subtitle: playback.subtitle_index(),
+                    audio_tracks: playback.audio_labels().to_vec(),
+                    audio: playback.audio_index(),
+                    list_page,
+                    image: playback.image,
+                    dialog,
                 };
-                let control_point =
+                // The pointer on the dialog (above the bar) or on the bar.
+                let dialog_at = controls_panel_at
+                    .filter(|_| dialog.is_some())
+                    .map(|bar| dialog_panel(&bar));
+                let dialog_point =
+                    dialog_at.and_then(|p| ray.and_then(|r| p.hit(r)).map(|pt| (p, pt)));
+                let bar_point =
                     controls_panel_at.and_then(|p| ray.and_then(|r| p.hit(r)).map(|pt| (p, pt)));
-                let control_hit = control_point.map_or(controls::Hit::Nothing, |(_, (x, y))| {
-                    controls::hit(&ui_state, x, y)
+                let control_point = dialog_point.or(bar_point);
+                let dialog_hit = dialog_point.map_or(controls::Hit::Nothing, |(_, (x, y))| {
+                    controls::dialog_hit(&ui_state, x, y)
                 });
+                let bar_hit = match (dialog_point, bar_point) {
+                    (None, Some((_, (x, y)))) => controls::hit(&ui_state, x, y),
+                    _ => controls::Hit::Nothing,
+                };
+                let control_hit = if dialog_point.is_some() {
+                    dialog_hit
+                } else {
+                    bar_hit
+                };
 
-                if buttons.select[active_hand] && press.is_none() {
-                    if control_point.is_some() {
-                        match control_hit {
-                            controls::Hit::PlayPause => playback.toggle_pause(now),
-                            controls::Hit::Seek(f) => playback.seek(f as f64 * playback.duration),
-                            controls::Hit::Curved => placement.curved = !placement.curved,
-                            controls::Hit::Previous => switch_video = Some(-1),
-                            controls::Hit::Next => switch_video = Some(1),
-                            controls::Hit::Flat | controls::Hit::Vr180 => {
-                                let layout = &mut playback.layout;
-                                (layout.projection, layout.stereo) =
-                                    if control_hit == controls::Hit::Flat {
-                                        controls::FLAT
-                                    } else {
-                                        controls::VR180
-                                    };
-                                save_layout(playing_key.as_ref(), layout);
-                            }
-                            controls::Hit::Pick(i) => {
-                                let layout = &mut playback.layout;
-                                (layout.projection, layout.stereo) = controls::FORMATS[i];
-                                save_layout(playing_key.as_ref(), layout);
-                            }
-                            controls::Hit::SwapEyes => {
-                                playback.layout.swap_eyes = !playback.layout.swap_eyes;
-                                save_layout(playing_key.as_ref(), &playback.layout);
-                            }
-                            controls::Hit::More => controls_more = true,
-                            controls::Hit::Back => controls_more = false,
-                            controls::Hit::Nothing => {}
+                // Controls act on release, so buttons with a long press can
+                // tell the two apart; the seek bar acts at once.
+                let mut clicked: Option<controls::Hit> = None;
+                let mut long_pressed: Option<controls::Hit> = None;
+                if let Some(cp) = &mut control_press {
+                    if buttons.select_held[cp.hand] {
+                        if !cp.long && cp.hit.has_long_press() && now - cp.since > LONG_PRESS_NS {
+                            cp.long = true;
+                            long_pressed = Some(cp.hit);
                         }
-                        controls_drawn = None;
+                    } else {
+                        if !cp.long {
+                            clicked = Some(cp.hit);
+                        }
+                        control_press = None;
+                    }
+                }
+                if buttons.select[active_hand] && press.is_none() && control_press.is_none() {
+                    if control_point.is_some() {
+                        if let controls::Hit::Seek(_) = control_hit {
+                            clicked = Some(control_hit);
+                        } else {
+                            control_press = Some(ControlPress {
+                                hand: active_hand,
+                                hit: control_hit,
+                                since: now,
+                                long: false,
+                            });
+                        }
                     } else if let Some(r) = buttons.rays[active_hand].as_ref() {
                         let (yaw, pitch) = aim_angles(r);
                         press = Some(Press {
@@ -751,15 +883,141 @@ pub fn run(
                                         views.first().map(|v| controls_panel(&v.pose, limit))
                                     }
                                 };
-                                controls_more = false;
+                                dialog = None;
                                 controls_drawn = None;
                             }
                             press = None;
                         }
                     }
                 }
+                let set_format = |playback: &mut Playback, format: controls::Format| {
+                    (playback.layout.projection, playback.layout.stereo) = format;
+                    save_layout(playing_key.as_ref(), &playback.layout, &playback.image);
+                };
+                let mut image_changed = false;
+                let mut captions_changed = false;
+                match clicked {
+                    Some(controls::Hit::PlayPause) => playback.toggle_pause(now),
+                    Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
+                    Some(controls::Hit::Previous) => switch_video = Some(-1),
+                    Some(controls::Hit::Next) => switch_video = Some(1),
+                    // CC: subtitles on/off (or, with none, straight to audio tracks).
+                    Some(controls::Hit::Captions) => {
+                        if playback.subtitle_labels().is_empty() {
+                            dialog = Some(controls::Dialog::Tracks);
+                        } else {
+                            playback.toggle_subtitles();
+                        }
+                    }
+                    Some(controls::Hit::Screen) => {
+                        let current = (playback.layout.projection, playback.layout.stereo);
+                        if let Some(next) = controls::next_favourite(current, &favourites) {
+                            set_format(playback, next);
+                        }
+                    }
+                    Some(controls::Hit::Image) => dialog = Some(controls::Dialog::Image),
+                    Some(controls::Hit::AudioTrack(track)) => playback.set_audio_track(track),
+                    Some(controls::Hit::SubtitleTrack(track)) => playback.set_subtitle(track),
+                    Some(controls::Hit::MorePage) => {
+                        list_page =
+                            (list_page + 1) % controls::pages(playback.subtitle_labels().len() + 1);
+                    }
+                    Some(controls::Hit::CaptionSize(d)) => {
+                        caption_settings.scale =
+                            (caption_settings.scale * 1.12f32.powi(d as i32)).clamp(0.5, 2.5);
+                        captions_changed = true;
+                    }
+                    Some(controls::Hit::CaptionMove(d)) => {
+                        caption_settings.raise =
+                            (caption_settings.raise + 0.03 * d as f32).clamp(-0.3, 0.8);
+                        captions_changed = true;
+                    }
+                    Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
+                    Some(controls::Hit::Curved) => placement.curved = !placement.curved,
+                    Some(controls::Hit::SwapEyes) => {
+                        playback.layout.swap_eyes = !playback.layout.swap_eyes;
+                        save_layout(playing_key.as_ref(), &playback.layout, &playback.image);
+                    }
+                    Some(controls::Hit::Brightness(d)) => {
+                        playback.image.brightness = (playback.image.brightness
+                            + controls::BRIGHTNESS_STEP * d as f32)
+                            .clamp(-0.5, 0.5);
+                        image_changed = true;
+                    }
+                    Some(controls::Hit::Contrast(d)) => {
+                        playback.image.contrast = (playback.image.contrast
+                            + controls::CONTRAST_STEP * d as f32)
+                            .clamp(0.5, 2.0);
+                        image_changed = true;
+                    }
+                    Some(controls::Hit::Saturation(d)) => {
+                        playback.image.saturation = (playback.image.saturation
+                            + controls::SATURATION_STEP * d as f32)
+                            .clamp(0.0, 2.0);
+                        image_changed = true;
+                    }
+                    Some(controls::Hit::Rotate(turns)) => {
+                        playback.image.rotation = turns;
+                        image_changed = true;
+                    }
+                    Some(controls::Hit::ResetImage) => {
+                        playback.image = Default::default();
+                        image_changed = true;
+                    }
+                    Some(controls::Hit::Close) => dialog = None,
+                    Some(controls::Hit::Nothing) | None => {}
+                }
+                match long_pressed {
+                    Some(controls::Hit::Captions) => {
+                        dialog = Some(controls::Dialog::Tracks);
+                        // Start on the page with the track shown.
+                        list_page = playback.subtitle_index().map_or(0, |i| (i + 1) / 11);
+                    }
+                    Some(controls::Hit::Screen) => dialog = Some(controls::Dialog::Screen),
+                    // Star or unstar a favourite.
+                    Some(controls::Hit::Pick(i)) => {
+                        let format = controls::FORMATS[i];
+                        match favourites.iter().position(|f| *f == format) {
+                            Some(at) if favourites.len() > 1 => {
+                                favourites.remove(at);
+                            }
+                            Some(_) => {} // keep at least one
+                            None => favourites.push(format),
+                        }
+                        let saved: Vec<crate::config::Format> = favourites
+                            .iter()
+                            .map(|&(projection, stereo)| crate::config::Format {
+                                projection,
+                                stereo,
+                            })
+                            .collect();
+                        if let Err(e) = crate::config::save_favourite_formats(&saved) {
+                            eprintln!("Can't save favourite formats: {e:#}");
+                        }
+                    }
+                    _ => {}
+                }
+                if image_changed {
+                    renderer.set_adjust(&playback.image);
+                    save_layout(playing_key.as_ref(), &playback.layout, &playback.image);
+                }
+                if captions_changed {
+                    caption_drawn = None;
+                    if let Err(e) = crate::config::save_caption_settings(caption_settings) {
+                        eprintln!("Can't save subtitle settings: {e:#}");
+                    }
+                }
+                if clicked.is_some() || long_pressed.is_some() {
+                    controls_drawn = None;
+                    dialog_drawn = None;
+                }
                 let dragging = press.as_ref().is_some_and(|p| p.dragging);
                 // Thumbstick click: back to the default size and place.
+                // D-pad left/right (or a sideways stick flick): 5 seconds back/forward.
+                if buttons.seek != 0 {
+                    playback.seek(playback.position() + 5.0 * buttons.seek as f64);
+                    controls_drawn = None;
+                }
                 if buttons.reset {
                     placement = Placement {
                         curved: placement.curved,
@@ -775,28 +1033,31 @@ pub fn run(
                 }
 
                 if controls_panel_at.is_some() {
-                    if controls_drawn.as_ref() != Some(&(ui_state.clone(), control_hit)) {
-                        let canvas = controls::render(&ui_state, &mut fonts, control_hit);
+                    if controls_drawn.as_ref() != Some(&(ui_state.clone(), bar_hit)) {
+                        let canvas = controls::render(&ui_state, &mut fonts, bar_hit);
                         renderer.upload_quad(&mut controls_target, &canvas.pixels)?;
-                        controls_drawn = Some((ui_state, control_hit));
+                        controls_drawn = Some((ui_state.clone(), bar_hit));
+                    }
+                    if dialog.is_some()
+                        && dialog_drawn.as_ref() != Some(&(ui_state.clone(), dialog_hit))
+                    {
+                        let canvas = controls::render_dialog(&ui_state, &mut fonts, dialog_hit);
+                        renderer.upload_quad(&mut dialog_target, &canvas.pixels)?;
+                        dialog_drawn = Some((ui_state, dialog_hit));
                     }
                     if let Some((p, (x, y))) = control_point {
                         cursor_at = Some((p, x, y));
                     } else if let (Some(r), Some(head)) = (ray, views.first()) {
                         // Menu open: also show where the ray meets the video.
-                        let (w, h) = renderer.video_size();
-                        let aspect = match playback.layout.stereo {
-                            crate::vr::Stereo::SideBySide => w as f32 / 2.0 / h.max(1) as f32,
-                            crate::vr::Stereo::TopBottom => w as f32 / (h as f32 / 2.0).max(1.0),
-                            crate::vr::Stereo::Mono => w as f32 / h.max(1) as f32,
-                        };
-                        let width = options.view.screen_width * placement.zoom;
-                        if let Some(point) = video_hit(
-                            r,
-                            &placement,
-                            playback.layout.projection,
-                            [width, width / aspect.max(0.1)],
-                        ) {
+                        let screen = screen_size(
+                            renderer.video_size(),
+                            playback.layout.stereo,
+                            options.view.screen_width * placement.zoom,
+                            playback.image.rotation,
+                        );
+                        if let Some(point) =
+                            video_hit(r, &placement, playback.layout.projection, screen)
+                        {
                             let eye = head.pose.position;
                             let to_eye = [eye.x - point[0], eye.y - point[1], eye.z - point[2]];
                             let distance = dot(to_eye, to_eye).sqrt();
@@ -806,6 +1067,29 @@ pub fn run(
                     }
                 }
 
+                // Subtitles: redrawn only when the text changes.
+                let caption = playback.caption();
+                if caption != caption_drawn {
+                    if let Some(caption) = &caption {
+                        let canvas = captions::render(caption, &mut fonts);
+                        renderer.upload_quad(&mut captions_target, &canvas.pixels)?;
+                    }
+                    caption_drawn = caption.clone();
+                }
+                caption_at = caption.is_some().then(|| {
+                    let screen = screen_size(
+                        renderer.video_size(),
+                        playback.layout.stereo,
+                        options.view.screen_width * placement.zoom,
+                        playback.image.rotation,
+                    );
+                    caption_pose(
+                        &placement,
+                        playback.layout.projection,
+                        screen,
+                        caption_settings,
+                    )
+                });
                 set_phase(6);
                 let upload = playback.advance(now);
                 renderer.begin_frame(if upload { playback.current() } else { None })?;
@@ -823,8 +1107,15 @@ pub fn run(
                     let index = target.swapchain.acquire_image()?;
                     target.swapchain.wait_image(xr::Duration::INFINITE)?;
                     indices[eye] = index;
-                    let params =
-                        eye_params(view, eye, &playback.layout, tex, &options.view, &placement);
+                    let params = eye_params(
+                        view,
+                        eye,
+                        &playback.layout,
+                        tex,
+                        &options.view,
+                        &placement,
+                        playback.image.rotation,
+                    );
                     renderer.draw_eye(eye, index, &params, show);
                 }
                 let media_time = playback.media_time(now);
@@ -856,8 +1147,15 @@ pub fn run(
                 }
             }
             Mode::Playing(_) => {
+                if let Some((pose, size)) = caption_at.filter(|_| captions_target.ready) {
+                    quads.push((&captions_target, pose, size, true));
+                }
                 if let Some(panel) = controls_panel_at.filter(|_| controls_target.ready) {
                     quads.push((&controls_target, panel.pose(), panel.size, false));
+                    if dialog.is_some() && dialog_target.ready {
+                        let above = dialog_panel(&panel);
+                        quads.push((&dialog_target, above.pose(), above.size, false));
+                    }
                 }
             }
         }

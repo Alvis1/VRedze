@@ -49,6 +49,62 @@ struct RawInfo {
 }
 
 #[repr(C)]
+struct RawSubtitleTrack {
+    codec: [c_char; 32],
+    language: [c_char; 16],
+    title: [c_char; 64],
+    is_default: i32,
+    forced: i32,
+    supported: i32,
+}
+
+#[repr(C)]
+struct RawAudioTrack {
+    codec: [c_char; 32],
+    language: [c_char; 16],
+    title: [c_char; 64],
+    channels: i32,
+    is_default: i32,
+}
+
+/// An audio stream in the file.
+#[derive(Clone, Debug, Serialize)]
+pub struct AudioTrackInfo {
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub channels: u32,
+    pub default: bool,
+}
+
+#[repr(C)]
+struct RawCue {
+    start: f64,
+    end: f64,
+    clear: i32,
+    text: [c_char; 1024],
+    rgba: *mut u8,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    frame_width: i32,
+    frame_height: i32,
+}
+
+/// A subtitle stream in the file.
+#[derive(Clone, Debug, Serialize)]
+pub struct SubtitleTrackInfo {
+    pub codec: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub default: bool,
+    pub forced: bool,
+    /// A text format we can show (bitmap subtitles, e.g. PGS, are not).
+    pub supported: bool,
+}
+
+#[repr(C)]
 struct RawStats {
     frames: i32,
     hardware_frames: i32,
@@ -170,6 +226,10 @@ pub struct MediaInfo {
     pub bit_rate: i64,
     pub video: Option<VideoInfo>,
     pub audio: Option<AudioInfo>,
+    pub subtitles: Vec<SubtitleTrackInfo>,
+    pub audio_tracks: Vec<AudioTrackInfo>,
+    /// The audio track played at first (index into `audio_tracks`).
+    pub audio_track: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -240,6 +300,42 @@ impl Media {
             channels: r.audio_channels.max(0) as u32,
             sample_rate: r.audio_sample_rate.max(0) as u32,
         });
+        let count = unsafe { jv_media_subtitle_count(raw) };
+        let subtitles = (0..count)
+            .filter_map(|i| {
+                let mut t = std::mem::MaybeUninit::<RawSubtitleTrack>::zeroed();
+                // SAFETY: `raw` is open and `i` is in range.
+                (unsafe { jv_media_subtitle_track(raw, i, t.as_mut_ptr()) } == 0).then(|| {
+                    let t = unsafe { t.assume_init() };
+                    SubtitleTrackInfo {
+                        codec: text(&t.codec),
+                        language: optional(&t.language),
+                        title: optional(&t.title),
+                        default: t.is_default != 0,
+                        forced: t.forced != 0,
+                        supported: t.supported != 0,
+                    }
+                })
+            })
+            .collect();
+        let audio_count = unsafe { jv_media_audio_count(raw) };
+        let audio_tracks = (0..audio_count)
+            .filter_map(|i| {
+                let mut t = std::mem::MaybeUninit::<RawAudioTrack>::zeroed();
+                // SAFETY: `raw` is open and `i` is in range.
+                (unsafe { jv_media_audio_track(raw, i, t.as_mut_ptr()) } == 0).then(|| {
+                    let t = unsafe { t.assume_init() };
+                    AudioTrackInfo {
+                        codec: text(&t.codec),
+                        language: optional(&t.language),
+                        title: optional(&t.title),
+                        channels: t.channels.max(0) as u32,
+                        default: t.is_default != 0,
+                    }
+                })
+            })
+            .collect();
+        let audio_track = usize::try_from(unsafe { jv_media_current_audio(raw) }).ok();
         Ok(Self {
             raw,
             _source: source,
@@ -249,6 +345,9 @@ impl Media {
                 bit_rate: r.bit_rate,
                 video,
                 audio,
+                subtitles,
+                audio_tracks,
+                audio_track,
             },
         })
     }
@@ -349,6 +448,20 @@ unsafe extern "C" {
         pts: *mut f64,
     ) -> c_int;
     fn jv_decoder_close(decoder: *mut RawDecoder);
+    fn jv_media_subtitle_count(media: *const RawMedia) -> c_int;
+    fn jv_media_audio_count(media: *const RawMedia) -> c_int;
+    fn jv_media_audio_track(media: *const RawMedia, track: c_int, out: *mut RawAudioTrack)
+    -> c_int;
+    fn jv_media_current_audio(media: *const RawMedia) -> c_int;
+    fn jv_decoder_select_audio(decoder: *mut RawDecoder, track: c_int) -> c_int;
+    fn jv_media_subtitle_track(
+        media: *const RawMedia,
+        track: c_int,
+        out: *mut RawSubtitleTrack,
+    ) -> c_int;
+    fn jv_decoder_select_subtitle(decoder: *mut RawDecoder, track: c_int) -> c_int;
+    fn jv_free(pointer: *mut c_void);
+    fn jv_decoder_subtitle_read(decoder: *mut RawDecoder, out: *mut RawCue) -> c_int;
 }
 
 const AVERROR_EOF: c_int = -0x20464F45; // FFERRTAG('E','O','F',' ')
@@ -578,6 +691,58 @@ impl VideoDecoder {
 
     /// Jumps to the keyframe at or before `seconds`; frames before the target
     /// still arrive and should be skipped by the caller.
+    /// Decodes subtitle track `track` (index into `info().subtitles`) alongside
+    /// the video, or none. False if it can't be decoded.
+    pub fn select_subtitle(&mut self, track: Option<usize>) -> bool {
+        let track = track.map_or(-1, |t| t as c_int);
+        unsafe { jv_decoder_select_subtitle(self.raw, track) == 0 }
+    }
+
+    /// Plays audio track `track` (index into `info().audio_tracks`) instead;
+    /// seek afterwards. False if it can't be decoded (the old one stays).
+    pub fn select_audio(&mut self, track: usize) -> bool {
+        unsafe { jv_decoder_select_audio(self.raw, track as c_int) == 0 }
+    }
+
+    /// Subtitle cues decoded since the last call.
+    pub fn take_subtitles(&mut self) -> Vec<crate::subtitles::Cue> {
+        let mut cues = Vec::new();
+        let mut raw = std::mem::MaybeUninit::<RawCue>::zeroed();
+        // SAFETY: `raw` is writable; the decoder is open.
+        while unsafe { jv_decoder_subtitle_read(self.raw, raw.as_mut_ptr()) } == 1 {
+            let cue = unsafe { raw.assume_init_ref() };
+            // Take the picture (we own it now), then free the C copy.
+            let image = (!cue.rgba.is_null() && cue.width > 0 && cue.height > 0).then(|| {
+                let len = cue.width as usize * cue.height as usize * 4;
+                // SAFETY: C allocated `width * height * 4` bytes at `rgba`.
+                let rgba = unsafe { std::slice::from_raw_parts(cue.rgba, len) }.to_vec();
+                std::sync::Arc::new(crate::subtitles::Bitmap {
+                    rgba,
+                    width: cue.width as u32,
+                    height: cue.height as u32,
+                    x: cue.x,
+                    y: cue.y,
+                    frame_width: cue.frame_width.max(1) as u32,
+                    frame_height: cue.frame_height.max(1) as u32,
+                })
+            });
+            if !cue.rgba.is_null() {
+                unsafe { jv_free(cue.rgba as *mut c_void) };
+            }
+            let text = crate::subtitles::clean_markup(&text(&cue.text));
+            if cue.clear != 0 || !text.is_empty() || image.is_some() {
+                // A cue with neither text nor picture erases (see `Cue`).
+                cues.push(crate::subtitles::Cue {
+                    start: cue.start,
+                    end: cue.end,
+                    text,
+                    image,
+                });
+            }
+        }
+        cues
+    }
+
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),

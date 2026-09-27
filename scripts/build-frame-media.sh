@@ -67,7 +67,7 @@ PKG_CONFIG_LIBDIR="$prefix/lib/pkgconfig" PKG_CONFIG_PATH= ./configure --prefix=
   --enable-static --disable-shared --enable-pic --disable-debug --disable-doc --disable-programs \
   --disable-network --disable-autodetect --enable-zlib --disable-avdevice --disable-avfilter --disable-swscale \
   --enable-swresample --disable-everything --enable-libdav1d --enable-v4l2-m2m \
-  --enable-decoder=h264,hevc,vp9,libdav1d,h264_v4l2m2m,hevc_v4l2m2m,vp9_v4l2m2m,aac,aac_latm,ac3,eac3,opus,flac,mp3,mp2,vorbis,dca,truehd,alac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le \
+  --enable-decoder=h264,hevc,vp9,libdav1d,h264_v4l2m2m,hevc_v4l2m2m,vp9_v4l2m2m,aac,aac_latm,ac3,eac3,opus,flac,mp3,mp2,vorbis,dca,truehd,alac,pcm_s16le,pcm_s24le,pcm_s32le,pcm_f32le,ass,ssa,subrip,srt,webvtt,movtext,text,dvdsub,pgssub,dvbsub \
   --enable-demuxer=mov,matroska,mpegts,avi \
   --enable-parser=h264,hevc,vp9,av1,aac,aac_latm,ac3,opus,flac,mpegaudio,dca,vorbis \
   --enable-bsf=h264_mp4toannexb,hevc_mp4toannexb,vp9_superframe_split,extract_extradata,av1_frame_split \

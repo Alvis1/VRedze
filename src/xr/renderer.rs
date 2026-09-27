@@ -28,6 +28,8 @@ pub struct EyeParams {
 struct ColorParams {
     rows: [[f32; 4]; 3],
     params: [f32; 4],
+    /// Brightness, contrast, saturation, quarter turns (see `Color` in video.wgsl).
+    adjust: [f32; 4],
 }
 
 struct Buffer {
@@ -88,6 +90,7 @@ pub struct Renderer {
     set: vk::DescriptorSet,
     sampler: vk::Sampler,
     color: Buffer,
+    adjust: [f32; 4],
     staging: Option<Buffer>,
     ui_staging: Option<Buffer>,
     readback: Option<Buffer>,
@@ -295,6 +298,7 @@ impl Renderer {
                     mapped: std::ptr::null_mut(),
                     size: 0,
                 },
+                adjust: [0.0, 1.0, 1.0, 0.0],
                 staging: None,
                 ui_staging: None,
                 readback: None,
@@ -684,7 +688,10 @@ impl Renderer {
             }
             regions.push(start as u64);
         }
-        let color = color_params(frame);
+        let color = ColorParams {
+            adjust: self.adjust,
+            ..color_params(frame)
+        };
         unsafe { std::ptr::copy_nonoverlapping(&color, self.color.mapped as *mut ColorParams, 1) };
         let video = self.video.as_ref().expect("video textures");
         for (plane, (texture, _, w, h)) in video.planes.iter().enumerate() {
@@ -822,10 +829,28 @@ impl Renderer {
     /// Starts recording a frame; uploads `frame` first when it changed.
     pub fn begin_frame(&mut self, upload: Option<&Frame>) -> anyhow::Result<()> {
         self.begin_commands()?;
+        // Corrections change without a new frame (e.g. while paused).
+        // SAFETY: the mapped uniform holds a whole ColorParams.
+        if !self.color.mapped.is_null() {
+            unsafe {
+                let color = self.color.mapped as *mut ColorParams;
+                (*color).adjust = self.adjust;
+            }
+        }
         if let Some(frame) = upload {
             self.record_upload(frame)?;
         }
         Ok(())
+    }
+
+    /// Picture corrections for the video from now on.
+    pub fn set_adjust(&mut self, image: &crate::config::ImageAdjust) {
+        self.adjust = [
+            image.brightness,
+            image.contrast,
+            image.saturation,
+            image.rotation as f32,
+        ];
     }
 
     /// Luma texture size, for the shader's half-texel clamp.
@@ -1120,5 +1145,6 @@ fn color_params(frame: &Frame) -> ColorParams {
             },
             transfer,
         ],
+        adjust: [0.0, 1.0, 1.0, 0.0],
     }
 }

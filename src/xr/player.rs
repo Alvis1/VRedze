@@ -3,6 +3,7 @@
 
 use super::renderer::EyeParams;
 use crate::media::{Frame, VideoDecoder};
+use crate::subtitles::Cues;
 use crate::vr::{Layout, Projection, Stereo};
 use openxr as xr;
 use std::{
@@ -229,6 +230,10 @@ struct DecodeThread {
     frames: mpsc::Receiver<Decoded>,
     control: mpsc::Sender<(u64, f64)>,
     requested: Arc<AtomicU64>,
+    /// Which embedded subtitle track to decode (None: none).
+    subtitle_track: mpsc::Sender<Option<usize>>,
+    /// Which audio track to play (a seek follows).
+    audio_track: mpsc::Sender<usize>,
 }
 
 fn spawn_decoder(
@@ -236,7 +241,10 @@ fn spawn_decoder(
     start: f64,
     audio: Option<mpsc::Sender<AudioChunk>>,
     stop: Arc<AtomicBool>,
+    embedded_cues: Arc<Mutex<Cues>>,
 ) -> DecodeThread {
+    let (subtitle_track, subtitle_changes) = mpsc::channel::<Option<usize>>();
+    let (audio_track, audio_changes) = mpsc::channel::<usize>();
     // A few frames of slack absorb decode jitter; more would only cost memory.
     let (tx, frames) = mpsc::sync_channel(4);
     let (control, commands) = mpsc::channel::<(u64, f64)>();
@@ -247,11 +255,23 @@ fn spawn_decoder(
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
             'decode: loop {
+                // Before seeks: the seek that follows a switch restarts the new track.
+                while let Ok(track) = audio_changes.try_recv() {
+                    if !decoder.select_audio(track) {
+                        eprintln!("Audio: can't decode track {track}");
+                    }
+                }
                 while let Ok((g, t)) = commands.try_recv() {
                     if let Err(e) = decoder.seek(t) {
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
                     (generation, start) = (g, t);
+                }
+                while let Ok(track) = subtitle_changes.try_recv() {
+                    embedded_cues.lock().expect("cues").clear();
+                    if !decoder.select_subtitle(track) {
+                        eprintln!("Subtitles: can't decode track {track:?}");
+                    }
                 }
                 if stop.load(Ordering::Relaxed) {
                     return;
@@ -261,6 +281,13 @@ fn spawn_decoder(
                     Ok(None) => Decoded::End(generation),
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
+                let cues = decoder.take_subtitles();
+                if !cues.is_empty() {
+                    let mut shared = embedded_cues.lock().expect("cues");
+                    for cue in cues {
+                        shared.insert(cue);
+                    }
+                }
                 if let Some(audio) = &audio {
                     while let Some((samples, pts)) = decoder.take_audio(crate::audio::CHANNELS) {
                         let pts = pts.unwrap_or(start);
@@ -320,11 +347,113 @@ fn spawn_decoder(
         frames,
         control,
         requested,
+        subtitle_track,
+        audio_track,
     }
+}
+
+/// "Korean · Surround", "English 5.1"…
+fn audio_label(index: usize, t: &crate::media::AudioTrackInfo) -> String {
+    let mut label = t
+        .language
+        .as_deref()
+        .map(language_name)
+        .unwrap_or_else(|| format!("Track {}", index + 1));
+    match t.title.as_deref() {
+        Some(title) if !title.eq_ignore_ascii_case(&label) => label = format!("{label} · {title}"),
+        _ => {
+            let channels = match t.channels {
+                1 => "mono".to_string(),
+                2 => "stereo".to_string(),
+                6 => "5.1".to_string(),
+                8 => "7.1".to_string(),
+                0 => String::new(),
+                n => format!("{n} ch"),
+            };
+            if !channels.is_empty() {
+                label = format!("{label} {channels}");
+            }
+        }
+    }
+    label
+}
+
+/// A subtitle track the viewer can pick.
+enum SubtitleSource {
+    /// Index into the file's subtitle streams; cues arrive while decoding.
+    Embedded(usize),
+    /// A .srt file next to the video.
+    External(Cues),
+}
+
+struct SubtitleTrack {
+    label: String,
+    source: SubtitleSource,
+}
+
+/// "English", "Svenska"… for common ISO 639-2 codes; the code otherwise.
+fn language_name(code: &str) -> String {
+    let name = match code.to_ascii_lowercase().as_str() {
+        "eng" | "en" => "English",
+        "swe" | "sv" => "Swedish",
+        "nor" | "nob" | "no" => "Norwegian",
+        "dan" | "da" => "Danish",
+        "fin" | "fi" => "Finnish",
+        "ger" | "deu" | "de" => "German",
+        "fre" | "fra" | "fr" => "French",
+        "spa" | "es" => "Spanish",
+        "ita" | "it" => "Italian",
+        "por" | "pt" => "Portuguese",
+        "dut" | "nld" | "nl" => "Dutch",
+        "pol" | "pl" => "Polish",
+        "rus" | "ru" => "Russian",
+        "jpn" | "ja" => "Japanese",
+        "kor" | "ko" => "Korean",
+        "chi" | "zho" | "zh" => "Chinese",
+        "ara" | "ar" => "Arabic",
+        "est" | "et" => "Estonian",
+        "lav" | "lv" => "Latvian",
+        "lit" | "lt" => "Lithuanian",
+        "ukr" | "uk" => "Ukrainian",
+        "hin" | "hi" => "Hindi",
+        "tam" | "ta" => "Tamil",
+        "tel" | "te" => "Telugu",
+        "cze" | "ces" | "cs" => "Czech",
+        "slo" | "slk" | "sk" => "Slovak",
+        "slv" | "sl" => "Slovenian",
+        "hun" | "hu" => "Hungarian",
+        "rum" | "ron" | "ro" => "Romanian",
+        "bul" | "bg" => "Bulgarian",
+        "hrv" | "hr" => "Croatian",
+        "srp" | "sr" => "Serbian",
+        "gre" | "ell" | "el" => "Greek",
+        "tur" | "tr" => "Turkish",
+        "heb" | "he" => "Hebrew",
+        "tha" | "th" => "Thai",
+        "vie" | "vi" => "Vietnamese",
+        "ind" | "id" => "Indonesian",
+        "may" | "msa" | "ms" => "Malay",
+        "ice" | "isl" | "is" => "Icelandic",
+        "cat" | "ca" => "Catalan",
+        "per" | "fas" | "fa" => "Persian",
+        _ => return code.to_string(),
+    };
+    name.to_string()
 }
 
 pub struct Playback {
     pub layout: Layout,
+    /// Picture corrections and rotation.
+    pub image: crate::config::ImageAdjust,
+    /// The track CC turns back on.
+    last_subtitle: usize,
+    subtitle_tracks: Vec<SubtitleTrack>,
+    subtitle: Option<usize>,
+    embedded_cues: Arc<Mutex<Cues>>,
+    /// Briefly shown instead of subtitles after switching ("Subtitles: English").
+    subtitle_notice: Option<(String, Instant)>,
+    audio_labels: Vec<String>,
+    audio_track: Option<usize>,
     decode: DecodeThread,
     audio: Option<Arc<AudioShared>>,
     stop: Arc<AtomicBool>,
@@ -345,11 +474,57 @@ pub struct Playback {
 impl Playback {
     /// Starts decoding (and sound, when the file has audio) at `start` seconds.
     pub fn start(mut decoder: VideoDecoder, layout: Layout, start: f64, volume: f32) -> Self {
+        // Embedded text subtitles; the file's default track is on from the start.
+        let embedded: Vec<(usize, &crate::media::SubtitleTrackInfo)> = decoder
+            .info()
+            .subtitles
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.supported)
+            .collect();
+        let subtitle_tracks: Vec<SubtitleTrack> = embedded
+            .iter()
+            .map(|(i, t)| {
+                let mut label = t
+                    .language
+                    .as_deref()
+                    .map(language_name)
+                    .unwrap_or_else(|| format!("Track {}", i + 1));
+                if let Some(title) = t
+                    .title
+                    .as_deref()
+                    .filter(|title| !title.eq_ignore_ascii_case(&label))
+                {
+                    label = format!("{label} ({title})");
+                }
+                SubtitleTrack {
+                    label,
+                    source: SubtitleSource::Embedded(*i),
+                }
+            })
+            .collect();
+        let subtitle = embedded
+            .iter()
+            .position(|(_, t)| t.default)
+            .or((!embedded.is_empty()).then_some(0));
+        if let Some(SubtitleSource::Embedded(track)) = subtitle.map(|i| &subtitle_tracks[i].source)
+        {
+            decoder.select_subtitle(Some(*track));
+        }
+        let embedded_cues = Arc::new(Mutex::new(Cues::default()));
         let info = decoder.info();
         let fps = info.video.as_ref().map_or(30.0, |v| v.fps.max(1.0));
         let duration = info.duration_seconds;
         let stop = Arc::new(AtomicBool::new(false));
         let has_audio = decoder.enable_audio(crate::audio::RATE, crate::audio::CHANNELS);
+        let audio_labels: Vec<String> = decoder
+            .info()
+            .audio_tracks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| audio_label(i, t))
+            .collect();
+        let audio_track = decoder.info().audio_track.filter(|_| has_audio);
         let audio = has_audio.then(|| {
             Arc::new(AudioShared {
                 generation: AtomicU64::new(0),
@@ -365,7 +540,21 @@ impl Playback {
         });
         Self {
             layout,
-            decode: spawn_decoder(decoder, start, audio_tx, stop.clone()),
+            image: Default::default(),
+            last_subtitle: subtitle.unwrap_or(0),
+            decode: spawn_decoder(
+                decoder,
+                start,
+                audio_tx,
+                stop.clone(),
+                embedded_cues.clone(),
+            ),
+            subtitle_tracks,
+            subtitle,
+            embedded_cues,
+            subtitle_notice: None,
+            audio_labels,
+            audio_track,
             audio,
             stop,
             generation: 0,
@@ -379,6 +568,138 @@ impl Playback {
             clock_start: None,
             paused_at: None,
             stats: PlayStats::default(),
+        }
+    }
+
+    /// Adds subtitle files found next to the video; the first one is shown
+    /// (a file placed next to a video is usually there to be used).
+    pub fn add_external_subtitles(&mut self, files: Vec<crate::library::ExternalSubtitles>) {
+        if files.is_empty() {
+            return;
+        }
+        let count = files.len();
+        let external = files.into_iter().map(|f| SubtitleTrack {
+            label: f.name.clone(),
+            source: SubtitleSource::External(Cues::new(f.cues)),
+        });
+        self.subtitle_tracks.splice(0..0, external);
+        self.subtitle = self.subtitle.map(|i| i + count);
+        self.select_subtitle(Some(0), false);
+    }
+
+    pub fn has_subtitles(&self) -> bool {
+        !self.subtitle_tracks.is_empty()
+    }
+
+    pub fn subtitles_on(&self) -> bool {
+        self.subtitle.is_some()
+    }
+
+    /// CC: subtitles off, or back on with the last track shown.
+    pub fn toggle_subtitles(&mut self) {
+        if self.subtitle_tracks.is_empty() {
+            return;
+        }
+        let next = match self.subtitle {
+            Some(_) => None,
+            None => Some(self.last_subtitle.min(self.subtitle_tracks.len() - 1)),
+        };
+        self.select_subtitle(next, true);
+    }
+
+    fn select_subtitle(&mut self, index: Option<usize>, announce: bool) {
+        if let Some(i) = index {
+            self.last_subtitle = i;
+        }
+        let embedded =
+            |i: Option<usize>, tracks: &[SubtitleTrack]| match i.map(|i| &tracks[i].source) {
+                Some(SubtitleSource::Embedded(t)) => Some(*t),
+                _ => None,
+            };
+        let (before, after) = (
+            embedded(self.subtitle, &self.subtitle_tracks),
+            embedded(index, &self.subtitle_tracks),
+        );
+        if before != after {
+            let _ = self.decode.subtitle_track.send(after);
+        }
+        self.subtitle = index;
+        if announce {
+            let text = match index {
+                Some(i) => format!("Subtitles: {}", self.subtitle_tracks[i].label),
+                None => "Subtitles off".to_string(),
+            };
+            self.subtitle_notice = Some((text, Instant::now()));
+        }
+    }
+
+    pub fn audio_labels(&self) -> &[String] {
+        &self.audio_labels
+    }
+
+    pub fn audio_index(&self) -> Option<usize> {
+        self.audio_track
+    }
+
+    /// Switches to audio track `index`, continuing from the current picture.
+    pub fn set_audio_track(&mut self, index: usize) {
+        if self.audio_track.is_none()
+            || self.audio_track == Some(index)
+            || index >= self.audio_labels.len()
+        {
+            return;
+        }
+        let _ = self.decode.audio_track.send(index);
+        self.audio_track = Some(index);
+        self.subtitle_notice = Some((
+            format!("Audio: {}", self.audio_labels[index]),
+            Instant::now(),
+        ));
+        self.seek(self.position());
+    }
+
+    pub fn subtitle_labels(&self) -> Vec<String> {
+        self.subtitle_tracks
+            .iter()
+            .map(|t| t.label.clone())
+            .collect()
+    }
+
+    pub fn subtitle_index(&self) -> Option<usize> {
+        self.subtitle
+    }
+
+    /// Shows track `index` (None: off), with a short notice.
+    pub fn set_subtitle(&mut self, index: Option<usize>) {
+        if index.is_none_or(|i| i < self.subtitle_tracks.len()) {
+            self.select_subtitle(index, true);
+        }
+    }
+
+    /// Off → each track in turn → off.
+    pub fn cycle_subtitles(&mut self) {
+        if self.subtitle_tracks.is_empty() {
+            return;
+        }
+        let next = match self.subtitle {
+            None => Some(0),
+            Some(i) if i + 1 < self.subtitle_tracks.len() => Some(i + 1),
+            Some(_) => None,
+        };
+        self.select_subtitle(next, true);
+    }
+
+    /// The subtitle for the frame on screen (or a short notice after switching).
+    pub fn caption(&self) -> Option<crate::subtitles::Caption> {
+        if let Some((text, at)) = &self.subtitle_notice
+            && at.elapsed() < Duration::from_millis(1800)
+        {
+            return Some(crate::subtitles::Caption::text(text.clone()));
+        }
+        let time = self.position();
+        match &self.subtitle_tracks.get(self.subtitle?)?.source {
+            SubtitleSource::External(cues) => cues.caption(time),
+            SubtitleSource::Embedded(_) => self.embedded_cues.lock().expect("cues").caption(time),
         }
     }
 
@@ -586,14 +907,19 @@ pub fn eye_params(
     tex: (u32, u32),
     options: &ViewOptions,
     placement: &Placement,
+    quarter_turns: u8,
 ) -> EyeParams {
     let (w, h) = (tex.0 as f32, tex.1 as f32);
-    // Flat screen aspect from one eye's part of the frame.
-    let aspect = match layout.stereo {
+    // Flat screen aspect from one eye's part of the frame (turned on its side
+    // when the picture is rotated a quarter).
+    let mut aspect = match layout.stereo {
         Stereo::SideBySide => w / 2.0 / h,
         Stereo::TopBottom => w / (h / 2.0),
         Stereo::Mono => w / h,
     };
+    if quarter_turns % 2 == 1 {
+        aspect = 1.0 / aspect.max(0.01);
+    }
     // Express the eye in the placement's frame: the shader's screen/sphere is
     // fixed there, so rotating the placement moves the video around the viewer.
     let placed = placement.rotation();

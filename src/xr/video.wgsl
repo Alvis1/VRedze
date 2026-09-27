@@ -24,11 +24,13 @@ struct Eye {
 
 // YUV -> R'G'B' as affine rows (xyz: coefficients, w: offset), then
 // params: x sample scale, y semi-planar chroma, z BT.2020 primaries, w transfer (0 SDR, 1 PQ, 2 HLG).
+// adjust: x brightness, y contrast, z saturation, w quarter turns clockwise.
 struct Color {
     m0: vec4<f32>,
     m1: vec4<f32>,
     m2: vec4<f32>,
     params: vec4<f32>,
+    adjust: vec4<f32>,
 }
 
 var<immediate> eye: Eye;
@@ -153,6 +155,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     if eye.mode.z > 0.5 {
         index = 1.0 - index;
     }
+    // Rotated video: turn the eye's image within its part of the frame.
+    var st = hit.xy;
+    let turns = u32(color.adjust.w + 0.5) % 4u;
+    if turns == 1u {
+        st = vec2<f32>(st.y, 1.0 - st.x);
+    } else if turns == 2u {
+        st = vec2<f32>(1.0 - st.x, 1.0 - st.y);
+    } else if turns == 3u {
+        st = vec2<f32>(1.0 - st.y, st.x);
+    }
     let stereo = u32(eye.mode.y);
     var rect = vec4<f32>(0.0, 0.0, 1.0, 1.0);
     if stereo == 1u {
@@ -161,7 +173,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         rect = vec4<f32>(0.0, index * 0.5, 1.0, index * 0.5 + 0.5);
     }
     let margin = vec2<f32>(1.0) / eye.tex.xy;
-    let uv = clamp(mix(rect.xy, rect.zw, hit.xy), rect.xy + margin, rect.zw - margin);
+    let uv = clamp(mix(rect.xy, rect.zw, st), rect.xy + margin, rect.zw - margin);
 
     let scale = color.params.x;
     let y = textureSampleLevel(tex_y, samp, uv, 0.0).r * scale;
@@ -179,11 +191,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(y, cb, cr, 1.0);
     }
     let yuv = vec3<f32>(y, cb, cr);
-    let encoded = clamp(
+    var encoded = clamp(
         vec3<f32>(dot(color.m0.xyz, yuv) + color.m0.w, dot(color.m1.xyz, yuv) + color.m1.w, dot(color.m2.xyz, yuv) + color.m2.w),
         vec3<f32>(0.0),
         vec3<f32>(1.0),
     );
+    // Picture corrections, on the encoded (perceptual) values.
+    let luma = dot(encoded, vec3<f32>(0.2126, 0.7152, 0.0722));
+    encoded = mix(vec3<f32>(luma), encoded, color.adjust.z);
+    encoded = clamp((encoded - 0.5) * color.adjust.y + 0.5 + color.adjust.x, vec3<f32>(0.0), vec3<f32>(1.0));
     var linear: vec3<f32>;
     let transfer = u32(color.params.w);
     if transfer == 1u {

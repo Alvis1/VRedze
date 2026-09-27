@@ -109,6 +109,23 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         seeks: usize,
     },
+    /// Print the subtitles decoded while playing through a stretch of video.
+    #[command(hide = true)]
+    Subtitles {
+        input: String,
+        /// Subtitle track (index into `info`'s subtitles).
+        #[arg(long, default_value_t = 0)]
+        track: usize,
+        /// Start here (seconds).
+        #[arg(long, default_value_t = 0.0)]
+        start: f64,
+        /// Media seconds to decode.
+        #[arg(long, default_value_t = 60.0)]
+        seconds: f64,
+        /// Save the first picture subtitle as rendered in the headset.
+        #[arg(long)]
+        png: Option<std::path::PathBuf>,
+    },
     /// Decode and play a file's audio for a few seconds (no XR), checking timestamps.
     #[command(hide = true)]
     AudioTest {
@@ -117,6 +134,9 @@ enum Command {
         seconds: f64,
         #[arg(long, default_value_t = 0.3)]
         volume: f32,
+        /// Halfway through, switch to this audio track (as the player does).
+        #[arg(long)]
+        switch_to: Option<usize>,
     },
     /// Render sample browser screens to PNG files (UI development).
     #[command(hide = true)]
@@ -651,10 +671,59 @@ fn main() -> anyhow::Result<()> {
             }
             eprintln!("no hang in {rounds} rounds");
         }
+        Command::Subtitles {
+            input,
+            track,
+            start,
+            seconds,
+            png,
+        } => {
+            let (source, _session) = open_input(&input, ReadAhead::default())?;
+            let media = Media::open(file_name(&input), source)?;
+            let mut decoder = media.into_decoder(None, true, "")?;
+            anyhow::ensure!(
+                decoder.select_subtitle(Some(track)),
+                "Can't decode subtitle track {track}"
+            );
+            if start > 0.0 {
+                decoder.seek(start)?;
+            }
+            let mut cues = Vec::new();
+            while let Some(frame) = decoder.next_frame()? {
+                cues.extend(decoder.take_subtitles());
+                if frame.pts().is_some_and(|t| t > start + seconds) {
+                    break;
+                }
+            }
+            for c in &cues {
+                let what = match &c.image {
+                    Some(b) => format!(
+                        "[picture {}x{} at {},{} in {}x{}]",
+                        b.width, b.height, b.x, b.y, b.frame_width, b.frame_height
+                    ),
+                    None if c.text.is_empty() => "[erase]".to_string(),
+                    None => c.text.replace('\n', " / "),
+                };
+                println!("{:8.2} {:8.2}  {what}", c.start, c.end);
+            }
+            if let (Some(path), Some(image)) = (png, cues.iter().find_map(|c| c.image.clone())) {
+                let mut fonts = just_video::ui::canvas::Fonts::load()?;
+                let caption = just_video::subtitles::Caption {
+                    text: None,
+                    image: Some(image),
+                };
+                just_video::ui::save_png(
+                    &just_video::ui::captions::render(&caption, &mut fonts),
+                    &path,
+                )?;
+            }
+            eprintln!("{} cues", cues.len());
+        }
         Command::AudioTest {
             input,
             seconds,
             volume,
+            switch_to,
         } => {
             use just_video::audio::{CHANNELS, Output, RATE};
             let (source, _session) = open_input(&input, ReadAhead::default())?;
@@ -664,7 +733,25 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
             let mut output = Output::open("audio-test")?;
             let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
+            // Zero crossings per second of the left channel, before and after a switch
+            // (a pure tone reads as twice its frequency).
+            let (mut crossings, mut counted, mut last) = ([0u64; 2], [0u64; 2], 0.0f32);
+            let mut switched = false;
             while (written as f64) < seconds * RATE as f64 {
+                if let Some(track) = switch_to
+                    && !switched
+                    && written as f64 >= seconds * RATE as f64 / 2.0
+                {
+                    switched = true;
+                    let at = expected.unwrap_or(0.0);
+                    anyhow::ensure!(
+                        decoder.select_audio(track),
+                        "Can't switch to audio track {track}"
+                    );
+                    decoder.seek(at)?;
+                    expected = None;
+                    eprintln!("switched to track {track} at {at:.2}s");
+                }
                 if decoder.next_frame()?.is_none() {
                     break;
                 }
@@ -678,6 +765,14 @@ fn main() -> anyhow::Result<()> {
                         eprintln!("timestamp jump: expected {e:.3}, got {p:.3}");
                     }
                     expected = pts.map(|p| p + n as f64 / RATE as f64);
+                    let half = switched as usize;
+                    for frame in samples.chunks_exact(CHANNELS as usize) {
+                        if (frame[0] >= 0.0) != (last >= 0.0) {
+                            crossings[half] += 1;
+                        }
+                        last = frame[0];
+                        counted[half] += 1;
+                    }
                     let scaled: Vec<f32> = samples.iter().map(|s| s * volume * volume).collect();
                     output.write(&scaled)?;
                     written += n;
@@ -688,6 +783,7 @@ fn main() -> anyhow::Result<()> {
                 "audio_seconds": written as f64 / RATE as f64,
                 "last_audio_pts": expected,
                 "timestamp_jumps": gaps,
+                "crossings_per_second": ([0, 1].map(|h| crossings[h] as f64 * RATE as f64 / counted[h].max(1) as f64)),
                 "output_latency_ms": output.latency() * 1000.0,
             }))?;
         }
@@ -823,26 +919,81 @@ fn main() -> anyhow::Result<()> {
                 paused: true,
                 position: 754.0,
                 duration: 5530.0,
-                curved: Some(true),
-                projection: just_video::vr::Projection::Flat,
-                stereo: just_video::vr::Stereo::SideBySide,
-                swap_eyes: false,
                 has_previous: true,
                 has_next: false,
-                more: false,
+                curved: Some(true),
+                format: controls::FORMATS[3],
+                favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],
+                swap_eyes: false,
+                subtitle_tracks: [
+                    "English",
+                    "English (Forced)",
+                    "English (Commentary)",
+                    "Danish",
+                    "Danish (Commentary)",
+                    "Estonian",
+                    "Finnish",
+                    "Finnish (Commentary)",
+                    "Hindi",
+                    "Latvian",
+                    "Lithuanian",
+                    "Norwegian",
+                    "Norwegian (Commentary)",
+                    "Russian",
+                    "Swedish",
+                    "Swedish (Commentary)",
+                ]
+                .map(String::from)
+                .to_vec(),
+                subtitle: Some(0),
+                audio_tracks: vec!["English 7.1".into(), "English · Commentary".into()],
+                audio: Some(0),
+                list_page: 0,
+                image: just_video::config::ImageAdjust {
+                    brightness: 0.1,
+                    contrast: 1.2,
+                    saturation: 1.0,
+                    rotation: 1,
+                },
+                dialog: None,
             };
             just_video::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
             )?;
-            let more = controls::State {
-                more: true,
-                ..state
-            };
-            just_video::ui::save_png(
-                &controls::render(&more, &mut fonts, controls::Hit::Pick(3)),
-                &dir.join("controls-more.png"),
-            )?;
+            for (dialog, name, hover) in [
+                (
+                    controls::Dialog::Tracks,
+                    "dialog-tracks.png",
+                    controls::Hit::SubtitleTrack(Some(3)),
+                ),
+                (
+                    controls::Dialog::Screen,
+                    "dialog-screen.png",
+                    controls::Hit::Pick(4),
+                ),
+                (
+                    controls::Dialog::Image,
+                    "dialog-image.png",
+                    controls::Hit::Contrast(1),
+                ),
+            ] {
+                let open = controls::State {
+                    dialog: Some(dialog),
+                    ..state.clone()
+                };
+                just_video::ui::save_png(
+                    &controls::render_dialog(&open, &mut fonts, hover),
+                    &dir.join(name),
+                )?;
+            }
+            let caption = just_video::ui::captions::render(
+                &just_video::subtitles::Caption::text(
+                    "Good morning, everyone.\nThe train leaves at noon.",
+                ),
+                &mut fonts,
+            );
+            just_video::ui::save_png(&caption, &dir.join("caption.png"))?;
         }
         Command::XrProbe => {
             let xr = just_video::xr::context::XrContext::new()?;

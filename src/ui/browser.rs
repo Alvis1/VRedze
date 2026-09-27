@@ -16,6 +16,7 @@ const CRUMB_SEP: &str = "  ›  ";
 /// Unlock button and row actions, from the right edge of a row.
 const LOCK_W: f32 = 76.0;
 const ACTION_W: f32 = 150.0;
+const ICON_ACTION_W: f32 = 84.0;
 /// The scrollbar's grab zone at the right edge of the list.
 const SCROLL_W: f32 = 64.0;
 /// Header tool buttons (e.g. "Select", "Delete 3").
@@ -62,6 +63,19 @@ pub enum Action {
 }
 
 impl Action {
+    /// Delete and Remove are trash-can icon buttons; the rest are labelled.
+    fn is_icon(self) -> bool {
+        matches!(self, Action::Delete | Action::Remove)
+    }
+
+    fn width(self) -> f32 {
+        if self.is_icon() {
+            ICON_ACTION_W
+        } else {
+            ACTION_W
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Action::Rename => "Rename",
@@ -291,11 +305,12 @@ fn action_rect(view: &View, i: usize, k: usize) -> Rect {
     } else {
         x + w - 8.0
     };
-    let from_right = (view.rows[i].actions.len() - k) as f32;
+    let actions = &view.rows[i].actions;
+    let from_right: f32 = actions[k..].iter().map(|a| a.width() + 10.0).sum();
     (
-        right - from_right * (ACTION_W + 10.0) + 10.0,
+        right - from_right + 10.0,
         y + 6.0,
-        ACTION_W,
+        actions[k].width(),
         h - 12.0,
     )
 }
@@ -385,6 +400,16 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx - 3.0, cy - 18.0, 6.0, 36.0, 3.0, ACCENT);
             canvas.rect(cx - 18.0, cy - 3.0, 36.0, 6.0, 3.0, ACCENT);
         }
+    }
+}
+
+/// A trash can: lid with handle, and a body with three slots.
+fn draw_trash(canvas: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
+    canvas.rect(cx - 6.0, cy - 21.0, 12.0, 5.0, 2.0, color);
+    canvas.rect(cx - 17.0, cy - 16.0, 34.0, 5.0, 2.0, color);
+    canvas.rect(cx - 13.0, cy - 8.0, 26.0, 29.0, 4.0, color);
+    for dx in [-6.0, 0.0, 6.0] {
+        canvas.rect(cx + dx - 1.5, cy - 3.0, 3.0, 19.0, 1.5, [0x6a, 0x1d, 0x19]);
     }
 }
 
@@ -521,17 +546,21 @@ pub fn render(
                     [color[0] / 3, color[1] / 3, color[2] / 3]
                 };
                 canvas.rect(ax, ay, aw, ah, 12.0, fill);
-                let label = action.label();
-                let lw = fonts.measure(label, 30.0);
-                fonts.draw(
-                    &mut canvas,
-                    label,
-                    ax + (aw - lw) / 2.0,
-                    ay + ah / 2.0 + 11.0,
-                    30.0,
-                    TEXT,
-                    aw,
-                );
+                if action.is_icon() {
+                    draw_trash(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
+                } else {
+                    let label = action.label();
+                    let lw = fonts.measure(label, 30.0);
+                    fonts.draw(
+                        &mut canvas,
+                        label,
+                        ax + (aw - lw) / 2.0,
+                        ay + ah / 2.0 + 11.0,
+                        30.0,
+                        TEXT,
+                        aw,
+                    );
+                }
                 if k == 0 {
                     right_edge = ax - 16.0;
                 }

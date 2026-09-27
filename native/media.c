@@ -14,11 +14,18 @@
 
 #define IO_BUFFER_SIZE (256 * 1024)
 
+#define MAX_SUBTITLES 32
+#define CUE_QUEUE 64
+
 struct JVMedia {
     AVFormatContext *format;
     AVIOContext *io;
     int video_stream;
     int audio_stream;
+    int subtitle_streams[MAX_SUBTITLES];
+    int subtitle_count;
+    int audio_streams[MAX_SUBTITLES];
+    int audio_count;
 };
 
 typedef struct {
@@ -122,9 +129,16 @@ JVMedia *jv_media_open(const char *name, jv_read_fn read, jv_seek_fn seek, void 
     }
     int audio = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, media->video_stream, NULL, 0);
     media->audio_stream = audio;
-    // Demux only what we play: skip subtitles, extra audio tracks, attachments.
-    for (unsigned i = 0; i < fmt->nb_streams; i++)
+    // Demux only what we play: skip extra audio tracks, attachments, and
+    // subtitles until one is selected (jv_decoder_select_subtitle).
+    for (unsigned i = 0; i < fmt->nb_streams; i++) {
+        enum AVMediaType type = fmt->streams[i]->codecpar->codec_type;
+        if (type == AVMEDIA_TYPE_SUBTITLE && media->subtitle_count < MAX_SUBTITLES)
+            media->subtitle_streams[media->subtitle_count++] = (int)i;
+        if (type == AVMEDIA_TYPE_AUDIO && media->audio_count < MAX_SUBTITLES)
+            media->audio_streams[media->audio_count++] = (int)i;
         if ((int)i != media->video_stream && (int)i != audio) fmt->streams[i]->discard = AVDISCARD_ALL;
+    }
     if (audio >= 0) {
         const AVCodecParameters *par = fmt->streams[audio]->codecpar;
         copy_name(info->audio_codec, sizeof(info->audio_codec), avcodec_get_name(par->codec_id));
@@ -217,6 +231,11 @@ struct JVDecoder {
     float *samples;      // interleaved, `sample_count` frames buffered
     int sample_count, sample_capacity;
     double samples_pts;  // time of samples[0], seconds from video start; < 0 unknown
+    // Subtitles (optional): the selected stream's cues, queued for Rust.
+    AVCodecContext *subtitle;
+    int subtitle_stream;  // stream index, -1 for none
+    JVSubtitleCue cues[CUE_QUEUE];
+    int cue_first, cue_count;
 };
 
 static double video_start_seconds(const JVMedia *media) {
@@ -224,8 +243,220 @@ static double video_start_seconds(const JVMedia *media) {
     return video->start_time != AV_NOPTS_VALUE ? video->start_time * av_q2d(video->time_base) : 0;
 }
 
+int jv_media_audio_count(const JVMedia *media) {
+    return media->audio_count;
+}
+
+int jv_media_audio_track(const JVMedia *media, int track, JVAudioTrack *out) {
+    memset(out, 0, sizeof(*out));
+    if (track < 0 || track >= media->audio_count) return AVERROR(EINVAL);
+    const AVStream *st = media->format->streams[media->audio_streams[track]];
+    copy_name(out->codec, sizeof(out->codec), avcodec_get_name(st->codecpar->codec_id));
+    const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
+    const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
+    copy_name(out->language, sizeof(out->language), lang ? lang->value : NULL);
+    copy_name(out->title, sizeof(out->title), title ? title->value : NULL);
+    out->channels = st->codecpar->ch_layout.nb_channels;
+    out->is_default = !!(st->disposition & AV_DISPOSITION_DEFAULT);
+    return 0;
+}
+
+int jv_media_current_audio(const JVMedia *media) {
+    for (int i = 0; i < media->audio_count; i++)
+        if (media->audio_streams[i] == media->audio_stream) return i;
+    return -1;
+}
+
+int jv_decoder_select_audio(JVDecoder *d, int track) {
+    JVMedia *m = d->media;
+    if (!d->audio) return AVERROR(EINVAL);  // audio was never enabled
+    if (track < 0 || track >= m->audio_count) return AVERROR(EINVAL);
+    int index = m->audio_streams[track];
+    if (index == m->audio_stream) return 0;
+    int rate = d->out_rate, channels = d->out_channels, old = m->audio_stream;
+    avcodec_free_context(&d->audio);
+    swr_free(&d->swr);
+    av_frame_free(&d->audio_frame);
+    d->sample_count = 0;
+    m->format->streams[old]->discard = AVDISCARD_ALL;
+    m->format->streams[index]->discard = AVDISCARD_DEFAULT;
+    m->audio_stream = index;
+    int ret = jv_decoder_enable_audio(d, rate, channels);
+    if (ret < 0) {  // can't decode it: back to the old track
+        avcodec_free_context(&d->audio);
+        swr_free(&d->swr);
+        av_frame_free(&d->audio_frame);
+        m->format->streams[index]->discard = AVDISCARD_ALL;
+        m->format->streams[old]->discard = AVDISCARD_DEFAULT;
+        m->audio_stream = old;
+        jv_decoder_enable_audio(d, rate, channels);
+    }
+    return ret;
+}
+
+int jv_media_subtitle_count(const JVMedia *media) {
+    return media->subtitle_count;
+}
+
+int jv_media_subtitle_track(const JVMedia *media, int track, JVSubtitleTrack *out) {
+    memset(out, 0, sizeof(*out));
+    if (track < 0 || track >= media->subtitle_count) return AVERROR(EINVAL);
+    const AVStream *st = media->format->streams[media->subtitle_streams[track]];
+    const AVCodecDescriptor *desc = avcodec_descriptor_get(st->codecpar->codec_id);
+    copy_name(out->codec, sizeof(out->codec), avcodec_get_name(st->codecpar->codec_id));
+    const AVDictionaryEntry *lang = av_dict_get(st->metadata, "language", NULL, 0);
+    const AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
+    copy_name(out->language, sizeof(out->language), lang ? lang->value : NULL);
+    copy_name(out->title, sizeof(out->title), title ? title->value : NULL);
+    out->is_default = !!(st->disposition & AV_DISPOSITION_DEFAULT);
+    out->forced = !!(st->disposition & AV_DISPOSITION_FORCED);
+    out->supported = desc && (desc->props & (AV_CODEC_PROP_TEXT_SUB | AV_CODEC_PROP_BITMAP_SUB))
+                     && avcodec_find_decoder(st->codecpar->codec_id);
+    return 0;
+}
+
+static void drop_cues(JVDecoder *d);
+
+int jv_decoder_select_subtitle(JVDecoder *d, int track) {
+    JVMedia *m = d->media;
+    if (d->subtitle_stream >= 0) m->format->streams[d->subtitle_stream]->discard = AVDISCARD_ALL;
+    avcodec_free_context(&d->subtitle);
+    d->subtitle_stream = -1;
+    drop_cues(d);
+    if (track < 0) return 0;
+    if (track >= m->subtitle_count) return AVERROR(EINVAL);
+    int index = m->subtitle_streams[track];
+    AVStream *st = m->format->streams[index];
+    const AVCodec *codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) return AVERROR_DECODER_NOT_FOUND;
+    d->subtitle = avcodec_alloc_context3(codec);
+    if (!d->subtitle) return AVERROR(ENOMEM);
+    int ret = avcodec_parameters_to_context(d->subtitle, st->codecpar);
+    if (ret >= 0) {
+        d->subtitle->pkt_timebase = st->time_base;
+        ret = avcodec_open2(d->subtitle, codec, NULL);
+    }
+    if (ret < 0) { avcodec_free_context(&d->subtitle); return ret; }
+    st->discard = AVDISCARD_DEFAULT;
+    d->subtitle_stream = index;
+    return 0;
+}
+
+// Text of an ASS "Dialogue" payload: the part after its 8 leading fields
+// (ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect).
+static const char *ass_dialogue_text(const char *ass) {
+    const char *p = ass;
+    int commas = 0;
+    for (; *p && commas < 8; p++)
+        if (*p == ',') commas++;
+    return commas == 8 ? p : ass;
+}
+
+void jv_free(void *pointer) {
+    av_free(pointer);
+}
+
+static void drop_cues(JVDecoder *d) {
+    for (int i = 0; i < d->cue_count; i++) av_freep(&d->cues[(d->cue_first + i) % CUE_QUEUE].rgba);
+    d->cue_first = d->cue_count = 0;
+}
+
+static void queue_cue(JVDecoder *d, const JVSubtitleCue *cue) {
+    if (d->cue_count == CUE_QUEUE) {  // nobody reading: drop the oldest
+        av_freep(&d->cues[d->cue_first].rgba);
+        d->cue_first = (d->cue_first + 1) % CUE_QUEUE;
+        d->cue_count--;
+    }
+    d->cues[(d->cue_first + d->cue_count++) % CUE_QUEUE] = *cue;
+}
+
+// All bitmap rectangles of a subtitle, merged into one premultiplied RGBA image.
+static void bitmap_cue(JVDecoder *d, const AVSubtitle *sub, JVSubtitleCue *cue) {
+    int x0 = INT32_MAX, y0 = INT32_MAX, x1 = 0, y1 = 0;
+    for (unsigned i = 0; i < sub->num_rects; i++) {
+        const AVSubtitleRect *r = sub->rects[i];
+        if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 || !r->data[0] || !r->data[1]) continue;
+        x0 = FFMIN(x0, r->x); y0 = FFMIN(y0, r->y);
+        x1 = FFMAX(x1, r->x + r->w); y1 = FFMAX(y1, r->y + r->h);
+    }
+    if (x1 <= x0 || y1 <= y0 || (int64_t)(x1 - x0) * (y1 - y0) > 4096 * 4096) return;
+    int w = x1 - x0, h = y1 - y0;
+    uint8_t *rgba = av_mallocz((size_t)w * h * 4);
+    if (!rgba) return;
+    for (unsigned i = 0; i < sub->num_rects; i++) {
+        const AVSubtitleRect *r = sub->rects[i];
+        if (r->type != SUBTITLE_BITMAP || r->w <= 0 || r->h <= 0 || !r->data[0] || !r->data[1]) continue;
+        const uint32_t *palette = (const uint32_t *)r->data[1];  // 0xAARRGGBB
+        for (int y = 0; y < r->h; y++) {
+            const uint8_t *src = r->data[0] + (size_t)y * r->linesize[0];
+            uint8_t *dst = rgba + ((size_t)(r->y - y0 + y) * w + (r->x - x0)) * 4;
+            for (int x = 0; x < r->w; x++, dst += 4) {
+                uint32_t c = palette[src[x]];
+                unsigned a = c >> 24;
+                if (!a) continue;
+                dst[0] = ((c >> 16) & 0xff) * a / 255;
+                dst[1] = ((c >> 8) & 0xff) * a / 255;
+                dst[2] = (c & 0xff) * a / 255;
+                dst[3] = a;
+            }
+        }
+    }
+    const AVCodecParameters *video = d->media->format->streams[d->media->video_stream]->codecpar;
+    cue->rgba = rgba;
+    cue->x = x0; cue->y = y0; cue->width = w; cue->height = h;
+    // Bitmap coordinates are in the subtitle's own frame (e.g. 720×576 for DVD).
+    cue->frame_width = d->subtitle->width > 0 ? d->subtitle->width : video->width;
+    cue->frame_height = d->subtitle->height > 0 ? d->subtitle->height : video->height;
+}
+
+static void decode_subtitle_packet(JVDecoder *d, AVPacket *packet) {
+    AVSubtitle sub;
+    int got = 0;
+    if (avcodec_decode_subtitle2(d->subtitle, &sub, &got, packet) < 0 || !got) return;
+    AVStream *st = d->media->format->streams[d->subtitle_stream];
+    int64_t pts = sub.pts != AV_NOPTS_VALUE ? av_rescale_q(sub.pts, AV_TIME_BASE_Q, st->time_base) : packet->pts;
+    if (pts != AV_NOPTS_VALUE) {
+        double start = pts * av_q2d(st->time_base) - video_start_seconds(d->media)
+                       + sub.start_display_time / 1000.0;
+        // Without a duration (Blu-ray), a cue lasts until the next erase event.
+        double length = packet->duration > 0 ? packet->duration * av_q2d(st->time_base)
+                        : sub.end_display_time > sub.start_display_time && sub.end_display_time != UINT32_MAX
+                            ? (sub.end_display_time - sub.start_display_time) / 1000.0
+                            : 10.0;
+        JVSubtitleCue cue = { .start = start, .end = start + length };
+        size_t used = 0;
+        for (unsigned i = 0; i < sub.num_rects; i++) {
+            const AVSubtitleRect *r = sub.rects[i];
+            if (r->type == SUBTITLE_BITMAP) continue;
+            const char *text = r->ass ? ass_dialogue_text(r->ass) : r->text;
+            if (!text || !*text) continue;
+            used += snprintf(cue.text + used, sizeof(cue.text) - used, "%s%s", used ? "\\N" : "", text);
+            if (used >= sizeof(cue.text)) break;
+        }
+        if (!cue.text[0]) bitmap_cue(d, &sub, &cue);
+        if (cue.text[0] || cue.rgba) {
+            queue_cue(d, &cue);
+        } else if (sub.num_rects == 0) {
+            cue.clear = 1;
+            queue_cue(d, &cue);
+        }
+    }
+    avsubtitle_free(&sub);
+}
+
+int jv_decoder_subtitle_read(JVDecoder *d, JVSubtitleCue *out) {
+    if (d->cue_count == 0) return 0;
+    *out = d->cues[d->cue_first];  // the caller now owns `rgba`
+    d->cues[d->cue_first].rgba = NULL;
+    d->cue_first = (d->cue_first + 1) % CUE_QUEUE;
+    d->cue_count--;
+    return 1;
+}
+
 void jv_decoder_close(JVDecoder *d) {
     if (!d) return;
+    drop_cues(d);
+    avcodec_free_context(&d->subtitle);
     avcodec_free_context(&d->audio);
     swr_free(&d->swr);
     av_frame_free(&d->audio_frame);
@@ -245,6 +476,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     int ret = AVERROR(ENOMEM);
     if (!d) goto fail;
     d->media = media;
+    d->subtitle_stream = -1;
     d->packet = av_packet_alloc();
     d->transfer = av_frame_alloc();
     if (!d->packet || !d->transfer) goto fail;
@@ -483,6 +715,11 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             av_packet_unref(d->packet);
             continue;
         }
+        if (d->subtitle && d->packet->stream_index == d->subtitle_stream) {
+            decode_subtitle_packet(d, d->packet);
+            av_packet_unref(d->packet);
+            continue;
+        }
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
         ret = avcodec_send_packet(d->ctx, d->packet);
         av_packet_unref(d->packet);
@@ -510,6 +747,7 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
         d->sample_count = 0;
         d->samples_pts = -1;
     }
+    if (d->subtitle) avcodec_flush_buffers(d->subtitle);
     d->flushing = 0;
     return 0;
 }

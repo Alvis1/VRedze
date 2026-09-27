@@ -101,6 +101,56 @@ int jv_decoder_audio_available(const JVDecoder *decoder);
 // Copies up to `frames` frames into `out`; `pts` receives the time of the
 // first frame (seconds from video start, < 0 if unknown). Returns frames copied.
 int jv_decoder_audio_read(JVDecoder *decoder, float *out, int frames, double *pts);
+// Subtitle tracks: the file's subtitle streams, in order.
+typedef struct {
+    char codec[32];
+    char language[16];
+    char title[64];
+    int32_t is_default;
+    int32_t forced;
+    int32_t supported;       // we can decode and show it (text or bitmap)
+} JVSubtitleTrack;
+
+// Audio tracks: the file's audio streams, in order.
+typedef struct {
+    char codec[32];
+    char language[16];
+    char title[64];
+    int32_t channels;
+    int32_t is_default;
+} JVAudioTrack;
+
+int jv_media_audio_count(const JVMedia *media);
+int jv_media_audio_track(const JVMedia *media, int track, JVAudioTrack *out);
+// The audio track played (index into the audio tracks), -1 for none.
+int jv_media_current_audio(const JVMedia *media);
+// Plays audio track `track` instead (after jv_decoder_enable_audio). Seek
+// afterwards so the new track starts where the picture is.
+int jv_decoder_select_audio(JVDecoder *decoder, int track);
+
+int jv_media_subtitle_count(const JVMedia *media);
+int jv_media_subtitle_track(const JVMedia *media, int track, JVSubtitleTrack *out);
+
+// A decoded subtitle: dialogue text (ASS override tags still inside) or,
+// for DVD/Blu-ray subtitles, a picture.
+typedef struct {
+    double start, end;       // seconds from video start
+    int32_t clear;           // an erase event: whatever shows at `start` ends there
+    char text[1024];
+    // Bitmap subtitles: premultiplied RGBA, owned by the cue (free with
+    // jv_free), placed at x, y in a frame_width × frame_height picture.
+    uint8_t *rgba;
+    int32_t x, y, width, height;
+    int32_t frame_width, frame_height;
+} JVSubtitleCue;
+
+void jv_free(void *pointer);
+
+// Decodes `track` (index into the subtitle tracks, -1 for none) as a side
+// effect of jv_decoder_next, like audio.
+int jv_decoder_select_subtitle(JVDecoder *decoder, int track);
+// Takes the next decoded cue: 1 with a cue, 0 when none is waiting.
+int jv_decoder_subtitle_read(JVDecoder *decoder, JVSubtitleCue *out);
 void jv_frame_release(void *handle);
 void jv_decoder_close(JVDecoder *decoder);
 
