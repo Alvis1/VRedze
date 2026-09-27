@@ -736,6 +736,16 @@ impl Navigator {
         }
     }
 
+    /// Back from playing: outlines the video that played, and keeps it in view.
+    pub fn playback_ended(&mut self) {
+        self.came_from = self
+            .playing
+            .and_then(|i| self.items.get(i))
+            .map(|item| item.trail_name().to_string());
+        self.restore_scroll();
+        self.rebuild_rows();
+    }
+
     pub fn has_adjacent(&self, delta: isize) -> bool {
         self.adjacent(delta).is_some()
     }
@@ -1001,7 +1011,7 @@ impl Navigator {
         let Some(f) = &mut self.view.form else { return };
         self.dirty = true;
         match hit {
-            form::Hit::Field(i) => f.focused = i,
+            form::Hit::Field(i, cursor) => f.focus(i, Some(cursor)),
             form::Hit::Key(key) => match f.press(key) {
                 Some(Key::Cancel) => {
                     self.view.form = None;
@@ -1032,7 +1042,7 @@ impl Navigator {
                 );
                 if address.is_empty() {
                     f.error = Some("Enter the server's address.".into());
-                    f.focused = 0;
+                    f.focus(0, None);
                     return;
                 }
                 let host = address
@@ -1292,5 +1302,8 @@ mod tests {
         );
         nav.playing = Some(4);
         assert!(!nav.has_adjacent(1));
+        nav.playback_ended();
+        assert!(nav.view().rows[4].outlined, "the video just played");
+        assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
     }
 }

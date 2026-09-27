@@ -33,6 +33,8 @@ pub struct Form {
     pub title: String,
     pub fields: Vec<Field>,
     pub focused: usize,
+    /// Caret in the focused field, in characters from its start.
+    pub cursor: usize,
     pub layer: Layer,
     pub error: Option<String>,
     pub busy: Option<String>,
@@ -45,6 +47,9 @@ pub enum Key {
     Shift,
     Symbols,
     Backspace,
+    /// Caret one character left or right.
+    Left,
+    Right,
     Space,
     Cancel,
     Submit,
@@ -52,17 +57,20 @@ pub enum Key {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
-    Field(usize),
+    /// A field, and the caret position under the pointer.
+    Field(usize, usize),
     Key(Key),
     Nothing,
 }
 
 impl Form {
     pub fn new(title: impl Into<String>, fields: Vec<Field>, submit: impl Into<String>) -> Self {
+        let cursor = fields.first().map_or(0, |f| f.value.chars().count());
         Self {
             title: title.into(),
             fields,
             focused: 0,
+            cursor,
             layer: Layer::Lower,
             error: None,
             busy: None,
@@ -74,21 +82,45 @@ impl Form {
         &self.fields[i].value
     }
 
+    /// Focuses field `i` with the caret at `cursor` (None: at the end).
+    pub fn focus(&mut self, i: usize, cursor: Option<usize>) {
+        self.focused = i;
+        let len = self.fields[i].value.chars().count();
+        self.cursor = cursor.unwrap_or(len).min(len);
+    }
+
     /// Applies a key; returns Cancel/Submit for the owner to act on.
     pub fn press(&mut self, key: Key) -> Option<Key> {
         self.error = None;
         let field = &mut self.fields[self.focused];
+        let len = field.value.chars().count();
+        self.cursor = self.cursor.min(len);
+        // Byte offset of the caret.
+        let at = |value: &str, chars: usize| {
+            value
+                .char_indices()
+                .nth(chars)
+                .map_or(value.len(), |(i, _)| i)
+        };
         match key {
-            Key::Char(c) => {
-                field.value.push(c);
-                if self.layer == Layer::Upper {
+            Key::Char(_) | Key::Space => {
+                let c = match key {
+                    Key::Char(c) => c,
+                    _ => ' ',
+                };
+                field.value.insert(at(&field.value, self.cursor), c);
+                self.cursor += 1;
+                if key != Key::Space && self.layer == Layer::Upper {
                     self.layer = Layer::Lower; // one-shot shift
                 }
             }
-            Key::Space => field.value.push(' '),
-            Key::Backspace => {
-                field.value.pop();
+            Key::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                field.value.remove(at(&field.value, self.cursor));
             }
+            Key::Backspace => {}
+            Key::Left => self.cursor = self.cursor.saturating_sub(1),
+            Key::Right => self.cursor = (self.cursor + 1).min(len),
             Key::Shift => {
                 self.layer = if self.layer == Layer::Upper {
                     Layer::Lower
@@ -152,6 +184,7 @@ fn keys(form: &Form, panel_width: f32) -> Vec<(Key, Rect)> {
         let key_w = (width - 2.0 * (side + KEY_GAP) - 9.0 * KEY_GAP) / 10.0;
         let (left, right) = match r {
             0 => (None, Some(Key::Backspace)),
+            1 => (Some(Key::Left), Some(Key::Right)),
             2 => (Some(Key::Shift), None),
             3 => (Some(Key::Symbols), None),
             _ => (None, None),
@@ -182,13 +215,58 @@ fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
 }
 
-pub fn hit(form: &Form, panel_width: f32, x: f32, y: f32) -> Hit {
+/// The text shown in a field (dots for secrets).
+fn shown(field: &Field) -> Vec<char> {
+    if field.secret {
+        vec!['•'; field.value.chars().count()]
+    } else {
+        field.value.chars().collect()
+    }
+}
+
+const TEXT_SIZE: f32 = 34.0;
+
+/// First character shown in field `i`: from the start if it all fits,
+/// otherwise so the end is visible, or, if the caret is further left,
+/// from the caret. Clicking inside the shown text never scrolls it.
+fn first_shown(form: &Form, i: usize, fonts: &mut Fonts) -> usize {
+    let chars = shown(&form.fields[i]);
+    let room = field_rect(i).2 - 60.0;
+    let mut start = 0;
+    while start + 1 < chars.len()
+        && fonts.measure(&chars[start..].iter().collect::<String>(), TEXT_SIZE) > room
+    {
+        start += 1;
+    }
+    if i == form.focused {
+        start.min(form.cursor)
+    } else {
+        start
+    }
+}
+
+/// The caret position nearest to canvas x in field `i`.
+fn caret_at(form: &Form, i: usize, x: f32, fonts: &mut Fonts) -> usize {
+    let chars = shown(&form.fields[i]);
+    let start = first_shown(form, i, fonts);
+    let mut left = field_rect(i).0 + 20.0;
+    for (k, c) in chars.iter().enumerate().skip(start) {
+        let w = fonts.measure(&c.to_string(), TEXT_SIZE);
+        if x < left + w / 2.0 {
+            return k;
+        }
+        left += w;
+    }
+    chars.len()
+}
+
+pub fn hit(form: &Form, fonts: &mut Fonts, panel_width: f32, x: f32, y: f32) -> Hit {
     if form.busy.is_some() {
         return Hit::Nothing;
     }
     for i in 0..form.fields.len() {
         if inside(field_rect(i), x, y) {
-            return Hit::Field(i);
+            return Hit::Field(i, caret_at(form, i, x, fonts));
         }
     }
     keys(form, panel_width)
@@ -215,6 +293,8 @@ fn key_label(key: Key, form: &Form) -> String {
             }
         }
         Key::Backspace => "Delete".into(),
+        // Drawn as triangles.
+        Key::Left | Key::Right => String::new(),
         Key::Space => "space".into(),
         Key::Cancel => "Cancel".into(),
         Key::Submit => form.submit.clone(),
@@ -227,7 +307,7 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
         let (fx, fy, fw, fh) = field_rect(i);
         fonts.draw(canvas, &field.label, X0, fy + 47.0, 30.0, SUBTLE, 250.0);
         let focused = i == form.focused;
-        let hovered = hover == Hit::Field(i);
+        let hovered = matches!(hover, Hit::Field(f, _) if f == i);
         canvas.rect(
             fx,
             fy,
@@ -245,12 +325,8 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
         if focused {
             canvas.rect(fx, fy + fh - 4.0, fw, 4.0, 2.0, ACCENT);
         }
-        let shown = if field.secret {
-            "•".repeat(field.value.chars().count())
-        } else {
-            field.value.clone()
-        };
-        if shown.is_empty() {
+        let chars = shown(field);
+        if chars.is_empty() {
             fonts.draw(
                 canvas,
                 &field.placeholder,
@@ -260,16 +336,24 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
                 [0x5f, 0x63, 0x68],
                 fw - 40.0,
             );
-        } else {
-            // Keep the end (where typing happens) visible.
-            let mut text = shown.clone();
-            while fonts.measure(&text, 34.0) > fw - 60.0 && text.chars().count() > 1 {
-                text.remove(0);
-            }
-            let width = fonts.draw(canvas, &text, fx + 20.0, fy + 48.0, 34.0, TEXT, fw - 40.0);
-            if focused {
-                canvas.rect(fx + 24.0 + width, fy + 16.0, 3.0, fh - 32.0, 1.0, ACCENT);
-            }
+        }
+        let start = first_shown(form, i, fonts);
+        let text: String = chars[start..].iter().collect();
+        fonts.draw(
+            canvas,
+            &text,
+            fx + 20.0,
+            fy + 48.0,
+            TEXT_SIZE,
+            TEXT,
+            fw - 40.0,
+        );
+        if focused {
+            let before: String = chars[start..form.cursor.clamp(start, chars.len())]
+                .iter()
+                .collect();
+            let x = fx + 20.0 + fonts.measure(&before, TEXT_SIZE);
+            canvas.rect(x, fy + 16.0, 3.0, fh - 32.0, 1.0, ACCENT);
         }
     }
     let status_y = keyboard_top(form) - 6.0;
@@ -298,6 +382,20 @@ pub fn render(canvas: &mut Canvas, fonts: &mut Fonts, form: &Form, hover: Hit) {
         } else {
             32.0
         };
+        if matches!(key, Key::Left | Key::Right) {
+            // A triangle from vertical strips, pointing its way.
+            let (cx, cy) = (x + kw / 2.0, y + kh / 2.0);
+            for i in 0..28 {
+                let t = i as f32;
+                let half = 16.0 * t / 28.0;
+                let px = if key == Key::Left {
+                    cx - 14.0 + t
+                } else {
+                    cx + 14.0 - t
+                };
+                canvas.rect(px, cy - half, 1.5, half * 2.0, 0.0, TEXT);
+            }
+        }
         let lw = fonts.measure(&label, size);
         fonts.draw(
             canvas,
@@ -350,11 +448,35 @@ mod tests {
     }
 
     #[test]
+    fn editing_in_the_middle() {
+        let mut f = form();
+        f.fields[0].value = "clip.mp4".into();
+        f.focus(0, Some(4));
+        f.press(Key::Char('2'));
+        assert_eq!(f.value(0), "clip2.mp4");
+        f.press(Key::Left);
+        f.press(Key::Backspace);
+        assert_eq!(f.value(0), "cli2.mp4");
+        assert_eq!(f.cursor, 3);
+        f.press(Key::Right);
+        f.press(Key::Right);
+        f.press(Key::Space);
+        assert_eq!(f.value(0), "cli2. mp4");
+        f.focus(0, Some(99));
+        assert_eq!(f.cursor, 9, "clamped to the end");
+        f.fields[0].value = "åäö".into();
+        f.focus(0, Some(1));
+        f.press(Key::Backspace);
+        assert_eq!(f.value(0), "äö", "characters, not bytes");
+    }
+
+    #[test]
     fn every_key_is_hittable_and_distinct() {
         let f = form();
+        let mut fonts = Fonts::load().expect("fonts");
         for (key, (x, y, w, h)) in keys(&f, 1600.0) {
             assert_eq!(
-                hit(&f, 1600.0, x + w / 2.0, y + h / 2.0),
+                hit(&f, &mut fonts, 1600.0, x + w / 2.0, y + h / 2.0),
                 Hit::Key(key),
                 "{key:?}"
             );

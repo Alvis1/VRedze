@@ -770,7 +770,7 @@ pub fn run(
                     nav.open_adjacent(delta);
                     nav.redraw();
                 }
-                Some(nav) => nav.redraw(),
+                Some(nav) => nav.playback_ended(),
                 None => options.quit.store(true, Ordering::Relaxed),
             }
         }
@@ -823,9 +823,8 @@ pub fn run(
                     continue;
                 }
                 let point = ray.and_then(|r| BROWSER_PANEL.hit(r));
-                let crumbs = browser::crumb_spans(nav.view(), &mut fonts);
                 let hit = point.map_or(browser::Hit::Nothing, |(x, y)| {
-                    browser::hit(nav.view(), &crumbs, x, y)
+                    browser::hit(nav.view(), &mut fonts, x, y)
                 });
                 if buttons.select[active_hand]
                     && browser_press.is_none()

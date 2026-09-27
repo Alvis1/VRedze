@@ -324,10 +324,11 @@ fn action_rect(view: &View, i: usize, k: usize) -> Rect {
 }
 
 /// What the pointer at canvas pixel (x, y) would activate.
-pub fn hit(view: &View, crumbs: &[(f32, f32)], x: f32, y: f32) -> Hit {
+pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     if let Some(f) = &view.form {
-        return Hit::Form(form::hit(f, WIDTH as f32, x, y));
+        return Hit::Form(form::hit(f, fonts, WIDTH as f32, x, y));
     }
+    let crumbs = crumb_spans(view, fonts);
     if let Some(dialog) = &view.dialog {
         return dialog_buttons(dialog.buttons.len())
             .into_iter()
@@ -487,7 +488,7 @@ pub fn render(
     canvas.clear(BG);
     let w = WIDTH as f32;
     let crumbs = crumb_spans(view, fonts);
-    let hover = pointer.map(|(x, y)| hit(view, &crumbs, x, y));
+    let hover = pointer.map(|(x, y)| hit(view, fonts, x, y));
     let bottom = HEIGHT as f32 - BOTTOM;
 
     if let Some(f) = &view.form {
@@ -838,13 +839,18 @@ mod tests {
     #[test]
     fn hit_testing_follows_scroll_and_dialog() {
         let mut view = view();
-        let crumbs = [(32.0, 200.0), (260.0, 320.0), (380.0, 500.0)];
-        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + 10.0), Hit::Row(0));
+        let mut fonts = Fonts::load().expect("fonts");
+        let spans = crumb_spans(&view, &mut fonts);
+        let last = (spans[2].0 + spans[2].1) / 2.0;
+        assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Row(0));
         view.scroll = 5.0;
-        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + ROW + 10.0), Hit::Row(6));
-        assert_eq!(hit(&view, &crumbs, 100.0, 70.0), Hit::Crumb(0));
         assert_eq!(
-            hit(&view, &crumbs, 450.0, 70.0),
+            hit(&view, &mut fonts, 400.0, HEADER + ROW + 10.0),
+            Hit::Row(6)
+        );
+        assert_eq!(hit(&view, &mut fonts, 100.0, 70.0), Hit::Crumb(0));
+        assert_eq!(
+            hit(&view, &mut fonts, last, 70.0),
             Hit::Nothing,
             "current place is not a link"
         );
@@ -857,43 +863,48 @@ mod tests {
         let rects = dialog_buttons(2);
         let (x, y, w, h) = rects[1];
         assert_eq!(
-            hit(&view, &crumbs, x + w / 2.0, y + h / 2.0),
+            hit(&view, &mut fonts, x + w / 2.0, y + h / 2.0),
             Hit::DialogButton(1)
         );
-        assert_eq!(hit(&view, &crumbs, 400.0, HEADER + 10.0), Hit::Nothing);
+        assert_eq!(hit(&view, &mut fonts, 400.0, HEADER + 10.0), Hit::Nothing);
     }
 
     #[test]
     fn scrollbar_is_not_a_row() {
         let view = view();
         let x = WIDTH as f32 - PAD - SCROLL_W / 2.0;
-        assert_eq!(hit(&view, &[], x, HEADER + 10.0), Hit::ScrollBar);
+        let mut fonts = Fonts::load().expect("fonts");
+        assert_eq!(hit(&view, &mut fonts, x, HEADER + 10.0), Hit::ScrollBar);
         assert_eq!(scroll_at(&view, 0.0), 0.0);
         assert_eq!(scroll_at(&view, HEIGHT as f32), view.max_scroll());
         let short = View {
             rows: view.rows[..3].to_vec(),
             ..view.clone()
         };
-        assert_eq!(hit(&short, &[], x, HEADER + 10.0), Hit::Nothing);
+        assert_eq!(hit(&short, &mut fonts, x, HEADER + 10.0), Hit::Nothing);
     }
 
     #[test]
     fn locks_actions_and_tools() {
         let mut view = view();
+        let mut fonts = Fonts::load().expect("fonts");
         view.rows[2].lock = Some(true);
         view.rows[2].actions = vec![Action::Edit, Action::Remove];
         let (x, y, w, h) = lock_rect(&view, 2);
-        assert_eq!(hit(&view, &[], x + w / 2.0, y + h / 2.0), Hit::Lock(2));
+        assert_eq!(
+            hit(&view, &mut fonts, x + w / 2.0, y + h / 2.0),
+            Hit::Lock(2)
+        );
         for (k, action) in [Action::Edit, Action::Remove].into_iter().enumerate() {
             let (ax, ay, aw, ah) = action_rect(&view, 2, k);
             assert_eq!(
-                hit(&view, &[], ax + aw / 2.0, ay + ah / 2.0),
+                hit(&view, &mut fonts, ax + aw / 2.0, ay + ah / 2.0),
                 Hit::RowAction(2, action)
             );
         }
         let (ax, ay, aw, ah) = action_rect(&view, 2, 0);
         assert_eq!(
-            hit(&view, &[], ax + aw / 2.0, ay + ah / 2.0 + ROW),
+            hit(&view, &mut fonts, ax + aw / 2.0, ay + ah / 2.0 + ROW),
             Hit::Row(3),
             "no actions on row 3"
         );
@@ -904,7 +915,10 @@ mod tests {
         ];
         for k in 0..3 {
             let (tx, ty, tw, th) = tool_rect(&view, k);
-            assert_eq!(hit(&view, &[], tx + tw / 2.0, ty + th / 2.0), Hit::Tool(k));
+            assert_eq!(
+                hit(&view, &mut fonts, tx + tw / 2.0, ty + th / 2.0),
+                Hit::Tool(k)
+            );
         }
         let (tx, _, tw, _) = tool_rect(&view, 2);
         assert!(tx + tw <= WIDTH as f32 - PAD + 0.5);
