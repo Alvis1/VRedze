@@ -65,9 +65,9 @@ pub enum Action {
 }
 
 impl Action {
-    /// Delete and Remove are trash-can icon buttons; the rest are labelled.
+    /// Rename is a pencil, Delete and Remove are trash cans; the rest are labelled.
     fn is_icon(self) -> bool {
-        matches!(self, Action::Delete | Action::Remove)
+        matches!(self, Action::Rename | Action::Delete | Action::Remove)
     }
 
     fn width(self) -> f32 {
@@ -102,6 +102,8 @@ pub struct Row {
     pub checked: Option<bool>,
     /// Greyed out: listed, but not something to open (non-video files).
     pub dimmed: bool,
+    /// Outlined: the entry just come back out of.
+    pub outlined: bool,
 }
 
 impl Row {
@@ -115,6 +117,7 @@ impl Row {
             actions: Vec::new(),
             checked: None,
             dimmed: false,
+            outlined: false,
         }
     }
 }
@@ -519,6 +522,9 @@ pub fn render(
                 && (!row.dimmed || row.checked.is_some());
             let label_color = if row.dimmed { FAINT } else { TEXT };
             let detail_color = if row.dimmed { FAINT } else { SUBTLE };
+            if row.outlined {
+                canvas.rect(rx - 3.0, ry - 3.0, rw + 6.0, rh + 6.0, 17.0, ACCENT);
+            }
             canvas.rect(rx, ry, rw, rh, 14.0, if hovered { HOVER } else { ROW_BG });
             let (icon_x, icon_y) = (PAD + 48.0, ry - 4.0 + ROW / 2.0);
             match row.checked {
@@ -563,7 +569,9 @@ pub fn render(
                     [color[0] / 3, color[1] / 3, color[2] / 3]
                 };
                 canvas.rect(ax, ay, aw, ah, 12.0, fill);
-                if action.is_icon() {
+                if *action == Action::Rename {
+                    draw_pencil(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
+                } else if action.is_icon() {
                     draw_trash(&mut canvas, ax + aw / 2.0, ay + ah / 2.0, TEXT);
                 } else {
                     let label = action.label();

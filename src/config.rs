@@ -155,6 +155,66 @@ pub fn move_layout_override(from: &str, to: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Where a video was left, to continue from there.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+struct Resume {
+    seconds: f64,
+    /// Unix time of the save; the oldest are forgotten first.
+    saved: u64,
+}
+
+/// Videos whose place is remembered; older ones are forgotten.
+const MAX_RESUMES: usize = 1000;
+
+/// Serialises writes of `resume.json` (saved from background threads).
+static RESUME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Where to continue a file from, if it was left part way.
+pub fn resume_position(key: &str) -> Option<f64> {
+    let all: BTreeMap<String, Resume> = read_json("resume.json").ok()?;
+    all.get(key).map(|r| r.seconds)
+}
+
+/// Remembers (or with `None`, forgets) where a file was left.
+pub fn save_resume_position(key: &str, seconds: Option<f64>) -> anyhow::Result<()> {
+    let _guard = RESUME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all: BTreeMap<String, Resume> = read_json("resume.json")?;
+    match seconds {
+        Some(seconds) => {
+            let saved = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            all.insert(key.to_string(), Resume { seconds, saved });
+            while all.len() > MAX_RESUMES {
+                let oldest = all
+                    .iter()
+                    .min_by_key(|(_, r)| r.saved)
+                    .map(|(k, _)| k.clone())
+                    .expect("not empty");
+                all.remove(&oldest);
+            }
+        }
+        None if all.remove(key).is_none() => return Ok(()),
+        None => {}
+    }
+    write_json("resume.json", &all, false)
+}
+
+pub fn move_resume_position(from: &str, to: &str) -> anyhow::Result<()> {
+    if let Some(seconds) = resume_position(from) {
+        save_resume_position(from, None)?;
+        save_resume_position(to, Some(seconds))?;
+    }
+    Ok(())
+}
+
+/// The place worth remembering for a video stopped at `position`: none near
+/// its start (nothing to skip) or its end (watched).
+pub fn resume_point(position: f64, duration: f64) -> Option<f64> {
+    let near_end = duration > 0.0 && (duration - position < 30.0 || position > duration * 0.95);
+    (position >= 10.0 && !near_end).then_some(position)
+}
+
 /// A video format: projection and stereo layout.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Format {
@@ -233,6 +293,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resume_skips_start_and_end() {
+        assert_eq!(resume_point(5.0, 3600.0), None);
+        assert_eq!(resume_point(600.0, 3600.0), Some(600.0));
+        assert_eq!(resume_point(3580.0, 3600.0), None, "credits");
+        assert_eq!(resume_point(110.0, 120.0), None);
+        assert_eq!(resume_point(600.0, 0.0), Some(600.0), "unknown length");
+    }
+
+    #[test]
     fn round_trip_with_private_credentials() {
         let dir = std::env::temp_dir().join(format!("jv-config-{}", std::process::id()));
         // SAFETY: single-threaded within this test; other tests don't read XDG_CONFIG_HOME.
@@ -263,6 +332,14 @@ mod tests {
         assert_eq!(
             layout_override("smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap(),
             Some(l)
+        );
+        assert_eq!(resume_position(key), None);
+        save_resume_position(key, Some(754.0)).unwrap();
+        move_resume_position(key, "smb://alice@192.168.1.10/media/VR/renamed.mp4").unwrap();
+        assert_eq!(resume_position(key), None);
+        assert_eq!(
+            resume_position("smb://alice@192.168.1.10/media/VR/renamed.mp4"),
+            Some(754.0)
         );
         assert!(remove_server("PC").unwrap());
         assert!(servers().unwrap().is_empty());

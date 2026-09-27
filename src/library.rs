@@ -69,12 +69,14 @@ pub struct Opened {
     pub layout: Layout,
     pub assessment: Assessment,
     pub name: String,
-    /// Where this file's layout override is stored.
+    /// Identifies the file for its saved layout and resume point.
     pub key: String,
     /// Subtitle files next to the video (`movie.srt`, `movie.en.srt`).
     pub external_subtitles: Vec<ExternalSubtitles>,
     /// Saved picture corrections for this file.
     pub image: config::ImageAdjust,
+    /// Where this file was left last time (seconds), to continue from.
+    pub resume: Option<f64>,
 }
 
 pub struct ExternalSubtitles {
@@ -349,6 +351,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     eprintln!("Library: the previous video's decoder is still closing");
                 }
                 let decoder = media.into_decoder(hw, true, "").map_err(err)?;
+                let resume = config::resume_position(&key);
                 Ok(Box::new(Opened {
                     decoder,
                     layout,
@@ -357,6 +360,7 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                     key,
                     external_subtitles,
                     image,
+                    resume,
                 }))
             });
             Response::Opened { id, result }
@@ -376,10 +380,12 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
                 if let Some(last) = renamed.last_mut() {
                     *last = new_name.clone();
                 }
-                let _ = config::move_layout_override(
-                    &file_key(&server, &share, &path),
-                    &file_key(&server, &share, &renamed),
+                let (from, to) = (
+                    file_key(&server, &share, &path),
+                    file_key(&server, &share, &renamed),
                 );
+                let _ = config::move_layout_override(&from, &to);
+                let _ = config::move_resume_position(&from, &to);
                 Ok(())
             });
             Response::Changed { id, result }
@@ -392,7 +398,9 @@ fn run(request: Request, sessions: &Sessions, hw: Option<&str>) -> Response {
         } => {
             let result = session(sessions, &server, Purpose::Browse).and_then(|s| {
                 s.delete_in(&share, &smb_path(&path)).map_err(err)?;
-                let _ = config::save_layout_override(&file_key(&server, &share, &path), None);
+                let key = file_key(&server, &share, &path);
+                let _ = config::save_layout_override(&key, None);
+                let _ = config::save_resume_position(&key, None);
                 Ok(())
             });
             Response::Changed { id, result }

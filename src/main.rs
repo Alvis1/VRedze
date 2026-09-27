@@ -805,7 +805,10 @@ fn main() -> anyhow::Result<()> {
                 crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
                 tools: vec![Tool::text("Cancel", false), Tool::text("Delete 2", true)],
                 rows: vec![
-                    row(Icon::Folder, "Concerts", "", ""),
+                    Row {
+                        outlined: true,
+                        ..row(Icon::Folder, "Concerts", "", "")
+                    },
                     row(
                         Icon::Video(Some(Verdict::Software)),
                         "Documentary.2160p.HDR.mkv",
@@ -961,10 +964,19 @@ fn main() -> anyhow::Result<()> {
                     rotation: 1,
                 },
                 dialog: None,
+                caption_edit: false,
             };
             just_video::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
+            )?;
+            let editing = controls::State {
+                caption_edit: true,
+                ..state.clone()
+            };
+            just_video::ui::save_png(
+                &controls::render(&editing, &mut fonts, controls::Hit::CaptionMove(1)),
+                &dir.join("controls-captions.png"),
             )?;
             for (dialog, name, hover) in [
                 (

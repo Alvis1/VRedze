@@ -7,7 +7,9 @@
 //! ```
 //!
 //! CC: a click turns subtitles on/off, a long press opens the audio and
-//! subtitle dialog (tracks, subtitle size and position). The screen button: a
+//! subtitle dialog (tracks, and a way into subtitle editing: the bar then
+//! holds the size and position buttons while the screen and subtitle area
+//! are outlined, with sample text). The screen button: a
 //! click steps through the favourite formats, a long press opens the screen
 //! dialog (every format, stars, curved screen, swap eyes). The image button
 //! opens the image dialog (brightness, contrast, saturation, rotation).
@@ -109,6 +111,12 @@ pub enum Hit {
     CaptionSize(i8),
     /// Subtitles lower (-1) or higher (+1).
     CaptionMove(i8),
+    /// Into subtitle editing (from the track dialog).
+    CaptionEdit,
+    /// Subtitle size and position back to the defaults.
+    CaptionReset,
+    /// Out of subtitle editing.
+    CaptionDone,
     /// A format (index into [`FORMATS`]); long press stars it.
     Pick(usize),
     Curved,
@@ -152,6 +160,8 @@ pub struct State {
     pub list_page: usize,
     pub image: ImageAdjust,
     pub dialog: Option<Dialog>,
+    /// Editing subtitle size and position: the bar holds only those buttons.
+    pub caption_edit: bool,
 }
 
 type Rect = (f32, f32, f32, f32);
@@ -168,8 +178,29 @@ fn inside((x, y, w, h): Rect, px: f32, py: f32) -> bool {
     px >= x && px <= x + w && py >= y && py <= y + h
 }
 
+/// The bar's buttons while editing subtitles, with their labels.
+const EDIT_BUTTONS: [(Hit, &str); 6] = [
+    (Hit::CaptionSize(-1), "Smaller"),
+    (Hit::CaptionSize(1), "Larger"),
+    (Hit::CaptionMove(-1), "Lower"),
+    (Hit::CaptionMove(1), "Higher"),
+    (Hit::CaptionReset, "Reset"),
+    (Hit::CaptionDone, "Done"),
+];
+
+fn edit_rect(i: usize) -> Rect {
+    (24.0 + i as f32 * 194.0, 120.0, 180.0, 112.0)
+}
+
 /// What the bar would do for a pointer at (x, y).
 pub fn hit(state: &State, x: f32, y: f32) -> Hit {
+    if state.caption_edit {
+        return EDIT_BUTTONS
+            .iter()
+            .enumerate()
+            .find(|(i, _)| inside(edit_rect(*i), x, y))
+            .map_or(Hit::Nothing, |(_, (hit, _))| *hit);
+    }
     let can_caption = !state.subtitle_tracks.is_empty() || state.audio_tracks.len() > 1;
     let buttons = [
         (PREVIOUS, Hit::Previous, state.has_previous),
@@ -265,19 +296,7 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
                 page
             };
             add(grid(subs, 246.0), true);
-            let has_subs = !state.subtitle_tracks.is_empty();
-            add(
-                grid(
-                    vec![
-                        Hit::CaptionSize(-1),
-                        Hit::CaptionSize(1),
-                        Hit::CaptionMove(-1),
-                        Hit::CaptionMove(1),
-                    ],
-                    548.0,
-                ),
-                has_subs,
-            );
+            out.push((Hit::CaptionEdit, (24.0, 548.0, 568.0, ROW_H), true));
         }
         Some(Dialog::Screen) => {
             add(
@@ -435,6 +454,24 @@ fn image_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
 pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     let mut c = Canvas::new(WIDTH, HEIGHT);
     c.clear(BG);
+    if state.caption_edit {
+        fonts.draw(
+            &mut c,
+            "Subtitle size and position",
+            24.0,
+            64.0,
+            40.0,
+            TEXT,
+            800.0,
+        );
+        fonts.draw(&mut c, "B: done", 1040.0, 64.0, 26.0, SUBTLE, 140.0);
+        for (i, (hit, label)) in EDIT_BUTTONS.iter().enumerate() {
+            let r = edit_rect(i);
+            button(&mut c, r, hover == *hit, *hit == Hit::CaptionDone);
+            centered(&mut c, fonts, label, r, 32.0, TEXT);
+        }
+        return c;
+    }
 
     // Previous / play-pause / next.
     for (r, hit, enabled) in [
@@ -633,11 +670,7 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
                 let pages = pages(state.subtitle_tracks.len() + 1);
                 (format!("More ({}/{pages})", state.list_page + 1), false)
             }
-            Hit::CaptionSize(d) => (
-                (if d < 0 { "Smaller" } else { "Larger" }).to_string(),
-                false,
-            ),
-            Hit::CaptionMove(d) => ((if d < 0 { "Lower" } else { "Higher" }).to_string(), false),
+            Hit::CaptionEdit => ("Adjust size and position…".to_string(), false),
             Hit::Pick(i) => (format_label(FORMATS[i]), FORMATS[i] == state.format),
             Hit::Curved => (
                 (if state.curved == Some(true) {
@@ -704,6 +737,7 @@ mod tests {
             list_page: 0,
             image: ImageAdjust::default(),
             dialog: None,
+            caption_edit: false,
         }
     }
 
@@ -764,6 +798,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn caption_editing_replaces_the_bar() {
+        let s = State {
+            caption_edit: true,
+            ..state()
+        };
+        for (i, (h, _)) in EDIT_BUTTONS.iter().enumerate() {
+            let r = edit_rect(i);
+            assert!(r.0 + r.2 <= WIDTH as f32 && r.1 + r.3 <= HEIGHT as f32);
+            let (x, y) = center(r);
+            assert_eq!(hit(&s, x, y), *h);
+        }
+        let (x, y) = center(PLAY);
+        assert_eq!(hit(&s, x, y), Hit::Nothing);
     }
 
     #[test]

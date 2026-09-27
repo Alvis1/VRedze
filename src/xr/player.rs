@@ -450,7 +450,7 @@ pub struct Playback {
     subtitle_tracks: Vec<SubtitleTrack>,
     subtitle: Option<usize>,
     embedded_cues: Arc<Mutex<Cues>>,
-    /// Briefly shown instead of subtitles after switching ("Subtitles: English").
+    /// Briefly shown instead of subtitles ("Subtitles: English"), until then.
     subtitle_notice: Option<(String, Instant)>,
     audio_labels: Vec<String>,
     audio_track: Option<usize>,
@@ -629,8 +629,13 @@ impl Playback {
                 Some(i) => format!("Subtitles: {}", self.subtitle_tracks[i].label),
                 None => "Subtitles off".to_string(),
             };
-            self.subtitle_notice = Some((text, Instant::now()));
+            self.notice(text, Duration::from_millis(1800));
         }
+    }
+
+    /// Shows `text` where subtitles go for a while.
+    pub fn notice(&mut self, text: String, duration: Duration) {
+        self.subtitle_notice = Some((text, Instant::now() + duration));
     }
 
     pub fn audio_labels(&self) -> &[String] {
@@ -651,10 +656,10 @@ impl Playback {
         }
         let _ = self.decode.audio_track.send(index);
         self.audio_track = Some(index);
-        self.subtitle_notice = Some((
+        self.notice(
             format!("Audio: {}", self.audio_labels[index]),
-            Instant::now(),
-        ));
+            Duration::from_millis(1800),
+        );
         self.seek(self.position());
     }
 
@@ -691,8 +696,8 @@ impl Playback {
 
     /// The subtitle for the frame on screen (or a short notice after switching).
     pub fn caption(&self) -> Option<crate::subtitles::Caption> {
-        if let Some((text, at)) = &self.subtitle_notice
-            && at.elapsed() < Duration::from_millis(1800)
+        if let Some((text, until)) = &self.subtitle_notice
+            && Instant::now() < *until
         {
             return Some(crate::subtitles::Caption::text(text.clone()));
         }

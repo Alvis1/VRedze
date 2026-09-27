@@ -20,6 +20,22 @@ pub fn is_video(name: &str) -> bool {
         .is_some_and(|(_, ext)| VIDEO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
+/// Names from the top down to a place: server URL, share, folders.
+fn trail(location: &Location) -> Vec<String> {
+    match location {
+        Location::Servers => Vec::new(),
+        Location::Shares { server } => vec![server.url.clone()],
+        Location::Folder {
+            server,
+            share,
+            path,
+        } => [server.url.clone(), share.clone()]
+            .into_iter()
+            .chain(path.iter().cloned())
+            .collect(),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Location {
     Servers,
@@ -60,6 +76,14 @@ impl Item {
             | Item::Dir(n)
             | Item::Video { name: n, .. }
             | Item::File { name: n, .. } => n,
+        }
+    }
+
+    /// What [`trail`] calls this item.
+    fn trail_name(&self) -> &str {
+        match self {
+            Item::Server(s) => &s.url,
+            other => other.name(),
         }
     }
 
@@ -109,6 +133,12 @@ pub struct Navigator {
     /// Rename/delete/add requests whose answers we wait for.
     pending_changes: HashSet<u64>,
     change_errors: Vec<String>,
+    /// Scroll position of each place left, by its [`trail`].
+    scrolls: std::collections::HashMap<Vec<String>, f32>,
+    /// After going up: the entry we came out of (outlined) and the scroll
+    /// to return to once the list has loaded.
+    came_from: Option<String>,
+    return_scroll: Option<f32>,
     next_id: u64,
     generation: u64,
     dirty: bool,
@@ -130,6 +160,9 @@ impl Navigator {
             pending: None,
             pending_changes: HashSet::new(),
             change_errors: Vec::new(),
+            scrolls: Default::default(),
+            came_from: None,
+            return_scroll: None,
             next_id: 1,
             generation: 0,
             dirty: true,
@@ -215,7 +248,42 @@ impl Navigator {
         self.dirty = true;
     }
 
+    /// Before moving to `to`: remembers this list's scroll and, when going
+    /// up, which entry we are leaving and where that list was scrolled.
+    fn leave(&mut self, to: &Location) {
+        if *to == self.location {
+            return;
+        }
+        let (from, to) = (trail(&self.location), trail(to));
+        if !self.items.is_empty() {
+            self.scrolls.insert(from.clone(), self.view.scroll);
+        }
+        if to.len() < from.len() && from.starts_with(&to) {
+            self.came_from = Some(from[to.len()].clone());
+            self.return_scroll = self.scrolls.get(&to).copied();
+        } else {
+            self.came_from = None;
+            self.return_scroll = None;
+        }
+    }
+
+    /// Once a list has loaded: back to its old scroll, with the entry we
+    /// came out of in view.
+    fn restore_scroll(&mut self) {
+        if let Some(scroll) = self.return_scroll.take() {
+            self.view.scroll = scroll;
+        }
+        let Some(name) = &self.came_from else { return };
+        if let Some(i) = self.items.iter().position(|it| it.trail_name() == name) {
+            let (i, visible) = (i as f32, super::browser::visible_rows());
+            if i < self.view.scroll || i + 1.0 > self.view.scroll + visible {
+                self.view.scroll = i - (visible / 2.0).floor();
+            }
+        }
+    }
+
     fn show_servers(&mut self) {
+        self.leave(&Location::Servers);
         self.location = Location::Servers;
         self.pending = None;
         self.reset_view();
@@ -225,10 +293,12 @@ impl Navigator {
         });
         self.items = servers.into_iter().map(Item::Server).collect();
         self.items.push(Item::AddServer);
+        self.restore_scroll();
         self.rebuild_rows();
     }
 
     fn navigate(&mut self, location: Location) {
+        self.leave(&location);
         self.location = location.clone();
         self.items.clear();
         self.generation += 1;
@@ -318,6 +388,7 @@ impl Navigator {
                         ..Row::new(Icon::File, name)
                     },
                 };
+                row.outlined = self.came_from.as_deref() == Some(item.trail_name());
                 if item.is_entry() {
                     match selecting {
                         Some(selected) => row.checked = Some(selected.contains(&i)),
@@ -378,6 +449,7 @@ impl Navigator {
                         Ok(shares) => {
                             self.view.status = None;
                             self.items = shares.into_iter().map(Item::Share).collect();
+                            self.restore_scroll();
                             self.rebuild_rows();
                         }
                         Err(e) => self.set_status(format!("{e}  —  Press B to go back.")),
@@ -433,6 +505,7 @@ impl Navigator {
                             } else {
                                 None
                             };
+                            self.restore_scroll();
                             self.rebuild_rows();
                         }
                         Err(e) => self.set_status(format!(
@@ -1164,6 +1237,30 @@ mod tests {
 
         nav.long_press(1);
         assert_eq!(nav.view().rows[1].checked, Some(true), "long press selects");
+    }
+
+    #[test]
+    fn going_up_returns_to_the_folder_left() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        let names: Vec<String> = (0..40).map(|i| format!("f{i:02}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        nav.show_entries_for_test(server.clone(), &names);
+        nav.set_scroll(20.0);
+        nav.select(25);
+        assert!(matches!(&nav.location, Location::Folder { path, .. } if path == &["f25"]));
+        nav.back();
+        assert_eq!(nav.came_from.as_deref(), Some("f25"));
+        // The listing arrives.
+        nav.items = names.iter().map(|n| Item::Dir(n.to_string())).collect();
+        nav.restore_scroll();
+        nav.rebuild_rows();
+        assert_eq!(nav.scroll(), 20.0);
+        assert!(nav.view().rows[25].outlined);
+        assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
     }
 
     #[test]

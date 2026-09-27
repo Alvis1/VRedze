@@ -290,6 +290,26 @@ fn save_layout(
     }
 }
 
+/// Remembers where the playing file was left (off the frame loop: the
+/// write may be slow).
+fn save_resume(key: Option<&String>, playback: &Playback) {
+    let Some(key) = key.cloned() else { return };
+    let point = crate::config::resume_point(playback.position(), playback.duration);
+    let _ = std::thread::Builder::new()
+        .name("save resume".into())
+        .spawn(move || {
+            if let Err(e) = crate::config::save_resume_position(&key, point) {
+                eprintln!("Can't save where the video was left: {e:#}");
+            }
+        });
+}
+
+/// How often the place in the playing video is saved (for a crash or power-off).
+const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Resuming starts this much before where the video was left.
+const RESUME_REWIND: f64 = 3.0;
+
 struct Press {
     hand: usize,
     since: i64,
@@ -328,12 +348,12 @@ fn screen_size(
 
 /// Where subtitles go: over the bottom of a flat screen, just in front of it;
 /// for VR180/360, 2 m ahead in the view's direction, below its centre.
-fn caption_pose(
+fn caption_panel(
     placement: &Placement,
     projection: Projection,
     screen: [f32; 2],
     settings: crate::config::CaptionSettings,
-) -> (xr::Posef, [f32; 2]) {
+) -> Panel {
     let flat = projection == Projection::Flat;
     // The layer grows with the chosen size; its bottom edge stays put.
     let quad_w = settings.scale
@@ -365,7 +385,112 @@ fn caption_pose(
     };
     let [_, up, normal] = panel.basis();
     panel.center = [0, 1, 2].map(|i| up[i] * y - normal[i] * depth);
-    (panel.pose(), panel.size)
+    panel
+}
+
+/// Sample text shown while editing subtitle size and position.
+const SAMPLE_CAPTION: &str = "This is how subtitles will look.\nLong lines wrap onto a second one.";
+
+/// A 4×4 texture of one colour (premultiplied alpha), stretched into lines.
+fn solid_image(rgb: [u8; 3], alpha: f32) -> Vec<u8> {
+    let px = [
+        (rgb[0] as f32 * alpha) as u8,
+        (rgb[1] as f32 * alpha) as u8,
+        (rgb[2] as f32 * alpha) as u8,
+        (255.0 * alpha) as u8,
+    ];
+    px.repeat(16)
+}
+
+fn quat_mul(a: xr::Quaternionf, b: xr::Quaternionf) -> xr::Quaternionf {
+    xr::Quaternionf {
+        w: a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z,
+        x: a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+        y: a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        z: a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+    }
+}
+
+/// A line of the outline: its pose and size (metres).
+type Line = (xr::Posef, [f32; 2]);
+
+/// Lines `t` thick along the edges of a flat panel.
+fn panel_outline(panel: &Panel, t: f32) -> Vec<Line> {
+    let [right, up, _] = panel.basis();
+    let [w, h] = panel.size;
+    let at = |dx: f32, dy: f32| xr::Posef {
+        orientation: panel.orientation(),
+        position: {
+            let p = add(add(panel.center, scale(right, dx)), scale(up, dy));
+            xr::Vector3f {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+            }
+        },
+    };
+    vec![
+        (at(0.0, h / 2.0), [w + t, t]),
+        (at(0.0, -h / 2.0), [w + t, t]),
+        (at(-w / 2.0, 0.0), [t, h + t]),
+        (at(w / 2.0, 0.0), [t, h + t]),
+    ]
+}
+
+/// Lines along the edges of the flat screen (curved: along its arcs).
+fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> {
+    let base = Panel {
+        center: [0.0; 3],
+        yaw: placement.yaw,
+        tilt: placement.pitch,
+        size: screen,
+        pixels: [1, 1],
+    };
+    let [right, up, normal] = base.basis();
+    let r = placement.distance;
+    if !placement.curved {
+        let panel = Panel {
+            center: scale(normal, -r),
+            ..base
+        };
+        return panel_outline(&panel, t);
+    }
+    // A point on the curved screen `angle` to the right, `y` up, facing the viewer.
+    let at = |angle: f32, y: f32| -> xr::Posef {
+        let p = add(
+            add(scale(right, r * angle.sin()), scale(up, y)),
+            scale(normal, -r * angle.cos()),
+        );
+        let (s, c) = (-angle / 2.0).sin_cos();
+        let turn = xr::Quaternionf {
+            x: 0.0,
+            y: s,
+            z: 0.0,
+            w: c,
+        };
+        xr::Posef {
+            orientation: quat_mul(base.orientation(), turn),
+            position: xr::Vector3f {
+                x: p[0],
+                y: p[1],
+                z: p[2],
+            },
+        }
+    };
+    let [w, h] = screen;
+    let half = w / 2.0 / r;
+    let mut lines = vec![(at(-half, 0.0), [t, h + t]), (at(half, 0.0), [t, h + t])];
+    const SEGMENTS: usize = 24;
+    let step = 2.0 * half / SEGMENTS as f32;
+    for i in 0..SEGMENTS {
+        let angle = -half + (i as f32 + 0.5) * step;
+        // A little longer than the chord, so the segments join up.
+        let len = 2.0 * r * (step / 2.0).sin() + t / 2.0;
+        for y in [h / 2.0, -h / 2.0] {
+            lines.push((at(angle, y), [len, t]));
+        }
+    }
+    lines
 }
 
 fn video_hit(
@@ -490,11 +615,19 @@ pub fn run(
     };
     let mut controls_target = renderer.create_quad(&ctx, controls::WIDTH, controls::HEIGHT)?;
     let mut captions_target = renderer.create_quad(&ctx, captions::WIDTH, captions::HEIGHT)?;
+    // Outlines of the screen and the subtitle area while editing subtitles.
+    let mut screen_line = renderer.create_quad(&ctx, 4, 4)?;
+    renderer.upload_quad(&mut screen_line, &solid_image([0xff, 0xff, 0xff], 0.7))?;
+    let mut caption_line = renderer.create_quad(&ctx, 4, 4)?;
+    renderer.upload_quad(&mut caption_line, &solid_image([0xff, 0xcc, 0x00], 0.9))?;
+    let mut outlines: Vec<(bool, Line)> = Vec::new();
     let mut dialog_target =
         renderer.create_quad(&ctx, controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT)?;
     // The caption on screen, and where it goes this frame.
     let mut caption_drawn: Option<crate::subtitles::Caption> = None;
     let mut caption_at: Option<(xr::Posef, [f32; 2])> = None;
+    // Editing subtitle size and position (from the track dialog).
+    let mut caption_edit = false;
     let mut cursor = renderer.create_quad(&ctx, CURSOR_PX, CURSOR_PX)?;
     renderer.upload_quad(&mut cursor, &cursor_image())?;
 
@@ -510,6 +643,7 @@ pub fn run(
     let mut hovered: Option<browser::Hit> = None;
     // Where the playing file's chosen format is saved.
     let mut playing_key: Option<String> = None;
+    let mut resume_saved_at = Instant::now();
     let mut screenshot = options.play.screenshot.clone();
     let mut placement = Placement::new(&options.view);
     let mut controls_panel_at: Option<Panel> = None;
@@ -600,6 +734,13 @@ pub fn run(
             ctx.session
                 .locate_views(VIEW_TYPE, state.predicted_display_time, &space)?;
 
+        // B while editing subtitles: back to the track dialog.
+        if caption_edit && buttons.back {
+            caption_edit = false;
+            dialog = Some(controls::Dialog::Tracks);
+            buttons.back = false;
+            controls_drawn = None;
+        }
         // Leaving playback: B, end of video, or --duration reached.
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {
@@ -612,6 +753,7 @@ pub fn run(
         if stop_playback {
             set_phase(3);
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
+                save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
                 stats.skipped_frames += playback.stats.skipped_frames;
@@ -655,17 +797,26 @@ pub fn run(
                         "Playing {} as {:?} / {:?}",
                         opened.name, opened.layout.projection, opened.layout.stereo
                     );
+                    let start = opened.resume.map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
                     let mut playback = Playback::start(
                         opened.decoder,
                         opened.layout,
-                        0.0,
+                        start,
                         // Full level: the headset's volume buttons set loudness.
                         1.0,
                     );
+                    if start > 0.0 {
+                        playback.notice(
+                            format!("Continuing from {}", controls::format_time(start)),
+                            Duration::from_secs(4),
+                        );
+                    }
+                    resume_saved_at = Instant::now();
                     playback.add_external_subtitles(opened.external_subtitles);
                     playback.image = opened.image;
                     renderer.set_adjust(&playback.image);
                     dialog = None;
+                    caption_edit = false;
                     mode = Mode::Playing(Box::new(playback));
                     ctx.frame_stream
                         .end(state.predicted_display_time, ctx.blend_mode, &[])?;
@@ -763,6 +914,10 @@ pub fn run(
             }
             Mode::Playing(playback) => {
                 set_phase(5);
+                if resume_saved_at.elapsed() >= RESUME_SAVE_INTERVAL {
+                    resume_saved_at = Instant::now();
+                    save_resume(playing_key.as_ref(), playback);
+                }
                 let curved_applies = playback.layout.projection == Projection::Flat;
                 let ui_state = controls::State {
                     paused: playback.paused(),
@@ -781,6 +936,7 @@ pub fn run(
                     list_page,
                     image: playback.image,
                     dialog,
+                    caption_edit,
                 };
                 // The pointer on the dialog (above the bar) or on the bar.
                 let dialog_at = controls_panel_at
@@ -884,6 +1040,7 @@ pub fn run(
                                     }
                                 };
                                 dialog = None;
+                                caption_edit = false;
                                 controls_drawn = None;
                             }
                             press = None;
@@ -931,6 +1088,18 @@ pub fn run(
                         caption_settings.raise =
                             (caption_settings.raise + 0.03 * d as f32).clamp(-0.3, 0.8);
                         captions_changed = true;
+                    }
+                    Some(controls::Hit::CaptionEdit) => {
+                        caption_edit = true;
+                        dialog = None;
+                    }
+                    Some(controls::Hit::CaptionReset) => {
+                        caption_settings = Default::default();
+                        captions_changed = true;
+                    }
+                    Some(controls::Hit::CaptionDone) => {
+                        caption_edit = false;
+                        dialog = Some(controls::Dialog::Tracks);
                     }
                     Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
@@ -1067,8 +1236,13 @@ pub fn run(
                     }
                 }
 
-                // Subtitles: redrawn only when the text changes.
-                let caption = playback.caption();
+                // Subtitles: redrawn only when the text changes. While
+                // editing, sample text shows their size and place.
+                let caption = if caption_edit {
+                    Some(crate::subtitles::Caption::text(SAMPLE_CAPTION))
+                } else {
+                    playback.caption()
+                };
                 if caption != caption_drawn {
                     if let Some(caption) = &caption {
                         let canvas = captions::render(caption, &mut fonts);
@@ -1076,20 +1250,39 @@ pub fn run(
                     }
                     caption_drawn = caption.clone();
                 }
-                caption_at = caption.is_some().then(|| {
-                    let screen = screen_size(
-                        renderer.video_size(),
-                        playback.layout.stereo,
-                        options.view.screen_width * placement.zoom,
-                        playback.image.rotation,
+                let screen = screen_size(
+                    renderer.video_size(),
+                    playback.layout.stereo,
+                    options.view.screen_width * placement.zoom,
+                    playback.image.rotation,
+                );
+                let flat = playback.layout.projection == Projection::Flat;
+                let caption_area = caption_panel(
+                    &placement,
+                    playback.layout.projection,
+                    screen,
+                    caption_settings,
+                );
+                caption_at = caption
+                    .is_some()
+                    .then(|| (caption_area.pose(), caption_area.size));
+                outlines.clear();
+                if caption_edit {
+                    // Thick enough to see at any distance.
+                    let t = 0.004 * if flat { placement.distance } else { 2.0 };
+                    if flat {
+                        outlines.extend(
+                            screen_outline(&placement, screen, t)
+                                .into_iter()
+                                .map(|l| (false, l)),
+                        );
+                    }
+                    outlines.extend(
+                        panel_outline(&caption_area, t)
+                            .into_iter()
+                            .map(|l| (true, l)),
                     );
-                    caption_pose(
-                        &placement,
-                        playback.layout.projection,
-                        screen,
-                        caption_settings,
-                    )
-                });
+                }
                 set_phase(6);
                 let upload = playback.advance(now);
                 renderer.begin_frame(if upload { playback.current() } else { None })?;
@@ -1147,6 +1340,14 @@ pub fn run(
                 }
             }
             Mode::Playing(_) => {
+                for (caption, (pose, size)) in &outlines {
+                    let target = if *caption {
+                        &caption_line
+                    } else {
+                        &screen_line
+                    };
+                    quads.push((target, *pose, *size, true));
+                }
                 if let Some((pose, size)) = caption_at.filter(|_| captions_target.ready) {
                     quads.push((&captions_target, pose, size, true));
                 }
@@ -1239,6 +1440,13 @@ pub fn run(
     }
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
+        // Written here, not in the background: the app is about to exit.
+        let point = crate::config::resume_point(playback.position(), playback.duration);
+        if let Some(key) = &playing_key
+            && let Err(e) = crate::config::save_resume_position(key, point)
+        {
+            eprintln!("Can't save where the video was left: {e:#}");
+        }
         stats.displayed_frames += playback.stats.displayed_frames;
         stats.uploaded_frames += playback.stats.uploaded_frames;
         stats.skipped_frames += playback.stats.skipped_frames;
@@ -1273,6 +1481,42 @@ mod tests {
                 (hx - x).abs() < 2.0 && (hy - y).abs() < 2.0,
                 "({x},{y}) -> ({hx},{hy})"
             );
+        }
+    }
+
+    /// +Z (a quad's normal) turned by `q`.
+    fn rotate_z(q: xr::Quaternionf) -> [f32; 3] {
+        let v = [0.0f32, 0.0, 1.0];
+        let t = [
+            2.0 * (q.y * v[2] - q.z * v[1]),
+            2.0 * (q.z * v[0] - q.x * v[2]),
+            2.0 * (q.x * v[1] - q.y * v[0]),
+        ];
+        [
+            v[0] + q.w * t[0] + (q.y * t[2] - q.z * t[1]),
+            v[1] + q.w * t[1] + (q.z * t[0] - q.x * t[2]),
+            v[2] + q.w * t[2] + (q.x * t[1] - q.y * t[0]),
+        ]
+    }
+
+    #[test]
+    fn curved_screen_outline_faces_the_viewer() {
+        let placement = Placement {
+            yaw: 0.4,
+            pitch: 0.0,
+            distance: 3.0,
+            curved: true,
+            zoom: 1.0,
+        };
+        let lines = screen_outline(&placement, [4.0, 2.25], 0.01);
+        for (pose, _) in &lines {
+            let p = [pose.position.x, pose.position.y, pose.position.z];
+            let horizontal = (p[0] * p[0] + p[2] * p[2]).sqrt();
+            assert!((horizontal - 3.0).abs() < 1e-3, "on the arc: {p:?}");
+            // The normal points back at the viewer (the axis).
+            let n = rotate_z(pose.orientation);
+            let towards = [-p[0] / horizontal, 0.0, -p[2] / horizontal];
+            assert!(dot(n, towards) > 0.999, "{n:?} vs {towards:?}");
         }
     }
 
