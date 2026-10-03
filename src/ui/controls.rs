@@ -64,23 +64,18 @@ pub fn formats(views: u32) -> &'static [Format] {
     if views >= 2 { SPATIAL_FORMATS } else { FORMATS }
 }
 
-/// The favourites that apply to a video with `views` views: for spatial video
-/// their projections (as spatial formats), for other video the non-spatial ones.
+/// The starred favourites that apply to a video with `views` views: none for
+/// spatial video (its four formats aren't starred), and for other video the
+/// non-spatial ones.
 pub fn favourites_for(views: u32, favourites: &[Format]) -> Vec<Format> {
-    let mut out: Vec<Format> = Vec::new();
-    for &(projection, stereo) in favourites {
-        let format = if views >= 2 {
-            (projection, Stereo::MultiView)
-        } else if stereo == Stereo::MultiView {
-            continue;
-        } else {
-            (projection, stereo)
-        };
-        if !out.contains(&format) {
-            out.push(format);
-        }
+    if views >= 2 {
+        return Vec::new();
     }
-    out
+    favourites
+        .iter()
+        .copied()
+        .filter(|&(_, stereo)| stereo != Stereo::MultiView)
+        .collect()
 }
 
 pub fn format_label((projection, stereo): Format) -> String {
@@ -706,7 +701,11 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
             section(
                 &mut c,
                 fonts,
-                "Format  ·  click to use, long press to star a favourite",
+                if state.views >= 2 {
+                    "Spatial video format"
+                } else {
+                    "Format  ·  click to use, long press to star a favourite"
+                },
                 118.0,
             );
             section(&mut c, fonts, "Screen", 406.0);
@@ -842,11 +841,8 @@ mod tests {
         assert_eq!(formats(1), FORMATS);
         assert_eq!(formats(2), SPATIAL_FORMATS);
         let favourites = [FORMATS[0], FORMATS[3], (Projection::Flat, Stereo::MultiView)];
-        // Spatial video: the favourite projections, as spatial formats.
-        assert_eq!(
-            favourites_for(2, &favourites),
-            vec![SPATIAL_FORMATS[0], SPATIAL_FORMATS[1]]
-        );
+        // Spatial video: nothing starred (Screen steps through all four).
+        assert!(favourites_for(2, &favourites).is_empty());
         // Other video: spatial favourites don't apply.
         assert_eq!(favourites_for(1, &favourites), vec![FORMATS[0], FORMATS[3]]);
         let mut s = state();

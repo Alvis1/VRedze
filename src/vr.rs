@@ -150,8 +150,10 @@ fn projection_from_metadata(video: &VideoInfo) -> Option<Projection> {
 
 fn stereo_from_metadata(video: &VideoInfo) -> Option<(Stereo, bool)> {
     // Two coded views (MV-HEVC) are stereo whatever else the container says.
+    // The decoder puts the left view first (the container's eye-order flag
+    // is one of its clues), so nothing here swaps them again.
     if video.views >= 2 {
-        return Some((Stereo::MultiView, video.stereo_inverted));
+        return Some((Stereo::MultiView, false));
     }
     let stereo = match video.stereo_mode.as_deref()? {
         "2D" => Stereo::Mono,

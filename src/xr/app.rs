@@ -9,7 +9,7 @@ use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
 use crate::ui::{browser, captions, controls};
 use crate::config::LoopMode;
-use crate::vr::{Projection, Stereo};
+use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
 use std::{
@@ -79,6 +79,11 @@ impl Panel {
 
     /// Canvas pixel hit by `ray`, if any.
     fn hit(&self, ray: &Ray) -> Option<(f32, f32)> {
+        self.hit_at(ray).map(|(x, y, _)| (x, y))
+    }
+
+    /// Canvas pixel hit by `ray` and the distance along the ray, if any.
+    fn hit_at(&self, ray: &Ray) -> Option<(f32, f32, f32)> {
         let [right, up, normal] = self.basis();
         let denom = dot(ray.direction, normal);
         if denom.abs() < 1e-4 {
@@ -102,7 +107,7 @@ impl Panel {
         let u = dot(local, right) / self.size[0] + 0.5;
         let v = 0.5 - dot(local, up) / self.size[1];
         ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v))
-            .then_some((u * self.pixels[0] as f32, v * self.pixels[1] as f32))
+            .then_some((u * self.pixels[0] as f32, v * self.pixels[1] as f32, t))
     }
 
     /// World position of canvas pixel (x, y), `lift` metres towards the viewer.
@@ -682,8 +687,6 @@ pub fn run(
     let mut switch_video: Option<isize> = None;
     // At the end of a video: stop, play it again, or play the next in the folder.
     let mut loop_mode = crate::config::loop_mode();
-    // The video opening next came from looping the folder: play it from the start.
-    let mut looped_in = false;
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
@@ -761,21 +764,26 @@ pub fn run(
             controls_drawn = None;
         }
         // Leaving playback: B, end of video (unless looping), or --duration reached.
+        // Looping is for the headset's browser, not `play` from the command line.
         let folder_loop = loop_mode == LoopMode::Folder && navigator.is_some();
-        // A video that failed ends as usual instead of retrying forever.
+        let mut end_loop = false;
+        // A video that failed, or showed nothing, ends as usual instead of
+        // starting over forever.
         if let Mode::Playing(playback) = &mut mode
+            && navigator.is_some()
             && !buttons.back
             && switch_video.is_none()
             && playback.error.is_none()
+            && playback.shown_since_seek()
             && playback.reached_end(now)
         {
             match loop_mode {
                 LoopMode::Video => playback.seek(0.0),
-                LoopMode::Folder if folder_loop => {
+                LoopMode::Folder => {
                     switch_video = Some(1);
-                    looped_in = true;
+                    end_loop = true;
                 }
-                _ => {}
+                LoopMode::Off => {}
             }
         }
         let mut stop_playback = switch_video.is_some();
@@ -788,7 +796,9 @@ pub fn run(
         }
         if stop_playback {
             set_phase(3);
+            let mut failure = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
+                failure = playback.error.clone();
                 save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
@@ -803,10 +813,13 @@ pub fn run(
             match navigator.as_mut() {
                 // Previous/next: the browser shows "Opening …" until it plays.
                 Some(nav) if let Some(delta) = switch_video.take() => {
-                    nav.open_adjacent(delta, folder_loop);
+                    nav.open_adjacent(delta, folder_loop, end_loop);
                     nav.redraw();
                 }
-                Some(nav) => nav.playback_ended(),
+                Some(nav) => match &failure {
+                    Some(error) => nav.playback_failed(error),
+                    None => nav.playback_ended(),
+                },
                 None => options.quit.store(true, Ordering::Relaxed),
             }
         }
@@ -833,8 +846,8 @@ pub fn run(
                         "Playing {} as {:?} / {:?}",
                         opened.name, opened.layout.projection, opened.layout.stereo
                     );
-                    let from_loop = std::mem::take(&mut looped_in);
-                    let resume = opened.resume.filter(|_| !from_loop);
+                    // A video reached by looping the folder plays from the start.
+                    let resume = opened.resume.filter(|_| !opened.from_loop);
                     let start = resume.map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
                     let mut playback = Playback::start(
                         opened.decoder,
@@ -985,10 +998,18 @@ pub fn run(
                 let dialog_at = controls_panel_at
                     .filter(|_| dialog.is_some())
                     .map(|bar| dialog_panel(&bar));
-                let dialog_point =
-                    dialog_at.and_then(|p| ray.and_then(|r| p.hit(r)).map(|pt| (p, pt)));
-                let bar_point =
-                    controls_panel_at.and_then(|p| ray.and_then(|r| p.hit(r)).map(|pt| (p, pt)));
+                // The dialog leans back less than the bar, so its lower edge can
+                // sit behind the bar: the nearer of the two along the ray wins.
+                let dialog_hit_at = dialog_at.and_then(|p| ray.and_then(|r| p.hit_at(r)).map(|h| (p, h)));
+                let bar_hit_at =
+                    controls_panel_at.and_then(|p| ray.and_then(|r| p.hit_at(r)).map(|h| (p, h)));
+                let (dialog_hit_at, bar_hit_at) = match (dialog_hit_at, bar_hit_at) {
+                    (Some(d), Some(b)) if b.1.2 < d.1.2 => (None, Some(b)),
+                    (Some(d), Some(_)) => (Some(d), None),
+                    other => other,
+                };
+                let dialog_point = dialog_hit_at.map(|(p, (x, y, _))| (p, (x, y)));
+                let bar_point = bar_hit_at.map(|(p, (x, y, _))| (p, (x, y)));
                 let control_point = dialog_point.or(bar_point);
                 let dialog_hit = dialog_point.map_or(controls::Hit::Nothing, |(_, (x, y))| {
                     controls::dialog_hit(&ui_state, x, y)
@@ -1129,7 +1150,13 @@ pub fn run(
                     }
                     Some(controls::Hit::Screen) => {
                         let current = (playback.layout.projection, playback.layout.stereo);
-                        let usable = controls::favourites_for(playback.views, &favourites);
+                        // Spatial video steps through its projections; other video
+                        // through the starred favourites.
+                        let usable = if playback.views >= 2 {
+                            controls::SPATIAL_FORMATS.to_vec()
+                        } else {
+                            controls::favourites_for(playback.views, &favourites)
+                        };
                         if let Some(next) = controls::next_favourite(current, &usable) {
                             set_format(playback, next);
                         }
@@ -1163,8 +1190,11 @@ pub fn run(
                         caption_edit = false;
                         dialog = Some(controls::Dialog::Tracks);
                     }
+                    // The press may have begun on the previous video's dialog.
                     Some(controls::Hit::Pick(i)) => {
-                        set_format(playback, controls::formats(playback.views)[i])
+                        if let Some(&format) = controls::formats(playback.views).get(i) {
+                            set_format(playback, format);
+                        }
                     }
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
                     Some(controls::Hit::SwapEyes) => {
@@ -1207,25 +1237,18 @@ pub fn run(
                         list_page = playback.subtitle_index().map_or(0, |i| (i + 1) / 11);
                     }
                     Some(controls::Hit::Screen) => dialog = Some(controls::Dialog::Screen),
-                    // Star or unstar a favourite.
-                    Some(controls::Hit::Pick(i)) => {
-                        let format = controls::formats(playback.views)[i];
-                        if format.1 == Stereo::MultiView {
-                            // Spatial video stars a projection: any favourite with it counts.
-                            let others = favourites.iter().filter(|f| f.0 != format.0).count();
-                            if others == favourites.len() {
-                                favourites.push(format);
-                            } else if others > 0 {
-                                favourites.retain(|f| f.0 != format.0);
+                    // Star or unstar a favourite (spatial formats aren't starred:
+                    // the Screen button steps through all four).
+                    Some(controls::Hit::Pick(i))
+                        if playback.views < 2 && controls::formats(1).get(i).is_some() =>
+                    {
+                        let format = controls::formats(1)[i];
+                        match favourites.iter().position(|f| *f == format) {
+                            Some(at) if favourites.len() > 1 => {
+                                favourites.remove(at);
                             }
-                        } else {
-                            match favourites.iter().position(|f| *f == format) {
-                                Some(at) if favourites.len() > 1 => {
-                                    favourites.remove(at);
-                                }
-                                Some(_) => {} // keep at least one
-                                None => favourites.push(format),
-                            }
+                            Some(_) => {} // keep at least one
+                            None => favourites.push(format),
                         }
                         let saved: Vec<crate::config::Format> = favourites
                             .iter()

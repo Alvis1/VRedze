@@ -476,6 +476,8 @@ pub struct Playback {
     fps: f64,
     /// Coded views of the video: 2 for spatial (MV-HEVC) video.
     pub views: u32,
+    /// A picture was shown since the start or the last seek.
+    shown_since_seek: bool,
     pub duration: f64,
     last_pts: f64,
     /// Display time (ns) corresponding to media time 0.
@@ -578,6 +580,7 @@ impl Playback {
             error: None,
             fps,
             views,
+            shown_since_seek: false,
             duration,
             last_pts: start - 1.0 / fps,
             clock_start: None,
@@ -794,6 +797,7 @@ impl Playback {
         self.error = None;
         self.clock_start = None;
         self.last_pts = target;
+        self.shown_since_seek = false;
         // When paused, playback stays paused and shows the new position
         // (see `advance`).
     }
@@ -841,6 +845,7 @@ impl Playback {
             }
             self.last_pts = pts;
             self.current = self.next.take();
+            self.shown_since_seek = true;
             changed = true;
             if self.paused() {
                 break; // paused after a seek: show just the target frame
@@ -876,6 +881,11 @@ impl Playback {
             error * 0.1
         };
         *start += (correction * 1e9) as i64;
+    }
+
+    /// Whether a picture was shown since the start or the last seek.
+    pub fn shown_since_seek(&self) -> bool {
+        self.shown_since_seek
     }
 
     /// True once the stream ended and its last frame has been shown for a second.

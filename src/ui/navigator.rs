@@ -131,6 +131,8 @@ pub struct Navigator {
     playing: Option<usize>,
     /// Navigation request whose answer we wait for.
     pending: Option<u64>,
+    /// The pending open came from looping the folder (its request id).
+    loop_open: Option<u64>,
     /// Rename/delete/add requests whose answers we wait for.
     pending_changes: HashSet<u64>,
     change_errors: Vec<String>,
@@ -159,6 +161,7 @@ impl Navigator {
             tool_actions: Vec::new(),
             playing: None,
             pending: None,
+            loop_open: None,
             pending_changes: HashSet::new(),
             change_errors: Vec::new(),
             scrolls: Default::default(),
@@ -287,6 +290,7 @@ impl Navigator {
         self.leave(&Location::Servers);
         self.location = Location::Servers;
         self.pending = None;
+        self.loop_open = None;
         self.reset_view();
         let servers = config::servers().unwrap_or_else(|e| {
             eprintln!("Can't read saved servers: {e:#}");
@@ -302,6 +306,7 @@ impl Navigator {
     }
 
     fn navigate(&mut self, location: Location) {
+        self.loop_open = None;
         self.leave(&location);
         self.location = location.clone();
         self.items.clear();
@@ -548,6 +553,7 @@ impl Navigator {
                 }
                 Response::Opened { id, result } if Some(id) == self.pending => {
                     self.pending = None;
+                    let from_loop = self.loop_open.take() == Some(id);
                     self.view.notice = None;
                     self.dirty = true;
                     match result {
@@ -559,7 +565,10 @@ impl Navigator {
                                 [a.detail, a.hint].into_iter().flatten().collect(),
                             );
                         }
-                        Ok(opened) => return Some(opened),
+                        Ok(mut opened) => {
+                            opened.from_loop = from_loop;
+                            return Some(opened);
+                        }
                         Err(e) => self.dialog("Can't open this video", vec![e]),
                     }
                 }
@@ -758,6 +767,12 @@ impl Navigator {
         }
     }
 
+    /// Back from a video that stopped with an error: says why.
+    pub fn playback_failed(&mut self, error: &str) {
+        self.playback_ended();
+        self.dialog("Playback stopped", vec![error.to_string()]);
+    }
+
     /// Back from playing: outlines the video that played, and keeps it in view.
     pub fn playback_ended(&mut self) {
         self.came_from = self
@@ -768,21 +783,27 @@ impl Navigator {
         self.rebuild_rows();
     }
 
+    /// Whether there is another video to go to (never the playing one itself).
     pub fn has_adjacent(&self, delta: isize, wrap: bool) -> bool {
-        self.adjacent(delta, wrap).is_some()
+        self.adjacent(delta, wrap)
+            .is_some_and(|i| Some(i) != self.playing)
     }
 
     /// Opens the previous (-1) or next (+1) video in the folder (with `wrap`,
-    /// round from the last to the first); the result arrives from
-    /// [`Navigator::poll`] like any other.
-    pub fn open_adjacent(&mut self, delta: isize, wrap: bool) -> bool {
+    /// round from the last to the first, which in a folder of one is the same
+    /// video again); the result arrives from [`Navigator::poll`] like any
+    /// other. `from_loop` marks it as opened by looping (played from the start).
+    pub fn open_adjacent(&mut self, delta: isize, wrap: bool, from_loop: bool) -> bool {
         let Some(index) = self.adjacent(delta, wrap) else {
             return false;
         };
         self.selecting = None;
         self.view.dialog = None;
         self.view.form = None;
+        let before = self.pending;
         self.select(index);
+        // Only an open that select() actually started counts as the loop's.
+        self.loop_open = (from_loop && self.pending != before).then_some(self.pending).flatten();
         true
     }
 
@@ -1343,5 +1364,25 @@ mod tests {
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
+    }
+
+    #[test]
+    fn a_folder_of_one_loops_but_has_no_other_video() {
+        let mut nav = Navigator::new(Library::start(None));
+        let server = Server {
+            name: "NAS".into(),
+            url: "smb://u@nas".into(),
+        };
+        nav.show_entries_for_test(server, &[]);
+        nav.items = vec![Item::Video {
+            name: "only".into(),
+            size: 1,
+            assessment: None,
+            broken: None,
+        }];
+        nav.playing = Some(0);
+        assert_eq!(nav.adjacent(1, true), Some(0), "looping replays it");
+        assert!(!nav.has_adjacent(1, true), "but Next has nowhere to go");
+        assert!(!nav.has_adjacent(-1, true));
     }
 }

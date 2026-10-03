@@ -79,6 +79,8 @@ pub struct Opened {
     pub image: config::ImageAdjust,
     /// Where this file was left last time (seconds), to continue from.
     pub resume: Option<f64>,
+    /// Opened by looping the folder: it plays from the start.
+    pub from_loop: bool,
 }
 
 pub struct ExternalSubtitles {
@@ -308,13 +310,17 @@ fn open_video(
     let mut layout = vr::detect(&name, video.as_ref());
     let saved = config::layout_override(&key).ok().flatten();
     if let Some(saved) = saved {
-        saved.apply(&mut layout);
+        saved.apply(&mut layout, video.as_ref().map_or(1, |v| v.views));
     }
     let image = saved.map(|s| s.image).unwrap_or_default();
     // The last video's decoder closes in the background; wait for
     // it, or the hardware decoder is still busy.
+    let mut hw = hw;
     if !crate::media::wait_for_decoders_closed(std::time::Duration::from_secs(10)) {
-        eprintln!("Library: the previous video's decoder is still closing");
+        // Its hardware session may still be open: a second one could exceed
+        // the decoder's capacity, so this video decodes on the CPU.
+        eprintln!("Library: the previous video's decoder is still closing; using the CPU");
+        hw = None;
     }
     let decoder = media.into_decoder(hw, true, "").map_err(err)?;
     let resume = config::resume_position(&key);
@@ -327,6 +333,7 @@ fn open_video(
         external_subtitles,
         image,
         resume,
+        from_loop: false,
     }))
 }
 
@@ -593,9 +600,16 @@ impl Library {
 }
 
 impl LayoutOverride {
-    pub fn apply(&self, layout: &mut Layout) {
+    /// Applies the saved choice to a video with `views` coded views. A saved
+    /// stereo layout is kept only where it fits: spatial (two-view) video
+    /// always plays as MultiView and nothing else does, so a choice saved
+    /// before an update (or for a replaced file) can't show both views as one
+    /// picture.
+    pub fn apply(&self, layout: &mut Layout, views: u32) {
         layout.projection = self.projection;
-        layout.stereo = self.stereo;
         layout.swap_eyes = self.swap_eyes;
+        if (views >= 2) == (self.stereo == crate::vr::Stereo::MultiView) {
+            layout.stereo = self.stereo;
+        }
     }
 }

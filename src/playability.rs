@@ -44,7 +44,11 @@ impl Platform {
         }
         match self {
             Self::SteamFrame => {
-                // VP9 too stays on the CPU: a second VP9 session crashes the decoder firmware.
+                if v.codec == "vp9" {
+                    return Some(format!(
+                        "VP9 isn't sent to {name}'s hardware video decoder: a second VP9 video crashes it in the current SteamOS"
+                    ));
+                }
                 if !matches!(v.codec.as_str(), "h264" | "hevc") {
                     return Some(format!(
                         "{name}'s hardware video decoder doesn't support {}",
@@ -62,6 +66,14 @@ impl Platform {
                         "the video's bit depth couldn't be confirmed as 8-bit, so the hardware decoder isn't used, to be safe"
                             .into(),
                     );
+                }
+                // A profile allowing more than 8 bits may switch to 10-bit
+                // mid-stream, which crashes the firmware (mirrors media.c).
+                if v.profile.is_some() && !known_8bit_profile(v) {
+                    return Some(format!(
+                        "the video's profile ({}) allows more than 8 bits, so the hardware decoder isn't used, to be safe",
+                        v.profile.as_deref().unwrap_or("")
+                    ));
                 }
                 let pix = v.pixel_format.as_deref().unwrap_or("");
                 if pix.contains("422") || pix.contains("444") {
@@ -98,6 +110,9 @@ impl Platform {
                 "hevc" => 1.5e9,
                 "h264" => 1.3e9,
                 "av1" => 0.8e9,
+                // Not measured on the Frame: FFmpeg's VP9 decoder is about as
+                // fast as its H.264 one elsewhere.
+                "vp9" => 1.2e9,
                 _ => 0.8e9,
             }),
             Self::Desktop => None,
@@ -194,6 +209,21 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             software_speed: None,
         };
     };
+    // Two spatial views share one texture, at most 16384 px wide on these GPUs.
+    let texture_width = v.width as u64 * v.views.max(1) as u64;
+    if texture_width > 16384 || v.height > 16384 {
+        return Assessment {
+            platform,
+            verdict: Verdict::Unplayable,
+            title: format!("Too large to show ({})", describe(v)),
+            detail: Some(format!(
+                "{}×{} is beyond what the headset's GPU can hold as one picture.",
+                texture_width, v.height
+            )),
+            hint: hint(platform, v),
+            software_speed: None,
+        };
+    }
     let gap = platform.hardware_gap(v);
     if gap.is_none() {
         return Assessment {
@@ -403,6 +433,27 @@ mod tests {
         let mut chroma = video("h264", 1920, 1080, 8, 30.0);
         chroma.pixel_format = Some("yuv422p".into());
         assert_ne!(frame(&chroma).verdict, Verdict::Hardware);
+        // 8-bit first pictures, but a profile that allows 10-bit ones later.
+        let mut mixed = video("hevc", 3840, 2160, 8, 30.0);
+        mixed.profile = Some("Main 10".into());
+        assert_ne!(frame(&mixed).verdict, Verdict::Hardware);
+    }
+
+    #[test]
+    fn spatial_video_never_uses_hardware_and_counts_both_views() {
+        let mut v = video("hevc", 2200, 2200, 8, 30.0);
+        v.profile = Some("Main".into());
+        v.multilayer = true;
+        v.views = 2;
+        let a = frame(&v);
+        assert_eq!(a.verdict, Verdict::Software);
+        // Twice the pixels of one view: 2200 x 2200 x 30 x 2.
+        let one_view = 1.5e9 / (2200.0 * 2200.0 * 30.0);
+        assert!((a.software_speed.unwrap() - one_view / 2.0).abs() < 1e-9);
+        // Two 8640-wide views don't fit one texture.
+        v.width = 8640;
+        v.height = 4320;
+        assert_eq!(frame(&v).verdict, Verdict::Unplayable);
     }
 
     #[test]
