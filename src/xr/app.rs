@@ -8,6 +8,7 @@ use super::renderer::{QuadTarget, Renderer};
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
 use crate::ui::{browser, captions, controls};
+use crate::config::LoopMode;
 use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
@@ -37,6 +38,8 @@ struct Panel {
     tilt: f32,
     size: [f32; 2],
     pixels: [u32; 2],
+    /// The eye position the panel was placed for; head-placed panels face it.
+    eye: [f32; 3],
 }
 
 fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
@@ -133,6 +136,7 @@ const BROWSER_PANEL: Panel = Panel {
     tilt: 0.0,
     size: [2.347, 1.467],
     pixels: [browser::WIDTH, browser::HEIGHT],
+    eye: [0.0; 3],
 };
 
 /// Preferred distance of the control bar, the browser's; it looks as big as
@@ -143,7 +147,7 @@ const CONTROLS_DISTANCE: f32 = -BROWSER_PANEL.center[2];
 const CONTROLS_DROP: f32 = 0.756;
 
 /// The control bar ahead of the head, [`CONTROLS_DROP`] below eye level,
-/// tilted towards it: [`CONTROLS_DISTANCE`] away, but never beyond
+/// turned to face the eyes squarely: [`CONTROLS_DISTANCE`] away, but never beyond
 /// `max_distance` (in front of the screen), and scaled with its distance so it
 /// always looks the same size. Brought much nearer, it also sits less far
 /// down, so it isn't steeply below the eyes.
@@ -163,16 +167,19 @@ fn controls_panel(head: &xr::Posef, max_distance: f32) -> Panel {
     Panel {
         center: [p.x - sy * d, p.y - drop, p.z - cy * d],
         yaw,
-        tilt: -0.45,
+        // Leaning back by exactly the angle up to the eyes: perpendicular to the gaze.
+        tilt: -drop.atan2(d),
         size: [
             1.2 * d,
             1.2 * d * controls::HEIGHT as f32 / controls::WIDTH as f32,
         ],
         pixels: [controls::WIDTH, controls::HEIGHT],
+        eye: [p.x, p.y, p.z],
     }
 }
 
-/// The dialog panel: above the control bar, in the same plane, as wide.
+/// The dialog panel: above the control bar, as wide, and like it facing the
+/// eyes squarely (so it leans back less than the bar, being higher up).
 fn dialog_panel(bar: &Panel) -> Panel {
     let size = [
         bar.size[0],
@@ -180,8 +187,12 @@ fn dialog_panel(bar: &Panel) -> Panel {
     ];
     let [_, up, _] = bar.basis();
     let lift = bar.size[1] / 2.0 + bar.size[0] * 0.02 + size[1] / 2.0;
+    let center = [0, 1, 2].map(|i| bar.center[i] + up[i] * lift);
+    let below_eye = bar.eye[1] - center[1];
+    let ahead = (center[0] - bar.eye[0]).hypot(center[2] - bar.eye[2]);
     Panel {
-        center: [0, 1, 2].map(|i| bar.center[i] + up[i] * lift),
+        center,
+        tilt: -below_eye.atan2(ahead),
         size,
         pixels: [controls::DIALOG_WIDTH, controls::DIALOG_HEIGHT],
         ..*bar
@@ -384,6 +395,7 @@ fn caption_panel(
         tilt: placement.pitch,
         size: [quad_w, quad_h],
         pixels: [captions::WIDTH, captions::HEIGHT],
+        eye: [0.0; 3],
     };
     let [_, up, normal] = panel.basis();
     panel.center = [0, 1, 2].map(|i| up[i] * y - normal[i] * depth);
@@ -447,6 +459,7 @@ fn screen_outline(placement: &Placement, screen: [f32; 2], t: f32) -> Vec<Line> 
         tilt: placement.pitch,
         size: screen,
         pixels: [1, 1],
+        eye: [0.0; 3],
     };
     let [right, up, normal] = base.basis();
     let r = placement.distance;
@@ -667,6 +680,10 @@ pub fn run(
         .collect();
     // Previous (-1) or next (+1) video requested from the control bar.
     let mut switch_video: Option<isize> = None;
+    // At the end of a video: stop, play it again, or play the next in the folder.
+    let mut loop_mode = crate::config::loop_mode();
+    // The video opening next came from looping the folder: play it from the start.
+    let mut looped_in = false;
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
@@ -743,14 +760,31 @@ pub fn run(
             buttons.back = false;
             controls_drawn = None;
         }
-        // Leaving playback: B, end of video, or --duration reached.
+        // Leaving playback: B, end of video (unless looping), or --duration reached.
+        let folder_loop = loop_mode == LoopMode::Folder && navigator.is_some();
+        // A video that failed ends as usual instead of retrying forever.
+        if let Mode::Playing(playback) = &mut mode
+            && !buttons.back
+            && switch_video.is_none()
+            && playback.error.is_none()
+            && playback.reached_end(now)
+        {
+            match loop_mode {
+                LoopMode::Video => playback.seek(0.0),
+                LoopMode::Folder if folder_loop => {
+                    switch_video = Some(1);
+                    looped_in = true;
+                }
+                _ => {}
+            }
+        }
         let mut stop_playback = switch_video.is_some();
         if let Mode::Playing(playback) = &mut mode {
-            let reached_end = options
+            let reached_duration = options
                 .play
                 .duration
                 .is_some_and(|d| playback.media_time(now).is_some_and(|t| t >= d));
-            stop_playback |= buttons.back || playback.finished(now) || reached_end;
+            stop_playback |= buttons.back || playback.finished(now) || reached_duration;
         }
         if stop_playback {
             set_phase(3);
@@ -769,7 +803,7 @@ pub fn run(
             match navigator.as_mut() {
                 // Previous/next: the browser shows "Opening …" until it plays.
                 Some(nav) if let Some(delta) = switch_video.take() => {
-                    nav.open_adjacent(delta);
+                    nav.open_adjacent(delta, folder_loop);
                     nav.redraw();
                 }
                 Some(nav) => nav.playback_ended(),
@@ -799,7 +833,9 @@ pub fn run(
                         "Playing {} as {:?} / {:?}",
                         opened.name, opened.layout.projection, opened.layout.stereo
                     );
-                    let start = opened.resume.map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
+                    let from_loop = std::mem::take(&mut looped_in);
+                    let resume = opened.resume.filter(|_| !from_loop);
+                    let start = resume.map_or(0.0, |t| (t - RESUME_REWIND).max(0.0));
                     let mut playback = Playback::start(
                         opened.decoder,
                         opened.layout,
@@ -924,8 +960,13 @@ pub fn run(
                     paused: playback.paused(),
                     position: playback.position().floor(),
                     duration: playback.duration,
-                    has_previous: navigator.as_ref().is_some_and(|n| n.has_adjacent(-1)),
-                    has_next: navigator.as_ref().is_some_and(|n| n.has_adjacent(1)),
+                    has_previous: navigator
+                        .as_ref()
+                        .is_some_and(|n| n.has_adjacent(-1, folder_loop)),
+                    has_next: navigator
+                        .as_ref()
+                        .is_some_and(|n| n.has_adjacent(1, folder_loop)),
+                    loop_mode,
                     curved: curved_applies.then_some(placement.curved),
                     format: (playback.layout.projection, playback.layout.stereo),
                     favourites: favourites.clone(),
@@ -1059,6 +1100,24 @@ pub fn run(
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
+                    Some(hit @ (controls::Hit::LoopVideo | controls::Hit::LoopFolder)) => {
+                        let picked = if hit == controls::Hit::LoopVideo {
+                            LoopMode::Video
+                        } else {
+                            LoopMode::Folder
+                        };
+                        // A second click on the active one turns looping off.
+                        loop_mode = if loop_mode == picked { LoopMode::Off } else { picked };
+                        let text = match loop_mode {
+                            LoopMode::Off => "Loop off",
+                            LoopMode::Video => "Looping this video",
+                            LoopMode::Folder => "Looping the folder",
+                        };
+                        playback.notice(text.to_string(), Duration::from_secs(2));
+                        if let Err(e) = crate::config::save_loop_mode(loop_mode) {
+                            eprintln!("Can't save the loop setting: {e:#}");
+                        }
+                    }
                     // CC: subtitles on/off (or, with none, straight to audio tracks).
                     Some(controls::Hit::Captions) => {
                         if playback.subtitle_labels().is_empty() {
@@ -1383,6 +1442,7 @@ pub fn run(
                 tilt: pitch,
                 size: [0.0; 2],
                 pixels: [1, 1],
+                eye: [0.0; 3],
             };
             let pose = xr::Posef {
                 orientation: facing.orientation(),
@@ -1469,6 +1529,7 @@ mod tests {
             tilt: -0.45,
             size: [1.2, 1.2 * controls::HEIGHT as f32 / controls::WIDTH as f32],
             pixels: [1200, 260],
+            eye: [0.0; 3],
         };
         for (x, y) in [(600.0, 130.0), (100.0, 40.0), (1150.0, 250.0)] {
             let target = panel.point(x, y, 0.0);
@@ -1529,6 +1590,7 @@ mod tests {
             tilt: -0.4,
             size: [1.0, 1.0],
             pixels: [1, 1],
+            eye: [0.0; 3],
         };
         let q = panel.orientation();
         // Rotate +Z (the quad's normal) by q and compare with the basis normal.

@@ -138,6 +138,8 @@ const FONT_CANDIDATES: &[&[&str]] = &[
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        // macOS, for tests and previews on a development machine.
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
     ],
     &[
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Medium.ttc",

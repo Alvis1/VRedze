@@ -857,9 +857,19 @@ impl Playback {
 
     /// True once the stream ended and its last frame has been shown for a second.
     pub fn finished(&self, now: i64) -> bool {
+        self.shown_last_frame_for(now, 1.0)
+    }
+
+    /// True once the stream ended and its last frame has been on screen for
+    /// one frame's time: when looping, the video starts over without a pause.
+    pub fn reached_end(&self, now: i64) -> bool {
+        self.shown_last_frame_for(now, 1.0 / self.fps)
+    }
+
+    fn shown_last_frame_for(&self, now: i64, seconds: f64) -> bool {
         self.ended
             && self.next.is_none()
-            && self.media_time(now).is_none_or(|t| t > self.last_pts + 1.0)
+            && self.media_time(now).is_none_or(|t| t > self.last_pts + seconds)
     }
 }
 

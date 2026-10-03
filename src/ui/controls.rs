@@ -17,7 +17,7 @@
 //! screen.
 
 use super::canvas::{Canvas, Fonts, Rgb};
-use crate::config::ImageAdjust;
+use crate::config::{ImageAdjust, LoopMode};
 use crate::vr::{Projection, Stereo};
 
 pub const WIDTH: u32 = 1200;
@@ -93,6 +93,10 @@ pub enum Hit {
     Previous,
     PlayPause,
     Next,
+    /// Loop this video (click again: off).
+    LoopVideo,
+    /// Loop the folder: next video at the end, the first after the last (click again: off).
+    LoopFolder,
     /// Fraction of the duration.
     Seek(f32),
     /// CC: click toggles subtitles, long press opens the track dialog.
@@ -145,6 +149,7 @@ pub struct State {
     pub duration: f64,
     pub has_previous: bool,
     pub has_next: bool,
+    pub loop_mode: LoopMode,
     /// None when the curve toggle does not apply (VR180/360).
     pub curved: Option<bool>,
     pub format: Format,
@@ -169,6 +174,9 @@ type Rect = (f32, f32, f32, f32);
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
+// The loop buttons, centred in the gap between Next and CC.
+const LOOP_VIDEO: Rect = (468.0, 16.0, 96.0, 92.0);
+const LOOP_FOLDER: Rect = (598.0, 16.0, 96.0, 92.0);
 const CAPTIONS: Rect = (818.0, 16.0, 96.0, 92.0);
 const SCREEN: Rect = (948.0, 16.0, 96.0, 92.0);
 const IMAGE: Rect = (1078.0, 16.0, 96.0, 92.0);
@@ -206,6 +214,8 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (PREVIOUS, Hit::Previous, state.has_previous),
         (PLAY, Hit::PlayPause, true),
         (NEXT, Hit::Next, state.has_next),
+        (LOOP_VIDEO, Hit::LoopVideo, true),
+        (LOOP_FOLDER, Hit::LoopFolder, true),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -433,6 +443,22 @@ fn screen_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, fill: Rgb) {
     c.rect(cx - 14.0, cy + 19.0, 28.0, 5.0, 2.0, color);
 }
 
+/// Loop: a rounded ring with an arrowhead on its top edge, around `inside`
+/// ("1" for one video, a folder for the folder), drawn by the caller.
+fn loop_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, fill: Rgb) {
+    c.rect(cx - 30.0, cy - 21.0, 60.0, 42.0, 18.0, color);
+    c.rect(cx - 24.0, cy - 15.0, 48.0, 30.0, 12.0, fill);
+    // A gap in the top edge, with the arrowhead pointing into it.
+    c.rect(cx - 2.0, cy - 23.0, 12.0, 10.0, 0.0, fill);
+    triangle(c, cx - 8.0, cy - 18.0, 12.0, 18.0, false, color);
+}
+
+/// A small folder: a tab and a body.
+fn folder_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
+    c.rect(cx - 12.0, cy - 9.0, 10.0, 5.0, 1.5, color);
+    c.rect(cx - 12.0, cy - 6.0, 24.0, 15.0, 2.0, color);
+}
+
 /// Image: a sun (brightness).
 fn image_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
     c.circle(cx, cy, 11.0, color);
@@ -501,11 +527,34 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         }
     }
 
-    // The three setting buttons, each with a small label underneath.
+    // The loop and setting buttons, each with a small label underneath.
     let label_under = |c: &mut Canvas, fonts: &mut Fonts, r: Rect, text: &str| {
         let area = (r.0 - 17.0, r.1 + r.3 + 4.0, r.2 + 34.0, 30.0);
         centered(c, fonts, text, area, 22.0, SUBTLE);
     };
+
+    for (r, hit, mode, label) in [
+        (LOOP_VIDEO, Hit::LoopVideo, LoopMode::Video, "Loop video"),
+        (LOOP_FOLDER, Hit::LoopFolder, LoopMode::Folder, "Loop folder"),
+    ] {
+        let active = state.loop_mode == mode;
+        button(&mut c, r, hover == hit, active);
+        let fill = if active {
+            ACCENT
+        } else if hover == hit {
+            HOVER
+        } else {
+            BUTTON
+        };
+        let (cx, cy) = (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
+        loop_icon(&mut c, cx, cy, TEXT, fill);
+        if mode == LoopMode::Video {
+            centered(&mut c, fonts, "1", (cx - 15.0, cy - 15.0, 30.0, 30.0), 26.0, TEXT);
+        } else {
+            folder_icon(&mut c, cx, cy + 1.0, TEXT);
+        }
+        label_under(&mut c, fonts, r, label);
+    }
     let can_caption = !state.subtitle_tracks.is_empty() || state.audio_tracks.len() > 1;
     let subtitles_on = state.subtitle.is_some();
     button(
@@ -726,6 +775,7 @@ mod tests {
             duration: 120.0,
             has_previous: true,
             has_next: false,
+            loop_mode: LoopMode::Off,
             curved: Some(false),
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
@@ -743,6 +793,39 @@ mod tests {
 
     fn center(r: Rect) -> (f32, f32) {
         (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0)
+    }
+
+    #[test]
+    fn loop_buttons() {
+        let s = state();
+        let (x, y) = center(LOOP_VIDEO);
+        assert_eq!(hit(&s, x, y), Hit::LoopVideo);
+        let (x, y) = center(LOOP_FOLDER);
+        assert_eq!(hit(&s, x, y), Hit::LoopFolder);
+        // Clear of their neighbours, with room for the labels underneath.
+        assert!(LOOP_VIDEO.0 > NEXT.0 + NEXT.2 + 60.0);
+        assert!(LOOP_FOLDER.0 + LOOP_FOLDER.2 + 60.0 < CAPTIONS.0);
+        assert!(LOOP_VIDEO.0 + LOOP_VIDEO.2 + 17.0 <= LOOP_FOLDER.0 - 17.0, "labels overlap");
+    }
+
+    /// Writes the bar as a PNG for a look at the layout:
+    /// CONTROLS_PNG=/tmp/bar.png cargo test controls::tests::preview -- --ignored
+    #[test]
+    #[ignore]
+    fn preview() {
+        let Some(path) = std::env::var_os("CONTROLS_PNG") else { return };
+        let mut fonts = Fonts::load().expect("fonts");
+        let mut s = state();
+        s.loop_mode = LoopMode::Folder;
+        let canvas = render(&s, &mut fonts, Hit::LoopVideo);
+        let file = std::fs::File::create(path).expect("create png");
+        let mut encoder = png::Encoder::new(file, WIDTH, HEIGHT);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .and_then(|mut w| w.write_image_data(&canvas.pixels))
+            .expect("write png");
     }
 
     #[test]

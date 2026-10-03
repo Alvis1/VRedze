@@ -929,6 +929,7 @@ fn main() -> anyhow::Result<()> {
                 duration: 5530.0,
                 has_previous: true,
                 has_next: false,
+                loop_mode: just_video::config::LoopMode::Off,
                 curved: Some(true),
                 format: controls::FORMATS[3],
                 favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],

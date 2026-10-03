@@ -229,6 +229,34 @@ struct Settings {
     favourite_formats: Option<Vec<Format>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     captions: Option<CaptionSettings>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    loop_mode: Option<LoopMode>,
+}
+
+/// What happens when a video reaches its end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopMode {
+    /// Back to the browser.
+    #[default]
+    Off,
+    /// The same video again from the start.
+    Video,
+    /// The next video in the folder, and after the last one the first again.
+    Folder,
+}
+
+pub fn loop_mode() -> LoopMode {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.loop_mode)
+        .unwrap_or_default()
+}
+
+pub fn save_loop_mode(mode: LoopMode) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.loop_mode = Some(mode);
+    write_json("settings.json", &settings, false)
 }
 
 /// Subtitle size and position, the same for every video.

@@ -727,9 +727,20 @@ impl Navigator {
         self.rebuild_rows();
     }
 
-    /// The playable video `delta` places from the playing one, if any.
-    fn adjacent(&self, delta: isize) -> Option<usize> {
-        let mut i = self.playing? as isize;
+    /// The playable video `delta` places from the playing one, if any. With
+    /// `wrap`, past either end of the folder it continues from the other end
+    /// (back to the playing video itself when it is the only one).
+    fn adjacent(&self, delta: isize, wrap: bool) -> Option<usize> {
+        let playing = self.playing? as isize;
+        self.playable_after(playing, delta).or_else(|| {
+            let before_first = if delta > 0 { -1 } else { self.items.len() as isize };
+            wrap.then(|| self.playable_after(before_first, delta))
+                .flatten()
+        })
+    }
+
+    /// The first playable video after index `i`, stepping by `delta`.
+    fn playable_after(&self, mut i: isize, delta: isize) -> Option<usize> {
         loop {
             i += delta;
             let item = self.items.get(usize::try_from(i).ok()?)?;
@@ -757,14 +768,15 @@ impl Navigator {
         self.rebuild_rows();
     }
 
-    pub fn has_adjacent(&self, delta: isize) -> bool {
-        self.adjacent(delta).is_some()
+    pub fn has_adjacent(&self, delta: isize, wrap: bool) -> bool {
+        self.adjacent(delta, wrap).is_some()
     }
 
-    /// Opens the previous (-1) or next (+1) video in the folder; the result
-    /// arrives from [`Navigator::poll`] like any other.
-    pub fn open_adjacent(&mut self, delta: isize) -> bool {
-        let Some(index) = self.adjacent(delta) else {
+    /// Opens the previous (-1) or next (+1) video in the folder (with `wrap`,
+    /// round from the last to the first); the result arrives from
+    /// [`Navigator::poll`] like any other.
+    pub fn open_adjacent(&mut self, delta: isize, wrap: bool) -> bool {
+        let Some(index) = self.adjacent(delta, wrap) else {
             return false;
         };
         self.selecting = None;
@@ -1318,14 +1330,16 @@ mod tests {
         nav.items
             .extend([video("a", false), video("b", true), file, video("c", false)]);
         nav.playing = Some(1);
-        assert!(!nav.has_adjacent(-1), "a folder is not a video");
+        assert!(!nav.has_adjacent(-1, false), "a folder is not a video");
         assert_eq!(
-            nav.adjacent(1),
+            nav.adjacent(1, false),
             Some(4),
             "skips the broken one and the file"
         );
+        assert_eq!(nav.adjacent(-1, true), Some(4), "wraps to the last video");
         nav.playing = Some(4);
-        assert!(!nav.has_adjacent(1));
+        assert!(!nav.has_adjacent(1, false));
+        assert_eq!(nav.adjacent(1, true), Some(1), "wraps to the first video");
         nav.playback_ended();
         assert!(nav.view().rows[4].outlined, "the video just played");
         assert_eq!(nav.view().rows.iter().filter(|r| r.outlined).count(), 1);
