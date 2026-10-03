@@ -687,6 +687,9 @@ pub fn run(
     let mut switch_video: Option<isize> = None;
     // At the end of a video: stop, play it again, or play the next in the folder.
     let mut loop_mode = crate::config::loop_mode();
+    // The last frame's display time: a jump of more than 1.5 display
+    // periods means we missed one (counted per video).
+    let mut last_display: Option<i64> = None;
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
@@ -737,6 +740,13 @@ pub fn run(
         stats.rendered_xr_frames += 1;
         let now = state.predicted_display_time.as_nanos();
         let dt = state.predicted_display_period.as_nanos() as f32 / 1e9;
+        let period = state.predicted_display_period.as_nanos() as i64;
+        if let Some(previous) = last_display.replace(now)
+            && now - previous > period * 3 / 2
+            && let Mode::Playing(playback) = &mut mode
+        {
+            playback.stats.late_xr_frames += 1;
+        }
         set_phase(2);
         let mut buttons = input
             .poll(&ctx, &space, state.predicted_display_time)
@@ -799,6 +809,7 @@ pub fn run(
             let mut failure = None;
             if let Mode::Playing(playback) = std::mem::replace(&mut mode, Mode::Browser) {
                 failure = playback.error.clone();
+                eprintln!("Stopped: {}", playback.stats.summary());
                 save_resume(playing_key.as_ref(), &playback);
                 stats.displayed_frames += playback.stats.displayed_frames;
                 stats.uploaded_frames += playback.stats.uploaded_frames;
@@ -1391,14 +1402,19 @@ pub fn run(
                     playback.fail(format!("{e:#}"));
                     upload = false;
                 }
+                let upload_started = Instant::now();
                 renderer.begin_frame(
                     if upload { playback.current() } else { None },
                     playback.views,
                 )?;
                 if upload {
+                    let took = upload_started.elapsed().as_secs_f64();
                     playback.stats.uploaded_frames += 1;
+                    playback.stats.upload_seconds += took;
+                    playback.stats.upload_max_seconds = playback.stats.upload_max_seconds.max(took);
+                    playback.uploaded();
                 }
-                let show = playback.current().is_some();
+                let show = playback.showing();
                 if show {
                     playback.stats.displayed_frames += 1;
                 }

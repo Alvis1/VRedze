@@ -327,6 +327,7 @@ struct JVDecoder {
     AVCodecContext *ctx;
     char *options;       // the caller's decoder options, for reopening
     int multiview;       // decoding every view of MV-HEVC (view_ids=-1)
+    int fed;             // video packets sent since the codec was (re)opened
     AVBufferRef *device;
     AVPacket *packet;
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
@@ -346,6 +347,8 @@ struct JVDecoder {
     JVSubtitleCue cues[CUE_QUEUE];
     int cue_first, cue_count;
 };
+
+static int reopen_codec_with(JVDecoder *d, const AVCodec *codec);
 
 static double video_start_seconds(const JVMedia *media) {
     const AVStream *video = media->format->streams[media->video_stream];
@@ -632,7 +635,7 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             // above 4096x2304; 8 work up to 8K, and smaller frames can have more.
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
             av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
-            av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
+            av_dict_set_int(&open_options, "num_output_buffers", 6, 0);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
             snprintf(s->error, sizeof(s->error), "%s", why);
@@ -642,7 +645,6 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             codec = avcodec_find_decoder(id);
         }
     }
-reopen:
     for (int attempt = 0; attempt < 2; ++attempt) {
         avcodec_free_context(&d->ctx);
         av_buffer_unref(&d->device);
@@ -687,14 +689,21 @@ reopen:
         goto fail;
     }
     if (ret < 0 && d->choice.hardware_wrapper && allow_software) {
-        // Device missing, busy or its firmware recovering: never fail playback
-        // over it when the CPU can decode instead.
-        set_error(s->note, sizeof(s->note), "Hardware decoder failed to open", ret);
-        d->choice.hardware_wrapper = 0;
-        s->hw_backend[0] = '\0';
+        // Device busy (a session still being released), short of memory, or
+        // its firmware recovering: retry shortly, then decode on the CPU
+        // rather than fail playback.
+        int first_error = ret;
         av_dict_free(&open_options);
-        codec = avcodec_find_decoder(id);
-        goto reopen;
+        av_usleep(150000);
+        ret = reopen_codec_with(d, codec);
+        if (ret >= 0 && !d->choice.hardware_wrapper) {
+            set_error(s->note, sizeof(s->note), "Hardware decoder failed to open", first_error);
+            s->hw_backend[0] = '\0';
+            copy_name(s->decoder, sizeof(s->decoder), d->ctx->codec->name);
+        }
+        if (ret >= 0) return d;
+        set_error(s->error, sizeof(s->error), "Open decoder", ret);
+        goto fail;
     }
     if (ret < 0) { set_error(s->error, sizeof(s->error), "Open decoder", ret); goto fail; }
     av_dict_free(&open_options);
@@ -828,15 +837,11 @@ int jv_decoder_audio_read(JVDecoder *d, float *out, int frames, double *pts) {
     return n;
 }
 
-static int reopen_codec_with(JVDecoder *d, const AVCodec *codec);
-
-// Recreates the video codec context with the options it was opened with:
-// for a V4L2 wrapper that drained to the end of the stream (FFmpeg's wrapper
-// has no flush and can't restart), or to drop the second view of MV-HEVC.
-static int reopen_codec_with(JVDecoder *d, const AVCodec *codec) {
-    AVStream *video = d->media->format->streams[d->media->video_stream];
+// One attempt at creating and opening the video codec context.
+static int open_codec_once(JVDecoder *d, const AVCodec *codec, AVStream *video) {
     AVDictionary *opts = NULL;
     avcodec_free_context(&d->ctx);
+    d->fed = 0;
     d->ctx = avcodec_alloc_context3(codec);
     if (!d->ctx) return AVERROR(ENOMEM);
     int ret = avcodec_parameters_to_context(d->ctx, video->codecpar);
@@ -848,12 +853,27 @@ static int reopen_codec_with(JVDecoder *d, const AVCodec *codec) {
     if (d->choice.hardware_wrapper) {
         int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
         av_dict_set_int(&opts, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
-        av_dict_set_int(&opts, "num_output_buffers", 16, 0);
+        av_dict_set_int(&opts, "num_output_buffers", 6, 0);
     }
     if (d->multiview) av_dict_set(&opts, "view_ids", "-1", 0);
     if (d->options) ret = av_dict_parse_string(&opts, d->options, "=", ":", 0);
     if (ret >= 0) ret = avcodec_open2(d->ctx, codec, &opts);
     av_dict_free(&opts);
+    return ret;
+}
+
+// Recreates the video codec context with the options it was opened with:
+// for a V4L2 wrapper that drained to the end of the stream (FFmpeg's wrapper
+// has no flush and can't restart), or to drop the second view of MV-HEVC.
+static int reopen_codec_with(JVDecoder *d, const AVCodec *codec) {
+    AVStream *video = d->media->format->streams[d->media->video_stream];
+    int ret = open_codec_once(d, codec, video);
+    // The hardware decoder can refuse a session while another one (the last
+    // video's, or the one just closed) is still being released: retry briefly.
+    for (int attempt = 0; ret < 0 && d->choice.hardware_wrapper && attempt < 2; attempt++) {
+        av_usleep(150000);
+        ret = open_codec_once(d, codec, video);
+    }
     d->flushing = 0;
     if (ret < 0 && d->choice.hardware_wrapper) {
         // The hardware decoder didn't come back (busy, out of memory, its
@@ -905,6 +925,7 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             continue;
         }
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
+        d->fed = 1;
         ret = avcodec_send_packet(d->ctx, d->packet);
         av_packet_unref(d->packet);
         if (ret < 0 && ret != AVERROR_INVALIDDATA && ret != AVERROR(EAGAIN) && d->multiview) {
@@ -927,7 +948,7 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     int64_t ts = start + (int64_t)(seconds / av_q2d(video->time_base));
     int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
-    if (d->choice.hardware_wrapper) {
+    if (d->choice.hardware_wrapper && d->fed) {
         // FFmpeg's V4L2 wrapper has no flush: after a seek it would keep
         // returning pictures from the old position, get fed mid-stream data
         // ("driver decode error"), and stall; drained at the end it can't

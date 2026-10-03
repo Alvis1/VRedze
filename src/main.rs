@@ -1106,6 +1106,9 @@ fn main() -> anyhow::Result<()> {
                 for i in 0..seeks {
                     // Spread over the video, jumping back and forth like scrubbing.
                     let target = duration * (0.05 + 0.85 * ((i as f64 * 0.618_034) % 1.0));
+                    // Like the player: pictures of the old position are let go
+                    // before the seek (the shown one was released once uploaded).
+                    held.clear();
                     let started = std::time::Instant::now();
                     decoder.seek(target)?;
                     let mut decoded = 0u32;

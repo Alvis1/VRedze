@@ -124,6 +124,26 @@ pub struct PlayStats {
     pub rendered_xr_frames: u64,
     pub media_seconds: f64,
     pub screenshot: Option<String>,
+    /// Time spent copying pictures to the GPU staging buffer, total and worst.
+    pub upload_seconds: f64,
+    pub upload_max_seconds: f64,
+    /// XR frames that came later than one display period after the last.
+    pub late_xr_frames: u64,
+}
+
+impl PlayStats {
+    /// One line for the log when a video stops.
+    pub fn summary(&self) -> String {
+        let uploads = self.uploaded_frames.max(1) as f64;
+        format!(
+            "{} pictures shown, {} skipped, {} XR frames late; upload {:.1} ms on average, {:.1} ms at worst",
+            self.displayed_frames,
+            self.skipped_frames,
+            self.late_xr_frames,
+            self.upload_seconds / uploads * 1e3,
+            self.upload_max_seconds * 1e3,
+        )
+    }
 }
 
 enum Decoded {
@@ -248,9 +268,9 @@ fn spawn_decoder(
     // A few frames of slack absorb decode jitter; more would only cost memory.
     // A hardware (V4L2) decoder's pictures live in its few capture buffers,
     // and it stalls when we hold too many of them (it needs about four free
-    // for reference pictures): then only one waits in the queue, so at most
-    // three (shown, next, queued) are held while it decodes.
-    let slack = if decoder.stats().hw_backend.is_some() { 1 } else { 4 };
+    // for reference pictures). The shown picture is released once uploaded,
+    // so with two queued at most three (next, queued) are held while it decodes.
+    let slack = if decoder.stats().hw_backend.is_some() { 2 } else { 4 };
     let (tx, frames) = mpsc::sync_channel(slack);
     let (control, commands) = mpsc::channel::<(u64, f64)>();
     let requested = Arc::new(AtomicU64::new(0));
@@ -259,6 +279,13 @@ fn spawn_decoder(
         .name("decode".into())
         .spawn(move || {
             let (mut generation, mut start) = (0u64, start);
+            // Resuming: jump to the keyframe before the resume point instead
+            // of decoding everything before it.
+            if start > 0.0
+                && let Err(e) = decoder.seek(start)
+            {
+                eprintln!("Seek to {start:.1}s failed: {e:#}");
+            }
             'decode: loop {
                 // Before seeks: the seek that follows a switch restarts the new track.
                 while let Ok(track) = audio_changes.try_recv() {
@@ -322,6 +349,11 @@ fn spawn_decoder(
                 if let Decoded::Frame(_, frame) = &message
                     && frame.pts().is_some_and(|t| t < start)
                 {
+                    continue;
+                }
+                // A seek arrived while this was decoding: drop it, so no picture
+                // of the old position keeps its decoder session alive.
+                if pending.load(Ordering::Relaxed) != generation {
                     continue;
                 }
                 let finished = !matches!(message, Decoded::Frame(..));
@@ -478,6 +510,8 @@ pub struct Playback {
     pub views: u32,
     /// A picture was shown since the start or the last seek.
     shown_since_seek: bool,
+    /// A picture was uploaded and released: it is on screen.
+    showing: bool,
     pub duration: f64,
     last_pts: f64,
     /// Display time (ns) corresponding to media time 0.
@@ -581,6 +615,7 @@ impl Playback {
             fps,
             views,
             shown_since_seek: false,
+            showing: false,
             duration,
             last_pts: start - 1.0 / fps,
             clock_start: None,
@@ -726,6 +761,19 @@ impl Playback {
         }
     }
 
+    /// The picture was copied to the GPU: let go of it, returning its
+    /// decoder buffer (a hardware decoder has few). It stays on screen.
+    pub fn uploaded(&mut self) {
+        if self.current.take().is_some() {
+            self.showing = true;
+        }
+    }
+
+    /// Whether a picture is on screen.
+    pub fn showing(&self) -> bool {
+        self.showing || self.current.is_some()
+    }
+
     pub fn current(&self) -> Option<&Picture> {
         self.current.as_ref()
     }
@@ -791,6 +839,9 @@ impl Playback {
             audio.generation.store(self.generation, Ordering::Relaxed);
             *audio.clock.lock().expect("audio clock") = None;
         }
+        // Drop queued pictures of the old position first, so their decoder
+        // session can close before the decoder opens a new one.
+        while self.decode.frames.try_recv().is_ok() {}
         let _ = self.decode.control.send((self.generation, target));
         self.next = None;
         self.ended = false;
