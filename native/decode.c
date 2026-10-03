@@ -107,8 +107,19 @@ int jv_decode(const char *path, const char *backend, const char *device,
         int multilayer = (video->disposition & AV_DISPOSITION_MULTILAYER) ||
                          (video->codecpar->codec_id == AV_CODEC_ID_HEVC &&
                           video->codecpar->profile == AV_PROFILE_HEVC_MULTIVIEW_MAIN);
-        if (!desc || desc->comp[0].depth != 8 || multilayer) {
-            ret = fail(r, "The V4L2 decoder only gets 8-bit single-layer video", AVERROR(ENOSYS));
+        int profile = video->codecpar->profile;
+        int eight_bit_profile =
+            profile == AV_PROFILE_UNKNOWN ||
+            (video->codecpar->codec_id == AV_CODEC_ID_HEVC &&
+             (profile == AV_PROFILE_HEVC_MAIN || profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE)) ||
+            (video->codecpar->codec_id == AV_CODEC_ID_H264 &&
+             ((profile & 0xff) == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_MAIN ||
+              profile == AV_PROFILE_H264_EXTENDED || profile == AV_PROFILE_H264_HIGH));
+        if (!desc || desc->comp[0].depth != 8 || desc->log2_chroma_w != 1 ||
+            desc->log2_chroma_h != 1 || !eight_bit_profile || multilayer ||
+            video->codecpar->width > 8192 || video->codecpar->height > 8192) {
+            ret = fail(r, "The V4L2 decoder only gets 8-bit 4:2:0 single-layer video up to 8192 px",
+                       AVERROR(ENOSYS));
             goto done;
         }
     }
@@ -154,7 +165,14 @@ int jv_decode(const char *path, const char *backend, const char *device,
         if (!ctx->hw_device_ctx) { ret = fail(r, "Reference hardware device", AVERROR(ENOMEM)); goto done; }
         ctx->get_format = hardware_only;
     }
-    ret = avcodec_open2(ctx, codec, NULL);
+    AVDictionary *codec_options = NULL;
+    if (state.dedicated_v4l2) {
+        // FFmpeg's default 20 capture buffers fail to allocate (ENOMEM) at 8K.
+        int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+        av_dict_set_int(&codec_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 8, 0);
+    }
+    ret = avcodec_open2(ctx, codec, &codec_options);
+    av_dict_free(&codec_options);
     if (ret < 0) { fail(r, "Open hardware decoder", ret); goto done; }
     start = av_gettime_relative();
     while (r->frames < frame_limit) {

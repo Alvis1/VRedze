@@ -246,7 +246,12 @@ fn spawn_decoder(
     let (subtitle_track, subtitle_changes) = mpsc::channel::<Option<usize>>();
     let (audio_track, audio_changes) = mpsc::channel::<usize>();
     // A few frames of slack absorb decode jitter; more would only cost memory.
-    let (tx, frames) = mpsc::sync_channel(4);
+    // A hardware (V4L2) decoder's pictures live in its few capture buffers,
+    // and it stalls when we hold too many of them (it needs about four free
+    // for reference pictures): then only one waits in the queue, so at most
+    // three (shown, next, queued) are held while it decodes.
+    let slack = if decoder.stats().hw_backend.is_some() { 1 } else { 4 };
+    let (tx, frames) = mpsc::sync_channel(slack);
     let (control, commands) = mpsc::channel::<(u64, f64)>();
     let requested = Arc::new(AtomicU64::new(0));
     let pending = requested.clone();
@@ -261,7 +266,12 @@ fn spawn_decoder(
                         eprintln!("Audio: can't decode track {track}");
                     }
                 }
-                while let Ok((g, t)) = commands.try_recv() {
+                // Only the latest of several seeks matters (scrubbing sends many).
+                let mut seek = None;
+                while let Ok(command) = commands.try_recv() {
+                    seek = Some(command);
+                }
+                if let Some((g, t)) = seek {
                     if let Err(e) = decoder.seek(t) {
                         eprintln!("Seek to {t:.1}s failed: {e:#}");
                     }
@@ -757,6 +767,14 @@ impl Playback {
         if let Some(audio) = &self.audio {
             audio.paused.store(self.paused(), Ordering::Relaxed);
         }
+    }
+
+    /// Ends playback with an error (shown on returning to the browser).
+    pub fn fail(&mut self, message: String) {
+        eprintln!("Playback stopped: {message}");
+        self.error = Some(message);
+        self.ended = true;
+        self.next = None;
     }
 
     /// Jumps to `seconds`; the current picture stays until the new one arrives.

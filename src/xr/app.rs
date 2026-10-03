@@ -936,7 +936,7 @@ pub fn run(
                     cursor_at = Some((BROWSER_PANEL, x, y));
                 }
                 set_phase(6);
-                renderer.begin_frame(None)?;
+                renderer.begin_frame(None, 1)?;
                 for (eye, _) in views.iter().enumerate() {
                     let target = &mut renderer.eyes[eye];
                     let index = target.swapchain.acquire_image()?;
@@ -1358,8 +1358,20 @@ pub fn run(
                     );
                 }
                 set_phase(6);
-                let upload = playback.advance(now);
-                renderer.begin_frame(if upload { playback.current() } else { None })?;
+                let mut upload = playback.advance(now);
+                // A picture the GPU can't hold ends this video (back to the
+                // browser with the reason), not the whole app.
+                if upload
+                    && let Some(picture) = playback.current()
+                    && let Err(e) = renderer.fits(picture, playback.views)
+                {
+                    playback.fail(format!("{e:#}"));
+                    upload = false;
+                }
+                renderer.begin_frame(
+                    if upload { playback.current() } else { None },
+                    playback.views,
+                )?;
                 if upload {
                     playback.stats.uploaded_frames += 1;
                 }

@@ -279,6 +279,16 @@ static int attach_hardware(AVCodecContext *ctx, const AVCodec *codec, const char
     return ctx->hw_device_ctx ? 0 : AVERROR(ENOMEM);
 }
 
+// Profiles that only allow 8-bit 4:2:0 pictures.
+static int eight_bit_profile(enum AVCodecID id, int profile) {
+    if (id == AV_CODEC_ID_H264)
+        return (profile & 0xff) == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_MAIN ||
+               profile == AV_PROFILE_H264_EXTENDED || profile == AV_PROFILE_H264_HIGH;
+    if (id == AV_CODEC_ID_HEVC)
+        return profile == AV_PROFILE_HEVC_MAIN || profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE;
+    return 0;
+}
+
 // Why the V4L2 stateful decoder (Qualcomm iris on Steam Frame) must not get
 // this stream, or NULL if it may. Allow-list: only streams positively known to
 // be 8-bit 4:2:0 within the advertised size. On SteamOS 0.3 / kernel 6.18,
@@ -292,6 +302,12 @@ static const char *v4l2_unsuitable(const AVStream *st) {
         return "spatial (MV-HEVC) video needs both views, which only the software decoder outputs";
     if (par->width <= 0 || par->height <= 0 || par->width > 8192 || par->height > 8192)
         return "frame size outside the hardware decoder's 8192x8192 limit";
+    // The pixel format comes from the first pictures only. A known profile
+    // outside the 8-bit 4:2:0 ones (e.g. Main 10) means later pictures may be
+    // 10-bit, which crashes the firmware: then the CPU decodes it.
+    int profile = par->profile;
+    if (profile != AV_PROFILE_UNKNOWN && !eight_bit_profile(par->codec_id, profile))
+        return "the stream's profile allows more than 8 bits, so the hardware decoder isn't used, to be safe";
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
     if (desc) {
         if (desc->comp[0].depth != 8)
@@ -301,19 +317,16 @@ static const char *v4l2_unsuitable(const AVStream *st) {
         return NULL;
     }
     // No pixel format in the headers: trust only 8-bit 4:2:0 profiles.
-    int profile = par->profile;
-    int eight_bit =
-        (par->codec_id == AV_CODEC_ID_H264 &&
-         ((profile & 0xff) == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_MAIN ||
-          profile == AV_PROFILE_H264_EXTENDED || profile == AV_PROFILE_H264_HIGH)) ||
-        (par->codec_id == AV_CODEC_ID_HEVC &&
-         (profile == AV_PROFILE_HEVC_MAIN || profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE));
-    return eight_bit ? NULL : "cannot confirm the stream is 8-bit, so the hardware decoder is not used";
+    return eight_bit_profile(par->codec_id, profile)
+               ? NULL
+               : "cannot confirm the stream is 8-bit, so the hardware decoder is not used";
 }
 
 struct JVDecoder {
     JVMedia *media;
     AVCodecContext *ctx;
+    char *options;       // the caller's decoder options, for reopening
+    int multiview;       // decoding every view of MV-HEVC (view_ids=-1)
     AVBufferRef *device;
     AVPacket *packet;
     AVFrame *transfer;  // scratch for hwaccel -> CPU transfers
@@ -551,6 +564,7 @@ int jv_decoder_subtitle_read(JVDecoder *d, JVSubtitleCue *out) {
 
 void jv_decoder_close(JVDecoder *d) {
     if (!d) return;
+    av_free(d->options);
     drop_cues(d);
     avcodec_free_context(&d->subtitle);
     avcodec_free_context(&d->audio);
@@ -589,8 +603,14 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     if (hw_backend && is_multilayer(video)) {
         // Hardware decoders (V4L2, Vulkan video) output only the base layer:
         // spatial video needs FFmpeg's own decoder for both views.
-        copy_name(s->note, sizeof(s->note),
-                  "spatial (MV-HEVC) video needs both views, which only the software decoder outputs");
+        static const char why[] =
+            "spatial (MV-HEVC) video needs both views, which only the software decoder outputs";
+        if (!allow_software) {
+            ret = AVERROR(ENOSYS);
+            snprintf(s->error, sizeof(s->error), "%s", why);
+            goto fail;
+        }
+        copy_name(s->note, sizeof(s->note), why);
         hw_backend = NULL;
         codec = avcodec_find_decoder(id);
     }
@@ -609,9 +629,9 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             d->choice.hardware_wrapper = 1;
             copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
             // FFmpeg's default of 20 capture buffers fails to allocate (ENOMEM)
-            // above 4096x2304; the iris driver copes with 8 or fewer at any size.
+            // above 4096x2304; 8 work up to 8K, and smaller frames can have more.
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 8, 0);
+            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
             av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
@@ -650,10 +670,12 @@ reopen:
     copy_name(s->decoder, sizeof(s->decoder), codec->name);
     // MV-HEVC: output every view (by default FFmpeg decodes only the base one).
     // Only FFmpeg's own hevc decoder has the option.
-    if (!d->choice.hardware_wrapper && id == AV_CODEC_ID_HEVC && is_multilayer(video) &&
-        !strcmp(codec->name, "hevc"))
-        av_dict_set(&open_options, "view_ids", "-1", 0);
+    d->multiview = !d->choice.hardware_wrapper && !d->device && id == AV_CODEC_ID_HEVC &&
+                   is_multilayer(video) && !strcmp(codec->name, "hevc");
+    if (d->multiview) av_dict_set(&open_options, "view_ids", "-1", 0);
     if (decoder_options && *decoder_options) {
+        av_free(d->options);
+        d->options = av_strdup(decoder_options);
         ret = av_dict_parse_string(&open_options, decoder_options, "=", ":", 0);
         if (ret < 0) { set_error(s->error, sizeof(s->error), "Parse decoder options", ret); goto fail; }
     }
@@ -806,6 +828,47 @@ int jv_decoder_audio_read(JVDecoder *d, float *out, int frames, double *pts) {
     return n;
 }
 
+static int reopen_codec_with(JVDecoder *d, const AVCodec *codec);
+
+// Recreates the video codec context with the options it was opened with:
+// for a V4L2 wrapper that drained to the end of the stream (FFmpeg's wrapper
+// has no flush and can't restart), or to drop the second view of MV-HEVC.
+static int reopen_codec_with(JVDecoder *d, const AVCodec *codec) {
+    AVStream *video = d->media->format->streams[d->media->video_stream];
+    AVDictionary *opts = NULL;
+    avcodec_free_context(&d->ctx);
+    d->ctx = avcodec_alloc_context3(codec);
+    if (!d->ctx) return AVERROR(ENOMEM);
+    int ret = avcodec_parameters_to_context(d->ctx, video->codecpar);
+    if (ret < 0) return ret;
+    d->ctx->pkt_timebase = video->time_base;
+    d->ctx->opaque = &d->choice;
+    d->ctx->get_format = choose_format;
+    d->ctx->thread_count = 0;
+    if (d->choice.hardware_wrapper) {
+        int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+        av_dict_set_int(&opts, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
+        av_dict_set_int(&opts, "num_output_buffers", 16, 0);
+    }
+    if (d->multiview) av_dict_set(&opts, "view_ids", "-1", 0);
+    if (d->options) ret = av_dict_parse_string(&opts, d->options, "=", ":", 0);
+    if (ret >= 0) ret = avcodec_open2(d->ctx, codec, &opts);
+    av_dict_free(&opts);
+    d->flushing = 0;
+    if (ret < 0 && d->choice.hardware_wrapper) {
+        // The hardware decoder didn't come back (busy, out of memory, its
+        // firmware recovering): carry on with the CPU rather than stop.
+        const AVCodec *software = avcodec_find_decoder(video->codecpar->codec_id);
+        d->choice.hardware_wrapper = 0;
+        if (software) return reopen_codec_with(d, software);
+    }
+    return ret;
+}
+
+static int reopen_codec(JVDecoder *d) {
+    return reopen_codec_with(d, d->ctx->codec);
+}
+
 int jv_decoder_next(JVDecoder *d, JVFrame *out) {
     AVFrame *frame = av_frame_alloc();
     if (!frame) return AVERROR(ENOMEM);
@@ -815,6 +878,13 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
             ret = describe_frame(d, frame, out);
             if (ret < 0) av_frame_free(&frame);
             return ret;
+        }
+        if (ret != AVERROR(EAGAIN) && ret != AVERROR_EOF && d->multiview) {
+            // The second view has parameters FFmpeg can't decode (ENOSYS,
+            // PATCHWELCOME): carry on with the base view alone, from the next
+            // keyframe, rather than stop playback.
+            d->multiview = 0;
+            if (reopen_codec(d) >= 0) continue;
         }
         if (ret != AVERROR(EAGAIN)) { av_frame_free(&frame); return ret; }  // EOF or error
         ret = av_read_frame(d->media->format, d->packet);
@@ -837,6 +907,10 @@ int jv_decoder_next(JVDecoder *d, JVFrame *out) {
         if (d->packet->stream_index != d->media->video_stream) { av_packet_unref(d->packet); continue; }
         ret = avcodec_send_packet(d->ctx, d->packet);
         av_packet_unref(d->packet);
+        if (ret < 0 && ret != AVERROR_INVALIDDATA && ret != AVERROR(EAGAIN) && d->multiview) {
+            d->multiview = 0;  // as above: the base view alone
+            if (reopen_codec(d) >= 0) continue;
+        }
         // A damaged packet costs a glitch, not the whole playback.
         if (ret < 0 && ret != AVERROR_INVALIDDATA) { av_frame_free(&frame); return ret; }
     }
@@ -853,6 +927,14 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     int64_t ts = start + (int64_t)(seconds / av_q2d(video->time_base));
     int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
+    if (d->choice.hardware_wrapper) {
+        // FFmpeg's V4L2 wrapper has no flush: after a seek it would keep
+        // returning pictures from the old position, get fed mid-stream data
+        // ("driver decode error"), and stall; drained at the end it can't
+        // restart at all. A fresh session starts cleanly at the keyframe.
+        ret = reopen_codec(d);
+        if (ret < 0) return ret;
+    }
     avcodec_flush_buffers(d->ctx);
     if (d->audio) {
         avcodec_flush_buffers(d->audio);

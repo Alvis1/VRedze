@@ -752,6 +752,8 @@ pub trait ViewTagged {
     fn view_id(&self) -> Option<u32>;
     fn eye(&self) -> Option<Eye>;
     fn pts(&self) -> Option<f64>;
+    /// Width, height, plane layout and bit depth: views of one picture match.
+    fn shape(&self) -> (u32, u32, PlaneLayout, u32);
 }
 
 impl ViewTagged for Frame {
@@ -764,10 +766,13 @@ impl ViewTagged for Frame {
     fn pts(&self) -> Option<f64> {
         Frame::pts(self)
     }
+    fn shape(&self) -> (u32, u32, PlaneLayout, u32) {
+        (self.width(), self.height(), self.layout(), self.bits())
+    }
 }
 
 /// One moment of video: a single picture, or for spatial (MV-HEVC) video the
-/// two views decoded from the same access unit.
+/// two views decoded from the same access unit (always the same shape).
 pub enum Picture<F = Frame> {
     Mono(F),
     Stereo { left: F, right: F },
@@ -799,9 +804,11 @@ impl<F: ViewTagged> Picture<F> {
 /// frames themselves don't.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewHints {
-    /// Eye of the view with the lower id (the base layer) and the higher one.
+    /// Eye of the base view and of the second one.
     pub view_eyes: [Option<Eye>; 2],
     pub primary_eye: Option<Eye>,
+    /// The container says the views are stored right eye first.
+    pub order_reversed: bool,
 }
 
 /// Pairs consecutive views of the same access unit (same pts, different
@@ -840,7 +847,9 @@ impl<F: ViewTagged> ViewPairer<F> {
             (Some(a), Some(b)) => (a - b).abs() < 1e-6,
             _ => false,
         };
-        if same_time && held.view_id() != frame.view_id() {
+        // Views of different shapes can't share a texture (a damaged stream):
+        // they are shown one at a time instead.
+        if same_time && held.view_id() != frame.view_id() && held.shape() == frame.shape() {
             let (left, right) = self.eyes(held, frame);
             return Some(Picture::Stereo { left, right });
         }
@@ -859,27 +868,27 @@ impl<F: ViewTagged> ViewPairer<F> {
         self.held = None;
     }
 
-    /// (left, right) for two views of one picture. Evidence, strongest first:
-    /// the frames' own eye tags, the container's view positions, the hero eye
-    /// being the base layer, and finally base layer = left.
-    fn eyes(&self, a: F, b: F) -> (F, F) {
-        let a_is_left = match (a.eye(), b.eye()) {
+    /// (left, right) for the two views of one picture, `base` being the one
+    /// FFmpeg output first (the base layer). Evidence, strongest first: the
+    /// frames' own eye tags, the container's view positions, the hero eye,
+    /// and finally the stored order (base = left unless marked reversed).
+    fn eyes(&self, base: F, second: F) -> (F, F) {
+        let base_is_left = match (base.eye(), second.eye()) {
             (Some(Eye::Left), _) | (_, Some(Eye::Right)) => true,
             (Some(Eye::Right), _) | (_, Some(Eye::Left)) => false,
             _ => {
-                // The base layer has the lower view id.
-                let a_is_base = a.view_id() <= b.view_id();
+                let fallback = if self.hints.order_reversed { Eye::Right } else { Eye::Left };
                 let base_eye = match self.hints.view_eyes {
                     [Some(eye), _] => Some(eye),
                     [None, Some(Eye::Left)] => Some(Eye::Right),
                     [None, Some(Eye::Right)] => Some(Eye::Left),
                     _ => self.hints.primary_eye,
                 }
-                .unwrap_or(Eye::Left);
-                a_is_base == (base_eye == Eye::Left)
+                .unwrap_or(fallback);
+                base_eye == Eye::Left
             }
         };
-        if a_is_left { (a, b) } else { (b, a) }
+        if base_is_left { (base, second) } else { (second, base) }
     }
 }
 
@@ -922,6 +931,7 @@ impl Media {
         let hints = self.info.video.as_ref().map_or(ViewHints::default(), |v| ViewHints {
             view_eyes: v.view_eyes,
             primary_eye: v.primary_eye,
+            order_reversed: v.stereo_inverted,
         });
         Ok(VideoDecoder {
             raw: decoder,
@@ -1115,6 +1125,11 @@ mod tests {
         fn pts(&self) -> Option<f64> {
             Some(self.pts)
         }
+        fn shape(&self) -> (u32, u32, PlaneLayout, u32) {
+            // Views with id 9 are a different size (a damaged stream).
+            let width = if self.id == Some(9) { 3840 } else { 1920 };
+            (width, 1080, PlaneLayout::Planar, 8)
+        }
     }
 
     fn view(id: u32, pts: f64) -> View {
@@ -1144,6 +1159,7 @@ mod tests {
         let mut pairer = ViewPairer::new(ViewHints {
             view_eyes: [Some(Eye::Left), Some(Eye::Right)],
             primary_eye: Some(Eye::Left),
+            order_reversed: false,
         });
         let tagged = |id, eye| View { id: Some(id), eye: Some(eye), pts: 0.0 };
         pairer.push(tagged(0, Eye::Right));
@@ -1154,8 +1170,8 @@ mod tests {
     fn container_hints_place_the_base_layer() {
         // Hero eye right: the base layer is the right eye.
         let mut pairer = ViewPairer::new(ViewHints {
-            view_eyes: [None, None],
             primary_eye: Some(Eye::Right),
+            ..Default::default()
         });
         pairer.push(view(0, 0.0));
         assert_eq!(stereo(pairer.push(view(1, 0.0))), (1, 0));
@@ -1163,9 +1179,38 @@ mod tests {
         let mut pairer = ViewPairer::new(ViewHints {
             view_eyes: [None, Some(Eye::Right)],
             primary_eye: Some(Eye::Right),
+            ..Default::default()
         });
         pairer.push(view(0, 0.0));
         assert_eq!(stereo(pairer.push(view(1, 0.0))), (0, 1));
+        // The base layer is the first view output, whatever its id.
+        let mut pairer = ViewPairer::new(ViewHints::default());
+        pairer.push(view(1, 0.0));
+        assert_eq!(stereo(pairer.push(view(0, 0.0))), (1, 0));
+    }
+
+    #[test]
+    fn reversed_order_only_changes_the_last_guess() {
+        let reversed = ViewHints {
+            order_reversed: true,
+            ..Default::default()
+        };
+        let mut pairer = ViewPairer::new(reversed);
+        pairer.push(view(0, 0.0));
+        assert_eq!(stereo(pairer.push(view(1, 0.0))), (1, 0), "base is the right eye");
+        // Frames that say which eye they are win over the flag.
+        let mut pairer = ViewPairer::new(reversed);
+        let tagged = |id, eye| View { id: Some(id), eye: Some(eye), pts: 0.0 };
+        pairer.push(tagged(0, Eye::Left));
+        assert_eq!(stereo(pairer.push(tagged(1, Eye::Right))), (0, 1));
+    }
+
+    #[test]
+    fn views_of_different_shapes_are_not_paired() {
+        let mut pairer = ViewPairer::new(ViewHints::default());
+        pairer.push(view(0, 0.0));
+        assert!(matches!(pairer.push(view(9, 0.0)), Some(Picture::Mono(_))));
+        assert!(matches!(pairer.flush(), Some(Picture::Mono(_))));
     }
 
     #[test]

@@ -163,6 +163,14 @@ enum Command {
         /// FFmpeg decoder option, repeatable: --decoder-opt threads=8 --decoder-opt thread_type=frame
         #[arg(long = "decoder-opt", value_name = "KEY=VALUE")]
         decoder_opts: Vec<String>,
+        /// Instead of decoding through, seek this many times across the video
+        /// and report how long each takes to reach its target picture.
+        #[arg(long, default_value_t = 0)]
+        seeks: u32,
+        /// With --seeks: keep this many decoded pictures alive, as the player
+        /// does (on screen, next, queued), to check the decoder never starves.
+        #[arg(long, default_value_t = 4)]
+        hold: usize,
         #[command(flatten)]
         read_ahead: ReadAheadArgs,
     },
@@ -1082,11 +1090,51 @@ fn main() -> anyhow::Result<()> {
             hw,
             hw_only,
             decoder_opts,
+            seeks,
+            hold,
             read_ahead,
         } => {
             let (source, _session) = open_input(&input, read_ahead.get())?;
             let mut media = Media::open(file_name(&input), source)?;
             let backend = hw_backend(hw);
+            if seeks > 0 {
+                let info = media.info().clone();
+                let mut decoder = media.into_decoder(backend, !hw_only, &decoder_opts.join(":"))?;
+                let duration = info.duration_seconds.max(1.0);
+                let mut held = std::collections::VecDeque::new();
+                let mut times = Vec::new();
+                for i in 0..seeks {
+                    // Spread over the video, jumping back and forth like scrubbing.
+                    let target = duration * (0.05 + 0.85 * ((i as f64 * 0.618_034) % 1.0));
+                    let started = std::time::Instant::now();
+                    decoder.seek(target)?;
+                    let mut decoded = 0u32;
+                    while let Some(picture) = decoder.next_picture()? {
+                        decoded += 1;
+                        let pts = picture.pts().unwrap_or(target);
+                        held.push_back(picture);
+                        while held.len() > hold {
+                            held.pop_front();
+                        }
+                        if pts >= target - 0.001 {
+                            break;
+                        }
+                    }
+                    let seconds = started.elapsed().as_secs_f64();
+                    eprintln!("seek {i}: {target:.1} s in {:.0} ms ({decoded} pictures)", seconds * 1e3);
+                    times.push(seconds);
+                }
+                let mean = times.iter().sum::<f64>() / times.len() as f64;
+                let max = times.iter().cloned().fold(0.0, f64::max);
+                print(json!({
+                    "decoder": decoder.stats(),
+                    "seeks": seeks,
+                    "held_pictures": hold,
+                    "mean_seek_ms": mean * 1e3,
+                    "max_seek_ms": max * 1e3,
+                }))?;
+                return Ok(());
+            }
             let stats = media.decode(backend, !hw_only, &decoder_opts.join(":"), frames)?;
             let fps = media.info().video.as_ref().map_or(0.0, |v| v.fps);
             let realtime = if fps > 0.0 {

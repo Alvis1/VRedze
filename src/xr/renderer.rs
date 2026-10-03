@@ -678,24 +678,23 @@ impl Renderer {
     /// for spatial video the left view into the left half of each plane
     /// texture and the right view into the right half. Must be called between
     /// `begin_frame` and `draw_eye`.
-    fn record_upload(&mut self, picture: &Picture) -> anyhow::Result<()> {
+    fn record_upload(&mut self, picture: &Picture, coded_views: u32) -> anyhow::Result<()> {
         let views = picture.views();
         let frame = views[0];
-        // A lone view of spatial video (its partner was lost) goes to both
-        // halves, rather than recreating the textures for one picture.
-        let slots = if views.len() == 1
-            && self.video.as_ref().is_some_and(|v| {
-                v.key.views == 2
-                    && v.key.width == frame.width() * 2
-                    && v.key.height == frame.height()
-                    && v.key.layout == frame.layout()
-                    && v.key.bits == frame.bits()
-            }) {
-            2
-        } else {
-            views.len()
+        // Spatial video always fills two halves: a lone view (its partner was
+        // lost) goes to both. Every other video has one.
+        let slots = if coded_views >= 2 { 2 } else { 1 };
+        let same_shape = |f: &Frame| {
+            (f.width(), f.height(), f.layout(), f.bits())
+                == (frame.width(), frame.height(), frame.layout(), frame.bits())
         };
-        let sources: Vec<&Frame> = (0..slots).map(|i| views[i.min(views.len() - 1)]).collect();
+        // Every source matches `frame`'s shape, which sizes the staging buffer.
+        let sources: Vec<&Frame> = (0..slots)
+            .map(|i| match views.get(i) {
+                Some(&view) if same_shape(view) => view,
+                _ => frame,
+            })
+            .collect();
         self.ensure_video_textures(frame, slots as u32)?;
         let bytes = frame.bytes_per_sample();
         let total: u64 = (0..frame.plane_count())
@@ -883,8 +882,29 @@ impl Renderer {
         self.video.is_some()
     }
 
-    /// Starts recording a frame; uploads `picture` first when it changed.
-    pub fn begin_frame(&mut self, upload: Option<&Picture>) -> anyhow::Result<()> {
+    /// Whether a picture of a video with `coded_views` views fits the GPU's
+    /// textures (two spatial views side by side can be too wide).
+    pub fn fits(&self, picture: &Picture, coded_views: u32) -> anyhow::Result<()> {
+        let frame = picture.first();
+        let width = frame.width() * coded_views.clamp(1, 2);
+        if width > self.max_texture_size || frame.height() > self.max_texture_size {
+            anyhow::bail!(
+                "This video is too large for the headset's GPU: {}×{} is over its {} px texture limit.",
+                width,
+                frame.height(),
+                self.max_texture_size
+            );
+        }
+        Ok(())
+    }
+
+    /// Starts recording a frame; uploads `picture` (of a video with
+    /// `coded_views` views) first when it changed.
+    pub fn begin_frame(
+        &mut self,
+        upload: Option<&Picture>,
+        coded_views: u32,
+    ) -> anyhow::Result<()> {
         self.begin_commands()?;
         // Corrections change without a new frame (e.g. while paused).
         // SAFETY: the mapped uniform holds a whole ColorParams.
@@ -895,7 +915,7 @@ impl Renderer {
             }
         }
         if let Some(picture) = upload {
-            self.record_upload(picture)?;
+            self.record_upload(picture, coded_views)?;
         }
         Ok(())
     }
