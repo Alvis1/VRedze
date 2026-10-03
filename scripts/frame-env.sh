@@ -33,7 +33,7 @@ frame_ssh() { ssh "${FRAME_SSH_OPTS[@]}" "$FRAME_TARGET" "$@"; }
 # key and known_hosts paths reliably. Give it a generated wrapper instead.
 frame_ssh_wrapper() {
   local wrapper
-  wrapper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.local-deps/frame-ssh"
+  wrapper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.local-deps/frame-ssh-wrapper"
   mkdir -p "$(dirname "$wrapper")"
   { printf '#!/bin/sh\nexec ssh'; printf ' %q' "${FRAME_SSH_OPTS[@]}"; printf ' "$@"\n'; } > "$wrapper"
   chmod +x "$wrapper"
