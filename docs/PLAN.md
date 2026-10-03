@@ -57,3 +57,19 @@ Companion tool: `tools/spatial2sbs.sh` converts MV-HEVC to side-by-side on the M
 - `cargo test` on macOS for parsing, layout detection, eye mapping.
 - On the Frame over SSH: decode benchmarks and logs. Visual checks need the user in the
   headset (the session only reaches FOCUSED when worn).
+
+## Status (2026-10-04)
+
+- M1 baseline, M3 Apple spatial video: done; loop video/folder buttons; panels face the eyes.
+- Hardware seeking: a fresh V4L2 session per seek, ≤ 3 pictures held, coalesced seeks
+  (`just-video bench --seeks 20 --hold 3`: 8K seeks ~240 ms, no stalls).
+
+## Known limitations
+
+- The iris gate trusts the stream headers: a file whose *later* pictures switch to 10-bit
+  under an 8-bit profile (spliced streams) would still reach the hardware decoder. A
+  per-packet SPS check (av_parser) before feeding iris would close this; planned with the
+  own V4L2 client (M4).
+- MV-HEVC detection relies on the MOV/MP4 `lhvC` box; MV-HEVC in MKV/TS plays as 2D.
+- Apple Immersive (parametric immersive) is drawn as an equidistant fisheye (FFmpeg
+  exports no lens parameters).
