@@ -10,7 +10,15 @@
 #include <libavutil/stereo3d.h>
 #include <libavutil/time.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/display.h>
+#include <libavutil/opt.h>
 #include <libswresample/swresample.h>
+
+// MV-HEVC (Apple spatial video) decoding, its view and stereo metadata and
+// the Apple Projected Media Profile projections arrived in FFmpeg 7.1.
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(61, 19, 100)
+#error "FFmpeg 7.1 or newer is required"
+#endif
 
 #define IO_BUFFER_SIZE (256 * 1024)
 
@@ -62,6 +70,28 @@ static int64_t io_seek(void *opaque, int64_t offset, int whence) {
     return cb->seek(cb->opaque, offset, whence & ~AVSEEK_FORCE);
 }
 
+size_t jv_media_info_size(void) { return sizeof(JVMediaInfo); }
+size_t jv_frame_size(void) { return sizeof(JVFrame); }
+
+static int32_t eye_of(int view) {
+    return view == AV_STEREO3D_VIEW_LEFT ? JV_EYE_LEFT
+         : view == AV_STEREO3D_VIEW_RIGHT ? JV_EYE_RIGHT
+         : JV_EYE_UNKNOWN;
+}
+
+static int32_t projection_kind(enum AVSphericalProjection projection) {
+    switch (projection) {
+    case AV_SPHERICAL_EQUIRECTANGULAR:        return JV_PROJECTION_EQUIRECT;
+    case AV_SPHERICAL_EQUIRECTANGULAR_TILE:   return JV_PROJECTION_EQUIRECT_TILE;
+    case AV_SPHERICAL_HALF_EQUIRECTANGULAR:   return JV_PROJECTION_HALF_EQUIRECT;
+    case AV_SPHERICAL_RECTILINEAR:            return JV_PROJECTION_RECTILINEAR;
+    case AV_SPHERICAL_FISHEYE:                return JV_PROJECTION_FISHEYE;
+    case AV_SPHERICAL_PARAMETRIC_IMMERSIVE:   return JV_PROJECTION_PARAMETRIC_IMMERSIVE;
+    case AV_SPHERICAL_CUBEMAP:                return JV_PROJECTION_CUBEMAP;
+    default:                                  return JV_PROJECTION_NONE;
+    }
+}
+
 static void describe_vr(const AVCodecParameters *par, JVMediaInfo *info) {
     const AVPacketSideData *sd = av_packet_side_data_get(
         par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_STEREO3D);
@@ -69,16 +99,77 @@ static void describe_vr(const AVCodecParameters *par, JVMediaInfo *info) {
         const AVStereo3D *stereo = (const AVStereo3D *)sd->data;
         copy_name(info->stereo_mode, sizeof(info->stereo_mode), av_stereo3d_type_name(stereo->type));
         info->stereo_inverted = !!(stereo->flags & AV_STEREO3D_FLAG_INVERT);
+        info->primary_eye = stereo->primary_eye == AV_PRIMARY_EYE_LEFT ? JV_EYE_LEFT
+                          : stereo->primary_eye == AV_PRIMARY_EYE_RIGHT ? JV_EYE_RIGHT
+                          : JV_EYE_UNKNOWN;
+        info->baseline_um = stereo->baseline;
+        if (stereo->horizontal_disparity_adjustment.den)
+            info->disparity_adjustment = av_q2d(stereo->horizontal_disparity_adjustment);
+        if (stereo->horizontal_field_of_view.den)
+            info->hfov_degrees = av_q2d(stereo->horizontal_field_of_view);
     }
     sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_SPHERICAL);
     if (sd) {
         const AVSphericalMapping *map = (const AVSphericalMapping *)sd->data;
         copy_name(info->projection, sizeof(info->projection), av_spherical_projection_name(map->projection));
+        info->projection_kind = projection_kind(map->projection);
         info->bound_left = map->bound_left;
         info->bound_top = map->bound_top;
         info->bound_right = map->bound_right;
         info->bound_bottom = map->bound_bottom;
+        info->yaw = map->yaw / 65536.0;
+        info->pitch = map->pitch / 65536.0;
+        info->roll = map->roll / 65536.0;
     }
+    sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data, AV_PKT_DATA_DISPLAYMATRIX);
+    if (sd && sd->size >= 9 * sizeof(int32_t)) {
+        double rotation = av_display_rotation_get((const int32_t *)sd->data);
+        if (rotation == rotation) info->rotation = rotation;  // NaN: no rotation
+    }
+}
+
+// Views of a multilayer HEVC stream (MV-HEVC): their count and eyes, as the
+// decoder reports them after reading the layer configuration (lhvC).
+static void probe_views(const AVCodecParameters *par, JVMediaInfo *info) {
+    const AVCodec *codec = avcodec_find_decoder_by_name("hevc");
+    AVCodecContext *ctx = codec ? avcodec_alloc_context3(codec) : NULL;
+    if (!ctx) return;
+    ctx->thread_count = 1;
+    unsigned ids = 0, positions = 0;
+    if (avcodec_parameters_to_context(ctx, par) >= 0 && avcodec_open2(ctx, codec, NULL) >= 0 &&
+        av_opt_get_array_size(ctx, "view_ids_available", AV_OPT_SEARCH_CHILDREN, &ids) >= 0 &&
+        ids > 0) {
+        unsigned id[8] = { 0 }, pos[8] = { 0 };
+        if (ids > 8) ids = 8;
+        if (av_opt_get_array(ctx, "view_ids_available", AV_OPT_SEARCH_CHILDREN, 0, ids,
+                             AV_OPT_TYPE_UINT, id) >= 0) {
+            // Distinct ids: an alpha layer is a layer but not a view.
+            int distinct = 0;
+            for (unsigned i = 0; i < ids; i++) {
+                int seen = 0;
+                for (unsigned j = 0; j < i; j++) seen |= id[j] == id[i];
+                distinct += !seen;
+            }
+            info->view_count = distinct;
+        }
+        if (av_opt_get_array_size(ctx, "view_pos_available", AV_OPT_SEARCH_CHILDREN, &positions) >= 0 &&
+            positions > 0) {
+            if (positions > 2) positions = 2;
+            if (av_opt_get_array(ctx, "view_pos_available", AV_OPT_SEARCH_CHILDREN, 0, positions,
+                                 AV_OPT_TYPE_UINT, pos) >= 0) {
+                for (unsigned i = 0; i < positions; i++) info->view_eye[i] = eye_of((int)pos[i]);
+            }
+        }
+    }
+    avcodec_free_context(&ctx);
+}
+
+// More than one coded layer: MV-HEVC (or HEVC with alpha). Hardware decoders
+// see only the base layer.
+static int is_multilayer(const AVStream *st) {
+    return (st->disposition & AV_DISPOSITION_MULTILAYER) ||
+           (st->codecpar->codec_id == AV_CODEC_ID_HEVC &&
+            st->codecpar->profile == AV_PROFILE_HEVC_MULTIVIEW_MAIN);
 }
 
 JVMedia *jv_media_open(const char *name, jv_read_fn read, jv_seek_fn seek, void *opaque,
@@ -126,6 +217,9 @@ JVMedia *jv_media_open(const char *name, jv_read_fn read, jv_seek_fn seek, void 
         AVRational rate = av_guess_frame_rate(fmt, video, NULL);
         info->fps = rate.den ? av_q2d(rate) : 0;
         describe_vr(par, info);
+        info->multilayer = is_multilayer(video);
+        if (info->multilayer && par->codec_id == AV_CODEC_ID_HEVC) probe_views(par, info);
+        if (!info->view_count) info->view_count = 1;
     }
     int audio = av_find_best_stream(fmt, AVMEDIA_TYPE_AUDIO, -1, media->video_stream, NULL, 0);
     media->audio_stream = audio;
@@ -189,10 +283,13 @@ static int attach_hardware(AVCodecContext *ctx, const AVCodec *codec, const char
 // this stream, or NULL if it may. Allow-list: only streams positively known to
 // be 8-bit 4:2:0 within the advertised size. On SteamOS 0.3 / kernel 6.18,
 // 10-bit HEVC crashes the iris firmware, so anything uncertain goes to software.
-static const char *v4l2_unsuitable(const AVCodecParameters *par) {
-    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC &&
-        par->codec_id != AV_CODEC_ID_VP9)
-        return "hardware decoder supports H.264/HEVC/VP9 only";
+// VP9 is refused too: its second session in a boot crashes the firmware.
+static const char *v4l2_unsuitable(const AVStream *st) {
+    const AVCodecParameters *par = st->codecpar;
+    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC)
+        return "hardware decoder is used for H.264/HEVC only";
+    if (is_multilayer(st))
+        return "spatial (MV-HEVC) video needs both views, which only the software decoder outputs";
     if (par->width <= 0 || par->height <= 0 || par->width > 8192 || par->height > 8192)
         return "frame size outside the hardware decoder's 8192x8192 limit";
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
@@ -210,8 +307,7 @@ static const char *v4l2_unsuitable(const AVCodecParameters *par) {
          ((profile & 0xff) == AV_PROFILE_H264_BASELINE || profile == AV_PROFILE_H264_MAIN ||
           profile == AV_PROFILE_H264_EXTENDED || profile == AV_PROFILE_H264_HIGH)) ||
         (par->codec_id == AV_CODEC_ID_HEVC &&
-         (profile == AV_PROFILE_HEVC_MAIN || profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE)) ||
-        (par->codec_id == AV_CODEC_ID_VP9 && profile == AV_PROFILE_VP9_0);
+         (profile == AV_PROFILE_HEVC_MAIN || profile == AV_PROFILE_HEVC_MAIN_STILL_PICTURE));
     return eight_bit ? NULL : "cannot confirm the stream is 8-bit, so the hardware decoder is not used";
 }
 
@@ -490,8 +586,16 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
     if (hw_backend) codec = avcodec_find_decoder_by_name(avcodec_get_name(id));
     if (!codec) codec = avcodec_find_decoder(id);
     if (!codec) { ret = AVERROR_DECODER_NOT_FOUND; set_error(s->error, sizeof(s->error), "Find decoder", ret); goto fail; }
+    if (hw_backend && is_multilayer(video)) {
+        // Hardware decoders (V4L2, Vulkan video) output only the base layer:
+        // spatial video needs FFmpeg's own decoder for both views.
+        copy_name(s->note, sizeof(s->note),
+                  "spatial (MV-HEVC) video needs both views, which only the software decoder outputs");
+        hw_backend = NULL;
+        codec = avcodec_find_decoder(id);
+    }
     if (hw_backend && !strcmp(hw_backend, "v4l2m2m")) {
-        const char *why = v4l2_unsuitable(video->codecpar);
+        const char *why = v4l2_unsuitable(video);
         const AVCodec *wrapper = NULL;
         if (!why) {
             char name[48];
@@ -504,9 +608,10 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
             codec = wrapper;
             d->choice.hardware_wrapper = 1;
             copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
-            // FFmpeg's default of 20 capture buffers fails to allocate at 8K.
+            // FFmpeg's default of 20 capture buffers fails to allocate (ENOMEM)
+            // above 4096x2304; the iris driver copes with 8 or fewer at any size.
             int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 12, 0);
+            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 6 : 8, 0);
             av_dict_set_int(&open_options, "num_output_buffers", 16, 0);
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
@@ -543,6 +648,11 @@ reopen:
         break;
     }
     copy_name(s->decoder, sizeof(s->decoder), codec->name);
+    // MV-HEVC: output every view (by default FFmpeg decodes only the base one).
+    // Only FFmpeg's own hevc decoder has the option.
+    if (!d->choice.hardware_wrapper && id == AV_CODEC_ID_HEVC && is_multilayer(video) &&
+        !strcmp(codec->name, "hevc"))
+        av_dict_set(&open_options, "view_ids", "-1", 0);
     if (decoder_options && *decoder_options) {
         ret = av_dict_parse_string(&open_options, decoder_options, "=", ":", 0);
         if (ret < 0) { set_error(s->error, sizeof(s->error), "Parse decoder options", ret); goto fail; }
@@ -621,6 +731,10 @@ static int describe_frame(JVDecoder *d, AVFrame *frame, JVFrame *out) {
     out->transfer = frame->color_trc == AVCOL_TRC_SMPTE2084 ? JV_TRANSFER_PQ
                   : frame->color_trc == AVCOL_TRC_ARIB_STD_B67 ? JV_TRANSFER_HLG
                   : JV_TRANSFER_SDR;
+    const AVFrameSideData *view = av_frame_get_side_data(frame, AV_FRAME_DATA_VIEW_ID);
+    out->view_id = view && view->size >= sizeof(int) ? *(const int *)view->data : -1;
+    const AVFrameSideData *stereo = av_frame_get_side_data(frame, AV_FRAME_DATA_STEREO3D);
+    out->eye = stereo ? eye_of(((const AVStereo3D *)stereo->data)->view) : JV_EYE_UNKNOWN;
     return 0;
 }
 

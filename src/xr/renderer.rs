@@ -3,7 +3,7 @@
 //! swapchains, and an optional readback of the left eye for screenshots.
 
 use super::context::{XrContext, choose_color_format};
-use crate::media::{Frame, Matrix, PlaneLayout, Transfer};
+use crate::media::{Frame, Matrix, Picture, PlaneLayout, Transfer};
 use anyhow::{Context, bail};
 use ash::vk;
 use openxr as xr;
@@ -49,8 +49,10 @@ struct Texture {
 struct VideoKey {
     layout: PlaneLayout,
     bits: u32,
+    /// Of the whole texture: `views` frames side by side.
     width: u32,
     height: u32,
+    views: u32,
 }
 
 struct VideoTextures {
@@ -81,6 +83,8 @@ pub struct Renderer {
     device: ash::Device,
     queue: vk::Queue,
     memory_types: vk::PhysicalDeviceMemoryProperties,
+    /// Widest 2D texture the GPU takes (two spatial views side by side must fit).
+    max_texture_size: u32,
     color_format: vk::Format,
     render_pass: vk::RenderPass,
     set_layout: vk::DescriptorSetLayout,
@@ -133,6 +137,12 @@ impl Renderer {
         let memory_types = unsafe {
             ctx.vk
                 .get_physical_device_memory_properties(ctx.physical_device)
+        };
+        let max_texture_size = unsafe {
+            ctx.vk
+                .get_physical_device_properties(ctx.physical_device)
+                .limits
+                .max_image_dimension2_d
         };
         let color_format = choose_color_format(&ctx.swapchain_formats()?)?;
         unsafe {
@@ -284,6 +294,7 @@ impl Renderer {
                 device,
                 queue: ctx.queue,
                 memory_types,
+                max_texture_size,
                 color_format,
                 render_pass,
                 set_layout,
@@ -586,14 +597,24 @@ impl Renderer {
         }
     }
 
-    /// (Re)creates plane textures for this frame's shape and rebinds them.
-    fn ensure_video_textures(&mut self, frame: &Frame) -> anyhow::Result<()> {
+    /// (Re)creates plane textures holding `views` frames of this shape side by
+    /// side (two for spatial video), and rebinds them.
+    fn ensure_video_textures(&mut self, frame: &Frame, views: u32) -> anyhow::Result<()> {
         let key = VideoKey {
             layout: frame.layout(),
             bits: frame.bits(),
-            width: frame.width(),
+            width: frame.width() * views,
             height: frame.height(),
+            views,
         };
+        if key.width > self.max_texture_size || key.height > self.max_texture_size {
+            anyhow::bail!(
+                "{}×{} is larger than the GPU's {} px texture limit",
+                key.width,
+                key.height,
+                self.max_texture_size
+            );
+        }
         if self.video.as_ref().is_some_and(|v| v.key == key) {
             return Ok(());
         }
@@ -606,7 +627,7 @@ impl Renderer {
         for plane in 0..frame.plane_count() {
             let (w, h, _) = frame.plane_size(plane);
             let format = plane_format(key.layout, key.bits, plane);
-            planes.push((self.create_texture(format, w, h)?, format, w, h));
+            planes.push((self.create_texture(format, w * views, h)?, format, w * views, h));
         }
         let video = VideoTextures { key, planes };
         let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
@@ -653,15 +674,34 @@ impl Renderer {
         Ok(())
     }
 
-    /// Copies a decoded frame into the staging buffer and records its upload.
-    /// Must be called between `begin_frame` and `draw_eye`.
-    fn record_upload(&mut self, frame: &Frame) -> anyhow::Result<()> {
-        self.ensure_video_textures(frame)?;
+    /// Copies a decoded picture into the staging buffer and records its upload:
+    /// for spatial video the left view into the left half of each plane
+    /// texture and the right view into the right half. Must be called between
+    /// `begin_frame` and `draw_eye`.
+    fn record_upload(&mut self, picture: &Picture) -> anyhow::Result<()> {
+        let views = picture.views();
+        let frame = views[0];
+        // A lone view of spatial video (its partner was lost) goes to both
+        // halves, rather than recreating the textures for one picture.
+        let slots = if views.len() == 1
+            && self.video.as_ref().is_some_and(|v| {
+                v.key.views == 2
+                    && v.key.width == frame.width() * 2
+                    && v.key.height == frame.height()
+                    && v.key.layout == frame.layout()
+                    && v.key.bits == frame.bits()
+            }) {
+            2
+        } else {
+            views.len()
+        };
+        let sources: Vec<&Frame> = (0..slots).map(|i| views[i.min(views.len() - 1)]).collect();
+        self.ensure_video_textures(frame, slots as u32)?;
         let bytes = frame.bytes_per_sample();
         let total: u64 = (0..frame.plane_count())
             .map(|p| {
                 let (w, h, c) = frame.plane_size(p);
-                (w * h * c) as u64 * bytes as u64
+                (w * h * c) as u64 * bytes as u64 * slots as u64
             })
             .sum();
         if self.staging.as_ref().is_none_or(|s| s.size < total) {
@@ -672,21 +712,27 @@ impl Renderer {
         }
         let staging = self.staging.as_ref().expect("staging buffer");
         let mut offset = 0usize;
-        let mut regions = Vec::new();
+        // Per plane: (staging offset, x offset in texels) of each view.
+        let mut regions: Vec<Vec<(u64, u32)>> = Vec::new();
         for plane in 0..frame.plane_count() {
-            let start = offset;
-            for row in frame.rows(plane) {
-                // SAFETY: the staging buffer holds `total` bytes, the sum of all rows.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        row.as_ptr(),
-                        staging.mapped.add(offset),
-                        row.len(),
-                    )
-                };
-                offset += row.len();
+            let (plane_w, _, _) = frame.plane_size(plane);
+            let mut plane_regions = Vec::new();
+            for (slot, source) in sources.iter().enumerate() {
+                let start = offset;
+                for row in source.rows(plane) {
+                    // SAFETY: the staging buffer holds `total` bytes, the sum of all rows.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr(),
+                            staging.mapped.add(offset),
+                            row.len(),
+                        )
+                    };
+                    offset += row.len();
+                }
+                plane_regions.push((start as u64, slot as u32 * plane_w));
             }
-            regions.push(start as u64);
+            regions.push(plane_regions);
         }
         let color = ColorParams {
             adjust: self.adjust,
@@ -700,25 +746,36 @@ impl Renderer {
                 vk::ImageLayout::UNDEFINED,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             );
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(regions[plane])
-                .image_subresource(
-                    vk::ImageSubresourceLayers::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .layer_count(1),
-                )
-                .image_extent(vk::Extent3D {
-                    width: *w,
-                    height: *h,
-                    depth: 1,
-                });
+            let view_w = w / slots as u32;
+            let copies: Vec<vk::BufferImageCopy> = regions[plane]
+                .iter()
+                .map(|&(buffer_offset, x)| {
+                    vk::BufferImageCopy::default()
+                        .buffer_offset(buffer_offset)
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .layer_count(1),
+                        )
+                        .image_offset(vk::Offset3D {
+                            x: x as i32,
+                            y: 0,
+                            z: 0,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: view_w,
+                            height: *h,
+                            depth: 1,
+                        })
+                })
+                .collect();
             unsafe {
                 self.device.cmd_copy_buffer_to_image(
                     self.command,
                     staging.buffer,
                     texture.image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
+                    &copies,
                 );
             }
             self.transition(
@@ -826,8 +883,8 @@ impl Renderer {
         self.video.is_some()
     }
 
-    /// Starts recording a frame; uploads `frame` first when it changed.
-    pub fn begin_frame(&mut self, upload: Option<&Frame>) -> anyhow::Result<()> {
+    /// Starts recording a frame; uploads `picture` first when it changed.
+    pub fn begin_frame(&mut self, upload: Option<&Picture>) -> anyhow::Result<()> {
         self.begin_commands()?;
         // Corrections change without a new frame (e.g. while paused).
         // SAFETY: the mapped uniform holds a whole ColorParams.
@@ -837,8 +894,8 @@ impl Renderer {
                 (*color).adjust = self.adjust;
             }
         }
-        if let Some(frame) = upload {
-            self.record_upload(frame)?;
+        if let Some(picture) = upload {
+            self.record_upload(picture)?;
         }
         Ok(())
     }

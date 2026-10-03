@@ -2,7 +2,7 @@
 //! selection by timestamp against the runtime's predicted display time.
 
 use super::renderer::EyeParams;
-use crate::media::{Frame, VideoDecoder};
+use crate::media::{Picture, VideoDecoder};
 use crate::subtitles::Cues;
 use crate::vr::{Layout, Projection, Stereo};
 use openxr as xr;
@@ -127,7 +127,7 @@ pub struct PlayStats {
 }
 
 enum Decoded {
-    Frame(u64, Frame),
+    Frame(u64, Picture),
     End(u64),
     Failed(u64, String),
 }
@@ -276,8 +276,9 @@ fn spawn_decoder(
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let message = match decoder.next_frame() {
-                    Ok(Some(frame)) => Decoded::Frame(generation, frame),
+                // Spatial video: both views of a picture travel together.
+                let message = match decoder.next_picture() {
+                    Ok(Some(picture)) => Decoded::Frame(generation, picture),
                     Ok(None) => Decoded::End(generation),
                     Err(e) => Decoded::Failed(generation, format!("{e:#}")),
                 };
@@ -458,11 +459,13 @@ pub struct Playback {
     audio: Option<Arc<AudioShared>>,
     stop: Arc<AtomicBool>,
     generation: u64,
-    current: Option<Frame>,
-    next: Option<Frame>,
+    current: Option<Picture>,
+    next: Option<Picture>,
     ended: bool,
     pub error: Option<String>,
     fps: f64,
+    /// Coded views of the video: 2 for spatial (MV-HEVC) video.
+    pub views: u32,
     pub duration: f64,
     last_pts: f64,
     /// Display time (ns) corresponding to media time 0.
@@ -514,6 +517,7 @@ impl Playback {
         let embedded_cues = Arc::new(Mutex::new(Cues::default()));
         let info = decoder.info();
         let fps = info.video.as_ref().map_or(30.0, |v| v.fps.max(1.0));
+        let views = info.video.as_ref().map_or(1, |v| v.views);
         let duration = info.duration_seconds;
         let stop = Arc::new(AtomicBool::new(false));
         let has_audio = decoder.enable_audio(crate::audio::RATE, crate::audio::CHANNELS);
@@ -563,6 +567,7 @@ impl Playback {
             ended: false,
             error: None,
             fps,
+            views,
             duration,
             last_pts: start - 1.0 / fps,
             clock_start: None,
@@ -708,7 +713,7 @@ impl Playback {
         }
     }
 
-    pub fn current(&self) -> Option<&Frame> {
+    pub fn current(&self) -> Option<&Picture> {
         self.current.as_ref()
     }
 
@@ -956,7 +961,8 @@ pub fn eye_params(
             },
             match layout.stereo {
                 Stereo::Mono => 0.0,
-                Stereo::SideBySide => 1.0,
+                // Spatial video: the two views sit side by side in the texture.
+                Stereo::SideBySide | Stereo::MultiView => 1.0,
                 Stereo::TopBottom => 2.0,
             },
             if layout.swap_eyes { 1.0 } else { 0.0 },

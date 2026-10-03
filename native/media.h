@@ -1,5 +1,6 @@
 #ifndef JUST_VIDEO_MEDIA_H
 #define JUST_VIDEO_MEDIA_H
+#include <stddef.h>
 #include <stdint.h>
 
 // Player media layer. Input bytes come from Rust through callbacks (SMB or a
@@ -11,6 +12,21 @@ typedef int (*jv_read_fn)(void *opaque, uint8_t *buf, int size);
 typedef int64_t (*jv_seek_fn)(void *opaque, int64_t offset, int whence);
 
 typedef struct JVMedia JVMedia;
+
+// Which eye a view belongs to.
+enum { JV_EYE_UNKNOWN = 0, JV_EYE_LEFT = 1, JV_EYE_RIGHT = 2 };
+// Spherical projection from the container (Apple Projected Media Profile,
+// Google spherical metadata).
+enum {
+    JV_PROJECTION_NONE = 0,
+    JV_PROJECTION_EQUIRECT,
+    JV_PROJECTION_EQUIRECT_TILE,
+    JV_PROJECTION_HALF_EQUIRECT,
+    JV_PROJECTION_RECTILINEAR,
+    JV_PROJECTION_FISHEYE,
+    JV_PROJECTION_PARAMETRIC_IMMERSIVE,
+    JV_PROJECTION_CUBEMAP,
+};
 
 typedef struct {
     char container[64];
@@ -34,7 +50,23 @@ typedef struct {
     char audio_codec[32];
     int32_t audio_channels;
     int32_t audio_sample_rate;
+    // Spatial video. Appended: keep RawInfo in src/media.rs in the same order.
+    int32_t multilayer;       // more than one coded layer (MV-HEVC, or HEVC with alpha)
+    int32_t view_count;       // distinct views the decoder outputs: 2 for stereo MV-HEVC
+    int32_t view_eye[2];      // JV_EYE_* of view 0 and view 1
+    int32_t primary_eye;      // JV_EYE_* of the hero (main) eye
+    int32_t projection_kind;  // JV_PROJECTION_*
+    uint32_t baseline_um;     // camera baseline in micrometres, 0 when unknown
+    int32_t reserved;
+    double disparity_adjustment;  // horizontal disparity adjustment (fraction of width), 0 when absent
+    double hfov_degrees;      // horizontal field of view, 0 when unknown
+    double yaw, pitch, roll;  // degrees, from the spherical mapping
+    double rotation;          // display matrix rotation, degrees counter-clockwise
 } JVMediaInfo;
+
+// sizeof the structs, so Rust can check its mirrors match.
+size_t jv_media_info_size(void);
+size_t jv_frame_size(void);
 
 typedef struct {
     int32_t frames;
@@ -82,6 +114,8 @@ typedef struct {
     int32_t full_range;
     int32_t transfer;        // JV_TRANSFER_*
     int32_t hardware;        // produced by a hardware decoder
+    int32_t view_id;         // MV-HEVC view id, -1 for single-view video
+    int32_t eye;             // JV_EYE_* from the frame's stereo side data
 } JVFrame;
 
 // Opens the video decoder (same selection/fallback rules as jv_media_decode);

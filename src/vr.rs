@@ -2,7 +2,7 @@
 //! (DeoVR / HereSphere / Skybox style tags such as `_180_LR`, `_360_TB`).
 //! The result is a suggestion: the player keeps a per-file manual override.
 
-use crate::media::VideoInfo;
+use crate::media::{SphericalKind, VideoInfo};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +21,9 @@ pub enum Stereo {
     Mono,
     SideBySide,
     TopBottom,
+    /// Apple spatial video (MV-HEVC): each eye its own coded view. The player
+    /// puts the two views side by side in one texture, left first.
+    MultiView,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -59,6 +62,8 @@ pub fn eye_aspect(width: u32, height: u32, layout: &Layout) -> f32 {
         Stereo::SideBySide => w / 2.0 / h,
         Stereo::TopBottom if flat && w / (h / 2.0) > 3.0 => w / h,
         Stereo::TopBottom => w / (h / 2.0),
+        // Two whole views side by side in the texture.
+        Stereo::MultiView => w / 2.0 / h,
         Stereo::Mono => w / h,
     }
 }
@@ -123,8 +128,8 @@ fn stereo_from_name(tokens: &[String]) -> Option<(Stereo, bool)> {
 }
 
 fn projection_from_metadata(video: &VideoInfo) -> Option<Projection> {
-    match video.projection.as_deref()? {
-        "equirectangular" | "tiled equirectangular" => {
+    match video.spherical? {
+        SphericalKind::Equirectangular | SphericalKind::EquirectangularTile => {
             let degrees = video.horizontal_degrees.unwrap_or(360.0);
             Some(if degrees <= 270.0 {
                 Projection::Equirect180
@@ -132,15 +137,22 @@ fn projection_from_metadata(video: &VideoInfo) -> Option<Projection> {
                 Projection::Equirect360
             })
         }
-        "half equirectangular" => Some(Projection::Equirect180),
-        "fisheye" => Some(Projection::Fisheye180),
-        "rectilinear" => Some(Projection::Flat),
-        // Cubemaps and parametric immersive video are unsupported; fall back to names.
-        _ => None,
+        SphericalKind::HalfEquirectangular => Some(Projection::Equirect180),
+        SphericalKind::Fisheye => Some(Projection::Fisheye180),
+        // Apple Immersive's lens model: FFmpeg exports no lens parameters,
+        // so an equidistant fisheye is the closest we can draw.
+        SphericalKind::ParametricImmersive => Some(Projection::Fisheye180),
+        SphericalKind::Rectilinear => Some(Projection::Flat),
+        // Cubemaps are unsupported; fall back to the file name.
+        SphericalKind::Cubemap => None,
     }
 }
 
 fn stereo_from_metadata(video: &VideoInfo) -> Option<(Stereo, bool)> {
+    // Two coded views (MV-HEVC) are stereo whatever else the container says.
+    if video.views >= 2 {
+        return Some((Stereo::MultiView, video.stereo_inverted));
+    }
     let stereo = match video.stereo_mode.as_deref()? {
         "2D" => Stereo::Mono,
         "side by side" => Stereo::SideBySide,
@@ -231,6 +243,17 @@ mod tests {
             stereo_inverted: false,
             projection: projection.map(Into::into),
             horizontal_degrees: degrees,
+            spherical: projection.and_then(|name| match name {
+                "equirectangular" => Some(SphericalKind::Equirectangular),
+                "tiled equirectangular" => Some(SphericalKind::EquirectangularTile),
+                "half equirectangular" => Some(SphericalKind::HalfEquirectangular),
+                "rectilinear" => Some(SphericalKind::Rectilinear),
+                "fisheye" => Some(SphericalKind::Fisheye),
+                "parametric immersive" => Some(SphericalKind::ParametricImmersive),
+                "cubemap" => Some(SphericalKind::Cubemap),
+                _ => None,
+            }),
+            ..Default::default()
         }
     }
 

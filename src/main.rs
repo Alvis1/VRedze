@@ -194,6 +194,8 @@ enum StereoArg {
     Mono,
     Sbs,
     Tb,
+    /// Apple spatial video: two coded views (MV-HEVC).
+    Mv,
 }
 
 fn hw_backend(hw: Hw) -> Option<&'static str> {
@@ -485,6 +487,7 @@ fn main() -> anyhow::Result<()> {
                     StereoArg::Mono => vr::Stereo::Mono,
                     StereoArg::Sbs => vr::Stereo::SideBySide,
                     StereoArg::Tb => vr::Stereo::TopBottom,
+                    StereoArg::Mv => vr::Stereo::MultiView,
                 };
             }
             layout.swap_eyes ^= swap_eyes;
@@ -930,6 +933,7 @@ fn main() -> anyhow::Result<()> {
                 has_previous: true,
                 has_next: false,
                 loop_mode: just_video::config::LoopMode::Off,
+                views: 1,
                 curved: Some(true),
                 format: controls::FORMATS[3],
                 favourites: vec![controls::FORMATS[0], controls::FORMATS[3]],

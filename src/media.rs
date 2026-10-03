@@ -46,6 +46,20 @@ struct RawInfo {
     audio_codec: [c_char; 32],
     audio_channels: i32,
     audio_sample_rate: i32,
+    // Spatial video (JVMediaInfo's appended fields, same order).
+    multilayer: i32,
+    view_count: i32,
+    view_eye: [i32; 2],
+    primary_eye: i32,
+    projection_kind: i32,
+    baseline_um: u32,
+    reserved: i32,
+    disparity_adjustment: f64,
+    hfov_degrees: f64,
+    yaw: f64,
+    pitch: f64,
+    roll: f64,
+    rotation: f64,
 }
 
 #[repr(C)]
@@ -210,6 +224,111 @@ pub struct VideoInfo {
     pub projection: Option<String>,
     /// Horizontal coverage implied by equirectangular bounds, in degrees.
     pub horizontal_degrees: Option<f64>,
+    /// More than one coded layer (MV-HEVC: Apple spatial video).
+    pub multilayer: bool,
+    /// Views the decoder outputs: 2 for stereo MV-HEVC, otherwise 1.
+    pub views: u32,
+    /// The eye of view 0 and view 1, when the stream says.
+    pub view_eyes: [Option<Eye>; 2],
+    /// The hero (main) eye, when the container says.
+    pub primary_eye: Option<Eye>,
+    /// The projection as a kind (the name above is for display).
+    pub spherical: Option<SphericalKind>,
+    /// Camera baseline in millimetres.
+    pub baseline_mm: Option<f64>,
+    /// Horizontal disparity adjustment, as a fraction of the width.
+    pub disparity_adjustment: Option<f64>,
+    /// Horizontal field of view of the camera, in degrees.
+    pub hfov_degrees: Option<f64>,
+    /// Orientation of the spherical video: yaw, pitch, roll in degrees.
+    pub orientation: [f64; 3],
+    /// Rotation from the display matrix, degrees counter-clockwise.
+    pub rotation_degrees: f64,
+}
+
+impl Default for VideoInfo {
+    /// Nothing known: one view, no stereo or projection metadata.
+    fn default() -> Self {
+        Self {
+            codec: String::new(),
+            profile: None,
+            pixel_format: None,
+            width: 0,
+            height: 0,
+            bit_depth: 0,
+            fps: 0.0,
+            stereo_mode: None,
+            stereo_inverted: false,
+            projection: None,
+            horizontal_degrees: None,
+            multilayer: false,
+            views: 1,
+            view_eyes: [None; 2],
+            primary_eye: None,
+            spherical: None,
+            baseline_mm: None,
+            disparity_adjustment: None,
+            hfov_degrees: None,
+            orientation: [0.0; 3],
+            rotation_degrees: 0.0,
+        }
+    }
+}
+
+/// Which eye a view belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Eye {
+    Left,
+    Right,
+}
+
+impl Eye {
+    fn from_raw(raw: i32) -> Option<Eye> {
+        match raw {
+            1 => Some(Eye::Left),
+            2 => Some(Eye::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Spherical projection from the container (JV_PROJECTION_*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SphericalKind {
+    Equirectangular,
+    EquirectangularTile,
+    HalfEquirectangular,
+    Rectilinear,
+    Fisheye,
+    ParametricImmersive,
+    Cubemap,
+}
+
+impl SphericalKind {
+    fn from_raw(raw: i32) -> Option<SphericalKind> {
+        Some(match raw {
+            1 => SphericalKind::Equirectangular,
+            2 => SphericalKind::EquirectangularTile,
+            3 => SphericalKind::HalfEquirectangular,
+            4 => SphericalKind::Rectilinear,
+            5 => SphericalKind::Fisheye,
+            6 => SphericalKind::ParametricImmersive,
+            7 => SphericalKind::Cubemap,
+            _ => return None,
+        })
+    }
+
+    /// Equirectangular kinds, whose crop bounds give their coverage.
+    fn is_equirectangular(self) -> bool {
+        matches!(
+            self,
+            SphericalKind::Equirectangular
+                | SphericalKind::EquirectangularTile
+                | SphericalKind::HalfEquirectangular
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -259,6 +378,11 @@ unsafe impl Send for Media {}
 
 impl Media {
     pub fn open(name: &str, source: impl Source + 'static) -> anyhow::Result<Self> {
+        // SAFETY: plain size queries.
+        let sizes = unsafe { (jv_media_info_size(), jv_frame_size()) };
+        if sizes != (size_of::<RawInfo>(), size_of::<RawFrame>()) {
+            bail!("native/media.c and src/media.rs disagree on struct layouts: rebuild both");
+        }
         let mut source: Box<BoxedSource> = Box::new(Box::new(source));
         let name = CString::new(name.replace('\0', ""))?;
         let mut raw_info = std::mem::MaybeUninit::<RawInfo>::zeroed();
@@ -290,10 +414,27 @@ impl Media {
             stereo_mode: optional(&r.stereo_mode),
             stereo_inverted: r.stereo_inverted != 0,
             projection: optional(&r.projection),
-            horizontal_degrees: optional(&r.projection).map(|_| {
-                let covered = 1.0 - (r.bound_left as f64 + r.bound_right as f64) / 4294967296.0;
-                (covered * 360.0).clamp(0.0, 360.0)
-            }),
+            horizontal_degrees: SphericalKind::from_raw(r.projection_kind)
+                .filter(|k| k.is_equirectangular())
+                .map(|kind| {
+                    if kind == SphericalKind::HalfEquirectangular {
+                        return 180.0;
+                    }
+                    let covered =
+                        1.0 - (r.bound_left as f64 + r.bound_right as f64) / 4294967296.0;
+                    (covered * 360.0).clamp(0.0, 360.0)
+                }),
+            multilayer: r.multilayer != 0,
+            views: r.view_count.max(1) as u32,
+            view_eyes: r.view_eye.map(Eye::from_raw),
+            primary_eye: Eye::from_raw(r.primary_eye),
+            spherical: SphericalKind::from_raw(r.projection_kind),
+            baseline_mm: (r.baseline_um > 0).then(|| r.baseline_um as f64 / 1000.0),
+            disparity_adjustment: (r.disparity_adjustment != 0.0)
+                .then_some(r.disparity_adjustment),
+            hfov_degrees: (r.hfov_degrees > 0.0).then_some(r.hfov_degrees),
+            orientation: [r.yaw, r.pitch, r.roll],
+            rotation_degrees: r.rotation,
         });
         let audio = optional(&r.audio_codec).map(|codec| AudioInfo {
             codec,
@@ -426,9 +567,13 @@ struct RawFrame {
     full_range: i32,
     transfer: i32,
     hardware: i32,
+    view_id: i32,
+    eye: i32,
 }
 
 unsafe extern "C" {
+    fn jv_media_info_size() -> usize;
+    fn jv_frame_size() -> usize;
     fn jv_decoder_open(
         media: *mut RawMedia,
         hw_backend: *const c_char,
@@ -552,6 +697,16 @@ impl Frame {
         self.raw.hardware != 0
     }
 
+    /// MV-HEVC view id; None for single-view video.
+    pub fn view_id(&self) -> Option<u32> {
+        u32::try_from(self.raw.view_id).ok()
+    }
+
+    /// The eye this view is for, when the stream says.
+    pub fn eye(&self) -> Option<Eye> {
+        Eye::from_raw(self.raw.eye)
+    }
+
     /// Bytes per sample: 1 for 8-bit, 2 for 10-bit.
     pub fn bytes_per_sample(&self) -> usize {
         if self.raw.bits > 8 { 2 } else { 1 }
@@ -592,11 +747,148 @@ impl Drop for Frame {
     }
 }
 
+/// What the view pairer needs to know about a decoded view.
+pub trait ViewTagged {
+    fn view_id(&self) -> Option<u32>;
+    fn eye(&self) -> Option<Eye>;
+    fn pts(&self) -> Option<f64>;
+}
+
+impl ViewTagged for Frame {
+    fn view_id(&self) -> Option<u32> {
+        Frame::view_id(self)
+    }
+    fn eye(&self) -> Option<Eye> {
+        Frame::eye(self)
+    }
+    fn pts(&self) -> Option<f64> {
+        Frame::pts(self)
+    }
+}
+
+/// One moment of video: a single picture, or for spatial (MV-HEVC) video the
+/// two views decoded from the same access unit.
+pub enum Picture<F = Frame> {
+    Mono(F),
+    Stereo { left: F, right: F },
+}
+
+impl<F: ViewTagged> Picture<F> {
+    /// The left view (or the only one): every view has the same shape and time.
+    pub fn first(&self) -> &F {
+        match self {
+            Picture::Mono(frame) => frame,
+            Picture::Stereo { left, .. } => left,
+        }
+    }
+
+    pub fn pts(&self) -> Option<f64> {
+        self.first().pts()
+    }
+
+    /// The views in eye order (left first); one for mono.
+    pub fn views(&self) -> Vec<&F> {
+        match self {
+            Picture::Mono(frame) => vec![frame],
+            Picture::Stereo { left, right } => vec![left, right],
+        }
+    }
+}
+
+/// What the container says about the views, to tell the eyes apart when the
+/// frames themselves don't.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ViewHints {
+    /// Eye of the view with the lower id (the base layer) and the higher one.
+    pub view_eyes: [Option<Eye>; 2],
+    pub primary_eye: Option<Eye>,
+}
+
+/// Pairs consecutive views of the same access unit (same pts, different
+/// view id) into stereo pictures. FFmpeg's MV-HEVC decoder outputs the base
+/// layer, then the second, for each picture. A view without its partner (a
+/// damaged stream, the end, a seek) becomes a mono picture shown to both
+/// eyes, so nothing is dropped.
+pub struct ViewPairer<F> {
+    hints: ViewHints,
+    held: Option<F>,
+}
+
+impl<F: ViewTagged> ViewPairer<F> {
+    pub fn new(hints: ViewHints) -> Self {
+        Self { hints, held: None }
+    }
+
+    /// Takes the next decoded view; returns a picture when one is complete.
+    /// A returned mono picture may leave `frame` held for its partner.
+    pub fn push(&mut self, frame: F) -> Option<Picture<F>> {
+        if frame.view_id().is_none() {
+            // Single-view video: nothing to pair.
+            return match self.held.take() {
+                Some(held) => {
+                    self.held = Some(frame);
+                    Some(Picture::Mono(held))
+                }
+                None => Some(Picture::Mono(frame)),
+            };
+        }
+        let Some(held) = self.held.take() else {
+            self.held = Some(frame);
+            return None;
+        };
+        let same_time = match (held.pts(), frame.pts()) {
+            (Some(a), Some(b)) => (a - b).abs() < 1e-6,
+            _ => false,
+        };
+        if same_time && held.view_id() != frame.view_id() {
+            let (left, right) = self.eyes(held, frame);
+            return Some(Picture::Stereo { left, right });
+        }
+        // A view without its partner: show it to both eyes, wait with this one.
+        self.held = Some(frame);
+        Some(Picture::Mono(held))
+    }
+
+    /// At the end of the stream: a view still waiting for its partner.
+    pub fn flush(&mut self) -> Option<Picture<F>> {
+        self.held.take().map(Picture::Mono)
+    }
+
+    /// Drops a half-received pair (after a seek).
+    pub fn reset(&mut self) {
+        self.held = None;
+    }
+
+    /// (left, right) for two views of one picture. Evidence, strongest first:
+    /// the frames' own eye tags, the container's view positions, the hero eye
+    /// being the base layer, and finally base layer = left.
+    fn eyes(&self, a: F, b: F) -> (F, F) {
+        let a_is_left = match (a.eye(), b.eye()) {
+            (Some(Eye::Left), _) | (_, Some(Eye::Right)) => true,
+            (Some(Eye::Right), _) | (_, Some(Eye::Left)) => false,
+            _ => {
+                // The base layer has the lower view id.
+                let a_is_base = a.view_id() <= b.view_id();
+                let base_eye = match self.hints.view_eyes {
+                    [Some(eye), _] => Some(eye),
+                    [None, Some(Eye::Left)] => Some(Eye::Right),
+                    [None, Some(Eye::Right)] => Some(Eye::Left),
+                    _ => self.hints.primary_eye,
+                }
+                .unwrap_or(Eye::Left);
+                a_is_base == (base_eye == Eye::Left)
+            }
+        };
+        if a_is_left { (a, b) } else { (b, a) }
+    }
+}
+
 /// A video decoder owning its media; pull frames with [`VideoDecoder::next_frame`].
 pub struct VideoDecoder {
     raw: *mut RawDecoder,
     media: Media,
     stats: DecodeStats,
+    pairer: ViewPairer<Frame>,
 }
 
 // SAFETY: used from one thread at a time (the decode thread).
@@ -627,8 +919,13 @@ impl Media {
             bail!("{}", text(&s.error));
         }
         OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hints = self.info.video.as_ref().map_or(ViewHints::default(), |v| ViewHints {
+            view_eyes: v.view_eyes,
+            primary_eye: v.primary_eye,
+        });
         Ok(VideoDecoder {
             raw: decoder,
+            pairer: ViewPairer::new(hints),
             media: self,
             stats: DecodeStats {
                 frames: 0,
@@ -666,6 +963,21 @@ impl VideoDecoder {
             AVERROR_EOF => Ok(None),
             AVERROR_PATCHWELCOME => bail!("Decoder produced an unsupported pixel format"),
             code => bail!("Decoding failed (FFmpeg error {code})"),
+        }
+    }
+
+    /// The next picture (both views of spatial video together), or `None`
+    /// at the end of the stream.
+    pub fn next_picture(&mut self) -> anyhow::Result<Option<Picture>> {
+        loop {
+            match self.next_frame()? {
+                Some(frame) => {
+                    if let Some(picture) = self.pairer.push(frame) {
+                        return Ok(Some(picture));
+                    }
+                }
+                None => return Ok(self.pairer.flush()),
+            }
         }
     }
 
@@ -744,6 +1056,7 @@ impl VideoDecoder {
     }
 
     pub fn seek(&mut self, seconds: f64) -> anyhow::Result<()> {
+        self.pairer.reset();
         match unsafe { jv_decoder_seek(self.raw, seconds.max(0.0)) } {
             0 => Ok(()),
             code => bail!("Seek failed (FFmpeg error {code})"),
@@ -772,4 +1085,147 @@ pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ffi_structs_match_c() {
+        // A mismatch would silently corrupt memory across the FFI boundary.
+        assert_eq!(unsafe { jv_media_info_size() }, size_of::<RawInfo>());
+        assert_eq!(unsafe { jv_frame_size() }, size_of::<RawFrame>());
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct View {
+        id: Option<u32>,
+        eye: Option<Eye>,
+        pts: f64,
+    }
+
+    impl ViewTagged for View {
+        fn view_id(&self) -> Option<u32> {
+            self.id
+        }
+        fn eye(&self) -> Option<Eye> {
+            self.eye
+        }
+        fn pts(&self) -> Option<f64> {
+            Some(self.pts)
+        }
+    }
+
+    fn view(id: u32, pts: f64) -> View {
+        View { id: Some(id), eye: None, pts }
+    }
+
+    fn stereo(p: Option<Picture<View>>) -> (u32, u32) {
+        match p {
+            Some(Picture::Stereo { left, right }) => (left.id.unwrap(), right.id.unwrap()),
+            other => panic!("expected a stereo picture, got {:?}", other.map(|p| p.views().len())),
+        }
+    }
+
+    #[test]
+    fn pairs_base_then_second_view() {
+        let mut pairer = ViewPairer::new(ViewHints::default());
+        assert!(pairer.push(view(0, 0.0)).is_none());
+        // No hints: the base layer (lower id) is the left eye.
+        assert_eq!(stereo(pairer.push(view(1, 0.0))), (0, 1));
+        assert!(pairer.push(view(0, 1.0 / 30.0)).is_none());
+        assert_eq!(stereo(pairer.push(view(1, 1.0 / 30.0))), (0, 1));
+        assert!(pairer.flush().is_none());
+    }
+
+    #[test]
+    fn frame_eye_tags_win() {
+        let mut pairer = ViewPairer::new(ViewHints {
+            view_eyes: [Some(Eye::Left), Some(Eye::Right)],
+            primary_eye: Some(Eye::Left),
+        });
+        let tagged = |id, eye| View { id: Some(id), eye: Some(eye), pts: 0.0 };
+        pairer.push(tagged(0, Eye::Right));
+        assert_eq!(stereo(pairer.push(tagged(1, Eye::Left))), (1, 0));
+    }
+
+    #[test]
+    fn container_hints_place_the_base_layer() {
+        // Hero eye right: the base layer is the right eye.
+        let mut pairer = ViewPairer::new(ViewHints {
+            view_eyes: [None, None],
+            primary_eye: Some(Eye::Right),
+        });
+        pairer.push(view(0, 0.0));
+        assert_eq!(stereo(pairer.push(view(1, 0.0))), (1, 0));
+        // View positions beat the hero eye.
+        let mut pairer = ViewPairer::new(ViewHints {
+            view_eyes: [None, Some(Eye::Right)],
+            primary_eye: Some(Eye::Right),
+        });
+        pairer.push(view(0, 0.0));
+        assert_eq!(stereo(pairer.push(view(1, 0.0))), (0, 1));
+    }
+
+    #[test]
+    fn a_view_without_its_partner_is_shown_mono() {
+        let mut pairer = ViewPairer::new(ViewHints::default());
+        pairer.push(view(0, 0.0));
+        // The next picture's base layer arrives: the lone view goes out mono.
+        match pairer.push(view(0, 0.04)) {
+            Some(Picture::Mono(v)) => assert_eq!(v, view(0, 0.0)),
+            _ => panic!("expected the lone view as mono"),
+        }
+        assert_eq!(stereo(pairer.push(view(1, 0.04))), (0, 1));
+        // At the end, a view still waiting comes out too.
+        pairer.push(view(0, 0.08));
+        assert!(matches!(pairer.flush(), Some(Picture::Mono(_))));
+        // After a seek, a half pair is dropped.
+        pairer.push(view(0, 5.0));
+        pairer.reset();
+        assert!(pairer.flush().is_none());
+    }
+
+    #[test]
+    fn single_view_video_passes_straight_through() {
+        let mut pairer = ViewPairer::new(ViewHints::default());
+        let plain = |pts| View { id: None, eye: None, pts };
+        assert!(matches!(pairer.push(plain(0.0)), Some(Picture::Mono(_))));
+        assert!(matches!(pairer.push(plain(0.04)), Some(Picture::Mono(_))));
+        assert!(pairer.flush().is_none());
+    }
+
+    /// Decodes an Apple spatial video sample made with avconvert (see
+    /// tools/make-spatial-samples.sh): red left eye, blue right eye.
+    #[test]
+    fn decodes_both_views_of_spatial_video() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/spatial-red-left.mov");
+        let Ok(file) = std::fs::File::open(&path) else {
+            eprintln!("skipped: {} not found", path.display());
+            return;
+        };
+        let media = Media::open("spatial-red-left.mov", std::io::BufReader::new(file)).unwrap();
+        let video = media.info().video.clone().unwrap();
+        assert!(video.multilayer);
+        assert_eq!(video.views, 2);
+        assert_eq!(video.spherical, Some(SphericalKind::Rectilinear));
+        let mut decoder = media.into_decoder(None, true, "").unwrap();
+        let mut stereo_pictures = 0;
+        for _ in 0..10 {
+            let Some(picture) = decoder.next_picture().unwrap() else { break };
+            if let Picture::Stereo { left, right } = &picture {
+                assert_eq!(left.pts(), right.pts());
+                // Red is strong in the left view's V (Cr) plane, blue in the right's U (Cb).
+                let mean = |f: &Frame, plane: usize| {
+                    let rows: Vec<u8> = f.rows(plane).flatten().copied().collect();
+                    rows.iter().map(|&b| b as f64).sum::<f64>() / rows.len() as f64
+                };
+                assert!(mean(left, 2) > mean(right, 2), "left view should be the red one");
+                assert!(mean(right, 1) > mean(left, 1), "right view should be the blue one");
+                stereo_pictures += 1;
+            }
+        }
+        assert!(stereo_pictures >= 8, "only {stereo_pictures} stereo pictures");
+    }
 }

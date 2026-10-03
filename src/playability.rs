@@ -36,9 +36,16 @@ impl Platform {
     /// because 10-bit input crashes the Frame's decoder firmware.
     fn hardware_gap(self, v: &VideoInfo) -> Option<String> {
         let name = self.name();
+        if v.multilayer {
+            // Hardware decoders output only the base layer: one eye.
+            return Some(
+                "spatial video has two views and the hardware decoder only outputs one".into(),
+            );
+        }
         match self {
             Self::SteamFrame => {
-                if !matches!(v.codec.as_str(), "h264" | "hevc" | "vp9") {
+                // VP9 too stays on the CPU: a second VP9 session crashes the decoder firmware.
+                if !matches!(v.codec.as_str(), "h264" | "hevc") {
                     return Some(format!(
                         "{name}'s hardware video decoder doesn't support {}",
                         codec_label(&v.codec)
@@ -201,7 +208,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
     let gap = gap.unwrap_or_default();
     // Unknown frame rate: assume 60 fps, the worst common case for VR.
     let fps = if v.fps > 0.0 { v.fps } else { 60.0 };
-    let needed = v.width as f64 * v.height as f64 * fps;
+    // Spatial video decodes both views.
+    let needed = v.width as f64 * v.height as f64 * fps * v.views.max(1) as f64;
     let speed = platform.software_rate(v).map(|rate| {
         if needed > 0.0 {
             rate / needed
@@ -322,6 +330,7 @@ mod tests {
             stereo_inverted: false,
             projection: None,
             horizontal_degrees: None,
+            ..Default::default()
         }
     }
 

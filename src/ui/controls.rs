@@ -51,6 +51,38 @@ pub const FORMATS: &[Format] = &[
     (Projection::Equirect360, Stereo::SideBySide),
 ];
 
+/// Formats for spatial (two-view) video: only the projection is a choice.
+pub const SPATIAL_FORMATS: &[Format] = &[
+    (Projection::Flat, Stereo::MultiView),
+    (Projection::Equirect180, Stereo::MultiView),
+    (Projection::Equirect360, Stereo::MultiView),
+    (Projection::Fisheye180, Stereo::MultiView),
+];
+
+/// The formats offered for a video with `views` coded views.
+pub fn formats(views: u32) -> &'static [Format] {
+    if views >= 2 { SPATIAL_FORMATS } else { FORMATS }
+}
+
+/// The favourites that apply to a video with `views` views: for spatial video
+/// their projections (as spatial formats), for other video the non-spatial ones.
+pub fn favourites_for(views: u32, favourites: &[Format]) -> Vec<Format> {
+    let mut out: Vec<Format> = Vec::new();
+    for &(projection, stereo) in favourites {
+        let format = if views >= 2 {
+            (projection, Stereo::MultiView)
+        } else if stereo == Stereo::MultiView {
+            continue;
+        } else {
+            (projection, stereo)
+        };
+        if !out.contains(&format) {
+            out.push(format);
+        }
+    }
+    out
+}
+
 pub fn format_label((projection, stereo): Format) -> String {
     let shape = match projection {
         Projection::Flat => "Flat",
@@ -62,6 +94,7 @@ pub fn format_label((projection, stereo): Format) -> String {
         Stereo::Mono => "2D",
         Stereo::SideBySide => "3D SBS",
         Stereo::TopBottom => "3D TB",
+        Stereo::MultiView => "Spatial 3D",
     };
     format!("{shape} {depth}")
 }
@@ -150,6 +183,8 @@ pub struct State {
     pub has_previous: bool,
     pub has_next: bool,
     pub loop_mode: LoopMode,
+    /// Coded views: 2 for spatial video (the format choices differ).
+    pub views: u32,
     /// None when the curve toggle does not apply (VR180/360).
     pub curved: Option<bool>,
     pub format: Format,
@@ -310,7 +345,10 @@ fn dialog_buttons(state: &State) -> Vec<(Hit, Rect, bool)> {
         }
         Some(Dialog::Screen) => {
             add(
-                grid((0..FORMATS.len()).map(Hit::Pick).collect(), 132.0),
+                grid(
+                    (0..formats(state.views).len()).map(Hit::Pick).collect(),
+                    132.0,
+                ),
                 true,
             );
             out.push((
@@ -720,7 +758,10 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
                 (format!("More ({}/{pages})", state.list_page + 1), false)
             }
             Hit::CaptionEdit => ("Adjust size and position…".to_string(), false),
-            Hit::Pick(i) => (format_label(FORMATS[i]), FORMATS[i] == state.format),
+            Hit::Pick(i) => {
+                let format = formats(state.views)[i];
+                (format_label(format), format == state.format)
+            }
             Hit::Curved => (
                 (if state.curved == Some(true) {
                     "Curved screen: on"
@@ -756,7 +797,7 @@ pub fn render_dialog(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
             if enabled { TEXT } else { FAINT },
         );
         if let Hit::Pick(i) = hit
-            && state.favourites.contains(&FORMATS[i])
+            && state.favourites.contains(&formats(state.views)[i])
         {
             star(&mut c, r.0 + r.2 - 22.0, r.1 + 20.0, 11.0, STAR);
         }
@@ -776,6 +817,7 @@ mod tests {
             has_previous: true,
             has_next: false,
             loop_mode: LoopMode::Off,
+            views: 1,
             curved: Some(false),
             format: FORMATS[0],
             favourites: vec![FORMATS[0], FORMATS[3]],
@@ -793,6 +835,28 @@ mod tests {
 
     fn center(r: Rect) -> (f32, f32) {
         (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0)
+    }
+
+    #[test]
+    fn spatial_formats_and_favourites() {
+        assert_eq!(formats(1), FORMATS);
+        assert_eq!(formats(2), SPATIAL_FORMATS);
+        let favourites = [FORMATS[0], FORMATS[3], (Projection::Flat, Stereo::MultiView)];
+        // Spatial video: the favourite projections, as spatial formats.
+        assert_eq!(
+            favourites_for(2, &favourites),
+            vec![SPATIAL_FORMATS[0], SPATIAL_FORMATS[1]]
+        );
+        // Other video: spatial favourites don't apply.
+        assert_eq!(favourites_for(1, &favourites), vec![FORMATS[0], FORMATS[3]]);
+        let mut s = state();
+        s.views = 2;
+        s.dialog = Some(Dialog::Screen);
+        let picks = dialog_buttons(&s)
+            .into_iter()
+            .filter(|(hit, ..)| matches!(hit, Hit::Pick(_)))
+            .count();
+        assert_eq!(picks, SPATIAL_FORMATS.len());
     }
 
     #[test]

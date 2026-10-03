@@ -9,7 +9,7 @@ use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
 use crate::ui::{browser, captions, controls};
 use crate::config::LoopMode;
-use crate::vr::Projection;
+use crate::vr::{Projection, Stereo};
 use anyhow::Context;
 use openxr as xr;
 use std::{
@@ -967,9 +967,10 @@ pub fn run(
                         .as_ref()
                         .is_some_and(|n| n.has_adjacent(1, folder_loop)),
                     loop_mode,
+                    views: playback.views,
                     curved: curved_applies.then_some(placement.curved),
                     format: (playback.layout.projection, playback.layout.stereo),
-                    favourites: favourites.clone(),
+                    favourites: controls::favourites_for(playback.views, &favourites),
                     swap_eyes: playback.layout.swap_eyes,
                     subtitle_tracks: playback.subtitle_labels(),
                     subtitle: playback.subtitle_index(),
@@ -1128,7 +1129,8 @@ pub fn run(
                     }
                     Some(controls::Hit::Screen) => {
                         let current = (playback.layout.projection, playback.layout.stereo);
-                        if let Some(next) = controls::next_favourite(current, &favourites) {
+                        let usable = controls::favourites_for(playback.views, &favourites);
+                        if let Some(next) = controls::next_favourite(current, &usable) {
                             set_format(playback, next);
                         }
                     }
@@ -1161,7 +1163,9 @@ pub fn run(
                         caption_edit = false;
                         dialog = Some(controls::Dialog::Tracks);
                     }
-                    Some(controls::Hit::Pick(i)) => set_format(playback, controls::FORMATS[i]),
+                    Some(controls::Hit::Pick(i)) => {
+                        set_format(playback, controls::formats(playback.views)[i])
+                    }
                     Some(controls::Hit::Curved) => placement.curved = !placement.curved,
                     Some(controls::Hit::SwapEyes) => {
                         playback.layout.swap_eyes = !playback.layout.swap_eyes;
@@ -1205,13 +1209,23 @@ pub fn run(
                     Some(controls::Hit::Screen) => dialog = Some(controls::Dialog::Screen),
                     // Star or unstar a favourite.
                     Some(controls::Hit::Pick(i)) => {
-                        let format = controls::FORMATS[i];
-                        match favourites.iter().position(|f| *f == format) {
-                            Some(at) if favourites.len() > 1 => {
-                                favourites.remove(at);
+                        let format = controls::formats(playback.views)[i];
+                        if format.1 == Stereo::MultiView {
+                            // Spatial video stars a projection: any favourite with it counts.
+                            let others = favourites.iter().filter(|f| f.0 != format.0).count();
+                            if others == favourites.len() {
+                                favourites.push(format);
+                            } else if others > 0 {
+                                favourites.retain(|f| f.0 != format.0);
                             }
-                            Some(_) => {} // keep at least one
-                            None => favourites.push(format),
+                        } else {
+                            match favourites.iter().position(|f| *f == format) {
+                                Some(at) if favourites.len() > 1 => {
+                                    favourites.remove(at);
+                                }
+                                Some(_) => {} // keep at least one
+                                None => favourites.push(format),
+                            }
                         }
                         let saved: Vec<crate::config::Format> = favourites
                             .iter()

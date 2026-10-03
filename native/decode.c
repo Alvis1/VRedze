@@ -100,6 +100,18 @@ int jv_decode(const char *path, const char *backend, const char *device,
         video->codecpar->codec_id != AV_CODEC_ID_AV1) {
         ret = fail(r, "Only H.264, HEVC and AV1 are in this gate", AVERROR(ENOSYS)); goto done;
     }
+    if (state.dedicated_v4l2) {
+        // The iris firmware crashes on 10-bit streams and sees only the base
+        // layer of MV-HEVC: like the player, send it 8-bit single-layer only.
+        const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(video->codecpar->format);
+        int multilayer = (video->disposition & AV_DISPOSITION_MULTILAYER) ||
+                         (video->codecpar->codec_id == AV_CODEC_ID_HEVC &&
+                          video->codecpar->profile == AV_PROFILE_HEVC_MULTIVIEW_MAIN);
+        if (!desc || desc->comp[0].depth != 8 || multilayer) {
+            ret = fail(r, "The V4L2 decoder only gets 8-bit single-layer video", AVERROR(ENOSYS));
+            goto done;
+        }
+    }
     char decoder_name[64];
     snprintf(decoder_name, sizeof(decoder_name), "%s%s", codec_name,
              state.dedicated_v4l2 ? "_v4l2m2m" : "");
