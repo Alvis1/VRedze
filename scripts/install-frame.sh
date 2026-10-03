@@ -10,11 +10,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 binary=target/aarch64-unknown-linux-gnu/release/just-video
 [ -x "$binary" ] || { echo "Build first: scripts/build-frame.sh" >&2; exit 1; }
-host=steamos@${FRAME_HOST:-frame.local}
-ssh_opts=(-i "$HOME/.ssh/steam_frame_ed25519" -o IdentitiesOnly=yes -o BatchMode=yes)
-ssh "${ssh_opts[@]}" "$host" 'mkdir -p ~/Applications/JustVideo'
-rsync -a -e "ssh ${ssh_opts[*]}" "$binary" "$host:Applications/JustVideo/just-video"
-ssh "${ssh_opts[@]}" "$host" "RESTART_STEAM=${FRAME_RESTART_STEAM:-0} bash -s" <<'REMOTE'
+source scripts/frame-env.sh
+frame_ssh 'mkdir -p ~/Applications/JustVideo'
+rsync -a -e "$(frame_ssh_wrapper)" "$binary" "$FRAME_TARGET:Applications/JustVideo/just-video"
+frame_ssh "RESTART_STEAM=${FRAME_RESTART_STEAM:-0} bash -s" <<'REMOTE'
 set -euo pipefail
 dir=$HOME/Applications/JustVideo
 launcher="$dir/Just Video"
