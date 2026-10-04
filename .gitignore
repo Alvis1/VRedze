@@ -3,3 +3,8 @@
 /reports/
 /samples/
 
+
+# Claude Code: project notes, hooks and skills stay local.
+/CLAUDE.md
+/CLAUDE.local.md
+/.claude/
