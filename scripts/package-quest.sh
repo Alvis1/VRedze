@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wraps the Quest library (scripts/build-quest.sh) into a signed APK:
-# target/quest/SpatialPlayer.apk. Needs the Android SDK build-tools and a
+# target/quest/JustVideo.apk (the icon comes from android/res). Needs the Android SDK build-tools and a
 # platform android.jar; downloads the Khronos OpenXR loader once (checked
 # against Maven Central's SHA-1) into .local-deps/openxr-loader.
 set -euo pipefail
@@ -31,11 +31,13 @@ out=target/quest
 stage=$out/stage
 rm -rf "$stage" && mkdir -p "$stage/lib/arm64-v8a"
 cp "$lib" "$loader" "$stage/lib/arm64-v8a/"
-"$tools/aapt2" link -o "$out/unsigned.apk" --manifest android/AndroidManifest.xml -I "$jar"
+"$tools/aapt2" compile --dir android/res -o "$out/res.zip"
+"$tools/aapt2" link -o "$out/unsigned.apk" --manifest android/AndroidManifest.xml -I "$jar" \
+  -R "$out/res.zip" --auto-add-overlay
 # Libraries go in uncompressed so Android can map them straight from the APK.
 (cd "$stage" && zip -q -0 -r ../unsigned.apk lib)
 "$tools/zipalign" -f -P 16 4 "$out/unsigned.apk" "$out/aligned.apk"
 "$tools/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android \
-  --key-pass pass:android --ks-key-alias androiddebugkey --out "$out/SpatialPlayer.apk" "$out/aligned.apk"
-rm -f "$out/unsigned.apk" "$out/aligned.apk"
-ls -l "$out/SpatialPlayer.apk"
+  --key-pass pass:android --ks-key-alias androiddebugkey --out "$out/JustVideo.apk" "$out/aligned.apk"
+rm -f "$out/unsigned.apk" "$out/aligned.apk" "$out/res.zip"
+ls -l "$out/JustVideo.apk"

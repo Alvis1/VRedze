@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Installs target/quest/SpatialPlayer.apk on the Quest connected over USB
+# Installs target/quest/JustVideo.apk on the Quest connected over USB
 # (Developer Mode on, USB debugging allowed), grants its permissions, starts it
 # and follows its log. QUEST_LOG=0 skips the log. Uses SideQuest's adb if there
 # is no adb on PATH.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-apk=target/quest/SpatialPlayer.apk
+apk=target/quest/JustVideo.apk
 package=com.spatialplayer.app
 [ -f "$apk" ] || { echo "Package first: scripts/package-quest.sh" >&2; exit 1; }
 adb=$(command -v adb || true)

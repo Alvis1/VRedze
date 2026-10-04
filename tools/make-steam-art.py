@@ -3,7 +3,8 @@
 
 Writes assets/steam/: capsule.png (600x900 library card), header.png (920x430),
 hero.png (1920x620 banner) and logo.png (transparent title, shown on the hero).
-scripts/install-frame.sh copies them into Steam's grid folder.
+scripts/install-frame.sh copies them into Steam's grid folder. The same look
+goes into android/res/drawable-nodpi/icon.png (512x512), the Quest app icon.
 Usage: tools/make-steam-art.py ["App Name"]
 """
 import math
@@ -15,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 NAME = sys.argv[1] if len(sys.argv) > 1 else "Just Video"
 TAGLINE = "3D  ·  180°  ·  360°  ·  Spatial"
 OUT = os.path.join(os.path.dirname(__file__), "..", "assets", "steam")
+ICON = os.path.join(os.path.dirname(__file__), "..", "android", "res", "drawable-nodpi", "icon.png")
 FONT = "/System/Library/Fonts/Avenir Next.ttc"  # index 2: Demi Bold, 0: Bold
 TOP, BOTTOM = (18, 24, 44), (40, 18, 64)  # deep blue to violet
 LEFT_EYE, RIGHT_EYE = (255, 92, 108), (64, 196, 255)  # anaglyph red / cyan
@@ -125,6 +127,16 @@ def main():
     centered_text(d, (640, 300), TAGLINE, fit_font(d, TAGLINE, 1100, 60), (215, 220, 245, 255), shadow=False)
     logo.save(os.path.join(OUT, "logo.png"))
     print("Wrote", ", ".join(sorted(os.listdir(OUT))), "to", os.path.normpath(OUT))
+    # Quest app icon: emblem and title on the same background.
+    w = h = 512
+    img = background(w, h).convert("RGBA")
+    e = emblem(int(h * 0.42))
+    img.alpha_composite(e, (w // 2 - e.width // 2, int(h * 0.38 - e.height / 2)))
+    d = ImageDraw.Draw(img)
+    centered_text(d, (w / 2, h * 0.78), NAME, fit_font(d, NAME, w * 0.86, 84), (255, 255, 255, 255))
+    os.makedirs(os.path.dirname(ICON), exist_ok=True)
+    img.convert("RGB").save(ICON)
+    print("Wrote", os.path.normpath(ICON))
 
 
 if __name__ == "__main__":

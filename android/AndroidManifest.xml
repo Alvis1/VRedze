@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Spatial Player for Meta Quest 2/3: a NativeActivity (no Java code) that
-     loads libjust_video.so; android-activity runs android_main in it. -->
+<!-- Just Video for Meta Quest 2/3 (the name it has on the Steam Frame): a
+     NativeActivity (no Java code) that loads libjust_video.so;
+     android-activity runs android_main in it. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.spatialplayer.app"
     android:versionCode="1"
@@ -38,7 +39,8 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <application
-        android:label="Spatial Player"
+        android:label="Just Video"
+        android:icon="@drawable/icon"
         android:hasCode="false"
         android:allowBackup="false">
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
