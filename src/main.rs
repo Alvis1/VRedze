@@ -303,7 +303,7 @@ fn badge(verdict: Verdict) -> &'static str {
 
 fn print_assessment(name: &str, a: &Assessment) {
     println!("{} {name} — {}", badge(a.verdict), a.title);
-    for line in [&a.detail, &a.hint].into_iter().flatten() {
+    for line in [&a.detail, &a.todo].into_iter().flatten() {
         println!("     {line}");
     }
 }

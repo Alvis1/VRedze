@@ -104,6 +104,17 @@ pub struct Row {
     pub dimmed: bool,
     /// Outlined: the entry just come back out of.
     pub outlined: bool,
+    /// Shown by the row while it is pointed at.
+    pub tip: Option<Tip>,
+}
+
+/// Why a video plays badly (or not at all) and what to do about it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tip {
+    pub title: String,
+    pub detail: Vec<String>,
+    /// What to do, drawn brighter than the explanation.
+    pub todo: Option<String>,
 }
 
 impl Row {
@@ -118,6 +129,7 @@ impl Row {
             checked: None,
             dimmed: false,
             outlined: false,
+            tip: None,
         }
     }
 }
@@ -374,6 +386,72 @@ pub fn hit(view: &View, fonts: &mut Fonts, x: f32, y: f32) -> Hit {
     Hit::Row(i)
 }
 
+fn icon_color(icon: &Icon) -> Rgb {
+    match icon {
+        Icon::Video(Some(Verdict::Hardware)) => GREEN,
+        Icon::Video(Some(Verdict::Software)) => YELLOW,
+        Icon::Video(Some(Verdict::SoftwareMarginal)) => ORANGE,
+        Icon::Video(Some(Verdict::Unplayable)) | Icon::Broken => RED,
+        _ => GREY,
+    }
+}
+
+const TIP_TITLE: f32 = 30.0;
+const TIP_TEXT: f32 = 26.0;
+const TIP_LINE: f32 = 36.0;
+const TIP_PAD: f32 = 26.0;
+
+/// The tip box for row `i`, below it (above near the bottom of the list).
+fn draw_tip(canvas: &mut Canvas, fonts: &mut Fonts, view: &View, i: usize, tip: &Tip) {
+    let (rx, ry, rw, rh) = row_rect(view, i);
+    let (x, w) = (rx + 72.0, rw - 72.0);
+    let text_w = w - 2.0 * TIP_PAD - 10.0;
+    let title = fonts.wrap(&tip.title, TIP_TITLE, text_w);
+    let detail: Vec<String> = tip
+        .detail
+        .iter()
+        .flat_map(|p| fonts.wrap(p, TIP_TEXT, text_w))
+        .collect();
+    let todo = tip
+        .todo
+        .as_ref()
+        .map(|t| fonts.wrap(t, TIP_TEXT, text_w))
+        .unwrap_or_default();
+    let h = TIP_PAD * 2.0
+        + title.len() as f32 * (TIP_TITLE + 12.0)
+        + detail.len() as f32 * TIP_LINE
+        + if todo.is_empty() {
+            0.0
+        } else {
+            14.0 + todo.len() as f32 * TIP_LINE
+        };
+    let below = ry + rh + 6.0;
+    let y = if below + h <= HEIGHT as f32 - BOTTOM {
+        below
+    } else {
+        (ry - h - 6.0).max(HEADER)
+    };
+    canvas.translucent_rect(x + 6.0, y + 10.0, w, h, 18.0, [0, 0, 0], 0.55);
+    canvas.rect(x, y, w, h, 18.0, [0x2b, 0x31, 0x3c]);
+    canvas.rect(x, y, 10.0, h, 5.0, icon_color(&view.rows[i].icon));
+    let tx = x + TIP_PAD + 10.0;
+    let mut baseline = y + TIP_PAD + TIP_TITLE;
+    for line in &title {
+        fonts.draw(canvas, line, tx, baseline, TIP_TITLE, TEXT, text_w);
+        baseline += TIP_TITLE + 12.0;
+    }
+    baseline += TIP_TEXT - TIP_TITLE;
+    for line in &detail {
+        fonts.draw(canvas, line, tx, baseline, TIP_TEXT, SUBTLE, text_w);
+        baseline += TIP_LINE;
+    }
+    baseline += 14.0;
+    for line in &todo {
+        fonts.draw(canvas, line, tx, baseline, TIP_TEXT, TEXT, text_w);
+        baseline += TIP_LINE;
+    }
+}
+
 fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
     match icon {
         Icon::Server => {
@@ -391,16 +469,7 @@ fn draw_icon(canvas: &mut Canvas, icon: &Icon, cx: f32, cy: f32) {
             canvas.rect(cx - 24.0, cy - 18.0, 20.0, 10.0, 3.0, color);
             canvas.rect(cx - 24.0, cy - 12.0, 48.0, 32.0, 4.0, color);
         }
-        Icon::Video(verdict) => {
-            let color = match verdict {
-                Some(Verdict::Hardware) => GREEN,
-                Some(Verdict::Software) => YELLOW,
-                Some(Verdict::SoftwareMarginal) => ORANGE,
-                Some(Verdict::Unplayable) => RED,
-                None => GREY,
-            };
-            canvas.circle(cx, cy, 16.0, color);
-        }
+        Icon::Video(_) => canvas.circle(cx, cy, 16.0, icon_color(icon)),
         Icon::Broken => {
             canvas.circle(cx, cy, 16.0, RED);
             canvas.rect(cx - 9.0, cy - 3.0, 18.0, 6.0, 2.0, BG);
@@ -747,6 +816,16 @@ pub fn render(
         );
     }
 
+    // The pointed-at row's tip, over the rows below it.
+    if view.dialog.is_none()
+        && view.form.is_none()
+        && view.status.is_none()
+        && let Some(Hit::Row(i)) = hover
+        && let Some(tip) = &view.rows[i].tip
+    {
+        draw_tip(&mut canvas, fonts, view, i, tip);
+    }
+
     if let Some(dialog) = &view.dialog {
         // Dim the list behind the dialog.
         for px in canvas.pixels.chunks_exact_mut(4) {
@@ -922,6 +1001,41 @@ mod tests {
         }
         let (tx, _, tw, _) = tool_rect(&view, 2);
         assert!(tx + tw <= WIDTH as f32 - PAD + 0.5);
+    }
+
+    #[test]
+    fn tip_shows_for_the_pointed_row() {
+        let mut view = view();
+        let mut fonts = Fonts::load().expect("fonts");
+        view.rows[1] = Row {
+            icon: Icon::Video(Some(Verdict::Unplayable)),
+            detail: "Can't play smoothly on Quest (8K 30 fps H.264)".into(),
+            tip: Some(Tip {
+                title: "Can't play smoothly on Quest (8K 30 fps H.264)".into(),
+                detail: vec!["Quest's hardware video decoder takes at most 8192x4320 pixels (or 5760x5760 for square 360° video), and this video is 7680x7680. Decoding it on the CPU instead reaches only about 88% of the speed needed, so playback would stutter badly.".into()],
+                todo: Some("What to do: convert it to 8-bit HEVC at 5760x5760. tools/fit-for-quest.sh does this on a Mac, or use HandBrake (H.265, 8-bit).".into()),
+            }),
+            ..Row::new(Icon::Video(None), "8K30fpsVBR50_100.mp4")
+        };
+        let y = HEADER + ROW * 1.5;
+        let plain = render(&view, &mut fonts, Some((400.0, HEADER + ROW * 2.5)), false);
+        let pointed = render(&view, &mut fonts, Some((400.0, y)), false);
+        assert_ne!(plain.pixels, pointed.pixels, "the tip is drawn");
+        // Its stripe takes the row's colour, just below the row.
+        let (rx, ry, _, rh) = row_rect(&view, 1);
+        let at = (((ry + rh + 40.0) as u32 * WIDTH + (rx + 76.0) as u32) * 4) as usize;
+        assert_eq!(&pointed.pixels[at..at + 3], &RED[..]);
+        // BROWSER_PNG=/tmp/tip.png cargo test browser::tests::tip: a look at it.
+        if let Some(path) = std::env::var_os("BROWSER_PNG") {
+            let file = std::fs::File::create(path).expect("create png");
+            let mut encoder = png::Encoder::new(file, WIDTH, HEIGHT);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .and_then(|mut w| w.write_image_data(&pointed.pixels))
+                .expect("write png");
+        }
     }
 
     #[test]

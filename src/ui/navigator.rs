@@ -5,7 +5,7 @@
 //! reveals Edit/Remove for the server and, inside it, Rename on every entry
 //! and a "Select" tool for deleting several entries at once.
 
-use super::browser::{Action, Dialog, Hit, Icon, Row, Tool, ToolIcon, View, format_size};
+use super::browser::{Action, Dialog, Hit, Icon, Row, Tip, Tool, ToolIcon, View, format_size};
 use super::form::{self, Field, Form, Key};
 use crate::config::{self, Server};
 use crate::library::{Library, Opened, Path, Request, Response};
@@ -15,6 +15,31 @@ use crate::smb::SmbUrl;
 use std::collections::HashSet;
 
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mkv", "mov", "webm", "avi", "ts", "m2ts"];
+
+/// What to do about a file that can't be read.
+const BROKEN_TODO: &str = "What to do: it may be damaged, still copying, or not a video. Copy it to the headset again, or check that it plays on a computer.";
+
+/// What to do when playback stops with an error and there's no advice for
+/// the video itself.
+const FAILED_TODO: &str = "If it happens again: copy the video to the headset again, or convert it to 8-bit HEVC (tools/fit-for-quest.sh does this on a Mac, or HandBrake with H.265, 8-bit).";
+
+/// The tip shown while a video is pointed at: for videos that won't use the
+/// hardware decoder (why, and what to do) and for files that can't be read.
+fn video_tip(assessment: Option<&Assessment>, broken: Option<&str>) -> Option<Tip> {
+    if let Some(error) = broken {
+        return Some(Tip {
+            title: "Can't read this file".into(),
+            detail: vec![error.to_string()],
+            todo: Some(BROKEN_TODO.into()),
+        });
+    }
+    let a = assessment.filter(|a| a.verdict != Verdict::Hardware)?;
+    Some(Tip {
+        title: a.title.clone(),
+        detail: a.detail.iter().cloned().collect(),
+        todo: a.todo.clone(),
+    })
+}
 
 pub fn is_video(name: &str) -> bool {
     name.rsplit_once('.')
@@ -395,6 +420,7 @@ impl Navigator {
                             (Some(a), None) => a.title.clone(),
                             (None, None) => "Checking…".into(),
                         },
+                        tip: video_tip(assessment.as_ref(), broken.as_deref()),
                         right: format_size(*size),
                         ..Row::new(Icon::Video(None), name)
                     },
@@ -562,7 +588,7 @@ impl Navigator {
                             crate::xr::app::drop_in_background(opened);
                             self.dialog(
                                 a.title,
-                                [a.detail, a.hint].into_iter().flatten().collect(),
+                                [a.detail, a.todo].into_iter().flatten().collect(),
                             );
                         }
                         Ok(mut opened) => {
@@ -773,8 +799,20 @@ impl Navigator {
 
     /// Back from a video that stopped with an error: says why.
     pub fn playback_failed(&mut self, error: &str) {
+        // What to do: the advice for this video, or the general one.
+        let todo = self
+            .playing
+            .and_then(|i| self.items.get(i))
+            .and_then(|item| match item {
+                Item::Video {
+                    assessment: Some(a),
+                    ..
+                } => a.todo.clone(),
+                _ => None,
+            })
+            .unwrap_or_else(|| FAILED_TODO.into());
         self.playback_ended();
-        self.dialog("Playback stopped", vec![error.to_string()]);
+        self.dialog("Playback stopped", vec![error.to_string(), todo]);
     }
 
     /// Back from playing: outlines the video that played, and keeps it in view.
@@ -884,13 +922,13 @@ impl Navigator {
                 },
             ) => {
                 if let Some(e) = broken {
-                    let body = vec!["It may be damaged or not a video.".into(), e.clone()];
+                    let body = vec![e.clone(), BROKEN_TODO.into()];
                     self.dialog("Can't read this file", body);
                 } else if let Some(a) = assessment
                     .as_ref()
                     .filter(|a| a.verdict == Verdict::Unplayable)
                 {
-                    let body = [a.detail.clone(), a.hint.clone()]
+                    let body = [a.detail.clone(), a.todo.clone()]
                         .into_iter()
                         .flatten()
                         .collect();

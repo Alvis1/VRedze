@@ -522,7 +522,28 @@ pub struct Playback {
     clock_start: Option<i64>,
     paused_at: Option<i64>,
     pub stats: PlayStats,
+    /// The version of the video that would play well ("8-bit HEVC at
+    /// 5760x5760"), for the notice when playback can't keep up.
+    pub convert_to: Option<String>,
+    slow: SlowWatch,
 }
+
+/// Whether decoding keeps up, judged over a few seconds of playback.
+#[derive(Default)]
+struct SlowWatch {
+    since: Option<Instant>,
+    /// Pictures due in this stretch, and how many of them came late or were skipped.
+    pictures: u32,
+    late: u32,
+    /// Most were late: the user should hear why (once per video).
+    detected: bool,
+    told: bool,
+}
+
+/// A picture shown this far behind the clock counts as late.
+const LATE: f64 = 0.15;
+/// Stretches of playback judged at a time.
+const SLOW_STRETCH: Duration = Duration::from_secs(3);
 
 impl Playback {
     /// Starts decoding (and sound, when the file has audio) at `start` seconds.
@@ -625,6 +646,8 @@ impl Playback {
             clock_start: None,
             paused_at: None,
             stats: PlayStats::default(),
+            convert_to: None,
+            slow: SlowWatch::default(),
         }
     }
 
@@ -853,6 +876,10 @@ impl Playback {
         self.clock_start = None;
         self.last_pts = target;
         self.shown_since_seek = false;
+        // Pictures right after a seek are late by design.
+        self.slow.since = None;
+        self.slow.pictures = 0;
+        self.slow.late = 0;
         // When paused, playback stays paused and shows the new position
         // (see `advance`).
     }
@@ -865,6 +892,7 @@ impl Playback {
         self.sync_to_audio(now);
         let mut media_time = self.media_time(now);
         let mut changed = false;
+        let skipped_before = self.stats.skipped_frames;
         loop {
             if self.next.is_none() && !self.ended {
                 match self.decode.frames.try_recv() {
@@ -908,8 +936,54 @@ impl Playback {
         }
         if let Some(t) = media_time {
             self.stats.media_seconds = t;
+            if changed {
+                let skipped = (self.stats.skipped_frames - skipped_before) as u32;
+                self.watch_speed(t - self.last_pts, skipped);
+            }
         }
         changed
+    }
+
+    /// Counts pictures that came late (or were skipped to catch up); a
+    /// stretch of playback where most did means decoding can't keep up.
+    fn watch_speed(&mut self, lag: f64, skipped: u32) {
+        let w = &mut self.slow;
+        if w.detected {
+            return;
+        }
+        let now = Instant::now();
+        let since = *w.since.get_or_insert(now);
+        w.pictures += 1 + skipped;
+        if lag > LATE || skipped > 0 {
+            w.late += 1 + skipped;
+        }
+        if now.duration_since(since) >= SLOW_STRETCH {
+            if w.pictures >= 20 && w.late * 2 > w.pictures {
+                w.detected = true;
+                eprintln!(
+                    "Playing slowly: {} of {} pictures late in {:.0} s",
+                    w.late,
+                    w.pictures,
+                    SLOW_STRETCH.as_secs_f64()
+                );
+            }
+            w.since = Some(now);
+            w.pictures = 0;
+            w.late = 0;
+        }
+    }
+
+    /// Once per video, when decoding falls behind: what to tell the user.
+    pub fn take_slow_notice(&mut self) -> Option<String> {
+        if !self.slow.detected || std::mem::replace(&mut self.slow.told, true) {
+            return None;
+        }
+        Some(match &self.convert_to {
+            Some(target) => format!(
+                "Playing slowly: this headset can't decode this video in time. Convert it to {target} (point at it in the list for how)."
+            ),
+            None => "Playing slowly: the video can't be read or decoded in time. If it's on a network share, copy it to the headset.".into(),
+        })
     }
 
     /// Keeps the video clock on the audio clock (what is actually heard).

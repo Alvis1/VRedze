@@ -913,6 +913,7 @@ pub fn run(
                         );
                     }
                     resume_saved_at = Instant::now();
+                    playback.convert_to = opened.assessment.convert_to.clone();
                     playback.add_external_subtitles(opened.external_subtitles);
                     playback.image = opened.image;
                     renderer.set_adjust(&playback.image);
@@ -1453,6 +1454,9 @@ pub fn run(
                 }
                 set_phase(6);
                 let mut upload = playback.advance(now);
+                if let Some(text) = playback.take_slow_notice() {
+                    playback.notice(text, Duration::from_secs(10));
+                }
                 // A picture the GPU can't hold ends this video (back to the
                 // browser with the reason), not the whole app.
                 if upload

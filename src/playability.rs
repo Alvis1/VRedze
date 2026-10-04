@@ -218,6 +218,12 @@ pub struct Assessment {
     pub detail: Option<String>,
     /// What version of the video would play, when we can tell.
     pub hint: Option<String>,
+    /// What to do about it, for a tooltip: the version to convert it to and
+    /// how ("What to do: convert it to … tools/fit-for-quest.sh …").
+    pub todo: Option<String>,
+    /// Just the version to convert it to ("8-bit HEVC at 5760x5760"), for
+    /// short notices.
+    pub convert_to: Option<String>,
     /// Estimated CPU decode speed relative to real time (software paths only).
     pub software_speed: Option<f64>,
 }
@@ -257,6 +263,24 @@ fn describe(v: &VideoInfo) -> String {
 }
 
 pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
+    let mut a = judge(platform, video);
+    if let Some(v) = video
+        && let Some((target, how)) = conversion(platform, v, a.verdict)
+    {
+        let lead = match a.verdict {
+            Verdict::Hardware => "",
+            Verdict::Software => "Optional, for less battery use:",
+            Verdict::SoftwareMarginal => "If it stutters:",
+            Verdict::Unplayable => "What to do:",
+        };
+        a.todo = Some(format!("{lead} convert it to {target}. {how}"));
+        a.convert_to = Some(target);
+    }
+    a
+}
+
+/// The verdict and its explanation, without the advice.
+fn judge(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
     let Some(v) = video else {
         return Assessment {
             platform,
@@ -264,6 +288,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             title: "No video track".into(),
             detail: Some("This file contains no video stream.".into()),
             hint: None,
+            todo: None,
+            convert_to: None,
             software_speed: None,
         };
     };
@@ -279,6 +305,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
                 texture_width, v.height
             )),
             hint: hint(platform, v),
+            todo: None,
+            convert_to: None,
             software_speed: None,
         };
     }
@@ -290,6 +318,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             title: format!("Plays with hardware decoding ({})", describe(v)),
             detail: None,
             hint: None,
+            todo: None,
+            convert_to: None,
             software_speed: None,
         };
     }
@@ -314,6 +344,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
             title: format!("Plays with CPU decoding ({})", describe(v)),
             detail: Some(format!("{why_hw}. It is decoded on the CPU instead.")),
             hint: None,
+            todo: None,
+            convert_to: None,
             software_speed: None,
         },
         Some(s) if s >= SOFTWARE_HEADROOM => Assessment {
@@ -324,6 +356,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
                 "{why_hw}. It is decoded on the CPU instead: playback is smooth but uses more battery."
             )),
             hint: None,
+            todo: None,
+            convert_to: None,
             software_speed: Some(s),
         },
         Some(s) if s >= 1.0 => Assessment {
@@ -334,6 +368,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
                 "{why_hw}. The CPU can only just keep up with this video, so playback may stutter."
             )),
             hint: hint(platform, v),
+            todo: None,
+            convert_to: None,
             software_speed: Some(s),
         },
         Some(s) => Assessment {
@@ -345,6 +381,8 @@ pub fn assess(platform: Platform, video: Option<&VideoInfo>) -> Assessment {
                 (s * 100.0).floor()
             )),
             hint: hint(platform, v),
+            todo: None,
+            convert_to: None,
             software_speed: Some(s),
         },
     }
@@ -402,13 +440,95 @@ fn hint(platform: Platform, v: &VideoInfo) -> Option<String> {
             ..v.clone()
         };
         if matches!(
-            assess(platform, Some(&smaller)).verdict,
+            judge(platform, Some(&smaller)).verdict,
             Verdict::Hardware | Verdict::Software
         ) {
             options.push("a 4K version".into());
         }
     }
     (!options.is_empty()).then(|| format!("{} of this video would play.", join_or(&options)))
+}
+
+/// For a video that doesn't use the hardware decoder: the first version of
+/// it that would (target), and how to make it. Spatial video becomes side by
+/// side; others become 8-bit HEVC at the same size, the largest size the
+/// Quest's decoder takes, 30 fps, or 4K.
+fn conversion(platform: Platform, v: &VideoInfo, verdict: Verdict) -> Option<(String, String)> {
+    if verdict == Verdict::Hardware {
+        return None;
+    }
+    let hevc = |width: u32, height: u32, fps: f64| VideoInfo {
+        codec: "hevc".into(),
+        profile: Some("Main".into()),
+        pixel_format: Some("yuv420p".into()),
+        bit_depth: 8,
+        width,
+        height,
+        fps,
+        multilayer: false,
+        views: 1,
+        ..v.clone()
+    };
+    let plays = |c: &VideoInfo| judge(platform, Some(c)).verdict == Verdict::Hardware;
+    // The largest common width the Quest's decoder takes at this shape.
+    let quest_fit = |w: u32, h: u32| -> (u32, u32) {
+        let blocks = w.div_ceil(16) as f64 * h.div_ceil(16) as f64;
+        if blocks <= 138_240.0 && w <= 8192 {
+            return (w, h);
+        }
+        let most = (w as f64 * (138_240.0 / blocks).sqrt()).min(8192.0);
+        let fit = [7680, 6144, 5760, 5120, 4096, 3840, 2880, 1920]
+            .into_iter()
+            .find(|&c| c as f64 <= most)
+            .unwrap_or(1920);
+        (
+            fit,
+            ((h as f64 * fit as f64 / w as f64 / 16.0).floor() * 16.0) as u32,
+        )
+    };
+    const FIT: &str = "tools/fit-for-quest.sh does this on a Mac, or use HandBrake (H.265, 8-bit).";
+    if v.multilayer || v.views >= 2 {
+        // Both eyes side by side in one picture, which hardware decoders play.
+        let (w, h) = quest_fit(v.width * 2, v.height);
+        let sbs = hevc(w, h, v.fps);
+        if !plays(&sbs) {
+            return None;
+        }
+        let how = if w == v.width * 2 {
+            "tools/spatial2sbs.sh does this on a Mac.".to_string()
+        } else {
+            format!("tools/spatial2sbs.sh --max-width {w} does this on a Mac.")
+        };
+        return Some((format!("side-by-side 3D ({w}x{h})"), how));
+    }
+    let same = hevc(v.width, v.height, v.fps);
+    if plays(&same) {
+        return Some(("8-bit HEVC at the same size".into(), FIT.into()));
+    }
+    let (w, h) = quest_fit(v.width, v.height);
+    if plays(&hevc(w, h, v.fps)) {
+        return Some((format!("8-bit HEVC at {w}x{h}"), FIT.into()));
+    }
+    if v.fps > 31.0 && plays(&hevc(w, h, 30.0)) {
+        return Some((
+            format!("8-bit HEVC at {w}x{h} and 30 fps"),
+            "HandBrake does this (H.265, 8-bit, frame rate 30).".into(),
+        ));
+    }
+    let side = v.width.max(v.height);
+    if side > 3840 {
+        let (w, h) = (
+            (v.width as u64 * 3840 / side as u64) as u32 / 16 * 16,
+            (v.height as u64 * 3840 / side as u64) as u32 / 16 * 16,
+        );
+        if plays(&hevc(w, h, v.fps.min(60.0))) {
+            return Some((
+                format!("8-bit HEVC at {w}x{h}"),
+                "HandBrake does this (H.265, 8-bit, and that size).".into(),
+            ));
+        }
+    }
+    None
 }
 
 fn join_or(items: &[String]) -> String {
@@ -564,6 +684,41 @@ mod tests {
         v.width = 8640;
         v.height = 4320;
         assert_eq!(frame(&v).verdict, Verdict::Unplayable);
+    }
+
+    #[test]
+    fn advice_says_what_to_convert_to() {
+        // The 8K 360° files that the Quest 3 can't decode in hardware.
+        let mut v = video("h264", 7680, 7680, 8, 30.0);
+        v.profile = Some("High".into());
+        v.pixel_format = Some("yuv420p".into());
+        let a = assess(Platform::Quest, Some(&v));
+        assert_eq!(a.convert_to.as_deref(), Some("8-bit HEVC at 5760x5760"));
+        let todo = a.todo.unwrap();
+        assert!(
+            todo.starts_with("What to do: convert it to 8-bit HEVC at 5760x5760."),
+            "{todo}"
+        );
+        assert!(todo.contains("tools/fit-for-quest.sh"));
+        // 10-bit on the Frame: the same size, 8-bit.
+        let a = frame(&video("hevc", 8192, 4096, 10, 59.94));
+        assert_eq!(a.convert_to.as_deref(), Some("8-bit HEVC at the same size"));
+        // Spatial video: side by side, smaller where the Quest needs it.
+        let mut s = video("hevc", 1920, 1080, 8, 60.0);
+        s.multilayer = true;
+        s.views = 2;
+        let a = assess(Platform::Quest, Some(&s));
+        assert_eq!(a.convert_to.as_deref(), Some("side-by-side 3D (3840x1080)"));
+        assert!(
+            a.todo
+                .unwrap()
+                .starts_with("Optional, for less battery use:")
+        );
+        // Hardware decoding: nothing to do.
+        let mut ok = video("hevc", 3840, 2160, 8, 30.0);
+        ok.profile = Some("Main".into());
+        ok.pixel_format = Some("yuv420p".into());
+        assert!(assess(Platform::Quest, Some(&ok)).todo.is_none());
     }
 
     #[test]
