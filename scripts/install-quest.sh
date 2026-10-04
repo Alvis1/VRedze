@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Installs target/quest/JustVideo.apk on the Quest connected over USB
+# Installs target/quest/VRedze.apk on the Quest connected over USB
 # (Developer Mode on, USB debugging allowed), grants its permissions, starts it
 # and follows its log. QUEST_LOG=0 skips the log. Uses SideQuest's adb if there
 # is no adb on PATH.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-apk=target/quest/JustVideo.apk
+apk=target/quest/VRedze.apk
 package=com.spatialplayer.app
 [ -f "$apk" ] || { echo "Package first: scripts/package-quest.sh" >&2; exit 1; }
 adb=$(command -v adb || true)
@@ -28,6 +28,6 @@ if [ "${QUEST_LOG:-1}" = 1 ]; then
   if [ -n "$pid" ]; then
     exec "$adb" logcat --pid="$pid" -v brief
   else
-    exec "$adb" logcat -v brief -s JustVideo AndroidRuntime DEBUG
+    exec "$adb" logcat -v brief -s VRedze AndroidRuntime DEBUG
   fi
 fi

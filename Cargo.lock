@@ -1460,32 +1460,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "just-video"
-version = "0.1.0"
-dependencies = [
- "android-activity",
- "anyhow",
- "ash",
- "cc",
- "clap",
- "ctrlc",
- "fontdue",
- "futures-util",
- "libc",
- "libloading 0.9.0",
- "naga",
- "ndk",
- "openxr",
- "pkg-config",
- "png",
- "rpassword",
- "serde",
- "serde_json",
- "smb",
- "tokio",
-]
-
-[[package]]
 name = "kbkdf"
 version = "0.1.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3408,6 +3382,32 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "vredze"
+version = "0.1.0"
+dependencies = [
+ "android-activity",
+ "anyhow",
+ "ash",
+ "cc",
+ "clap",
+ "ctrlc",
+ "fontdue",
+ "futures-util",
+ "libc",
+ "libloading 0.9.0",
+ "naga",
+ "ndk",
+ "openxr",
+ "pkg-config",
+ "png",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "smb",
+ "tokio",
+]
 
 [[package]]
 name = "walkdir"

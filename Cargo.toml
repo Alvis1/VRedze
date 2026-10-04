@@ -1,10 +1,10 @@
 [package]
-name = "just-video"
+name = "vredze"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Standalone Steam Frame VR video player reading directly from SMB shares"
-default-run = "just-video"
+description = "VRedze: VR video player for Steam Frame and Meta Quest"
+default-run = "vredze"
 
 [features]
 default = ["decode"]
@@ -12,7 +12,7 @@ default = ["decode"]
 decode = []
 
 [[bin]]
-name = "just-video"
+name = "vredze"
 path = "src/main.rs"
 required-features = ["decode"]
 

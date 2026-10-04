@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Just Video for Meta Quest 2/3 (the name it has on the Steam Frame): a
-     NativeActivity (no Java code) that loads libjust_video.so;
-     android-activity runs android_main in it. -->
+<!-- VRedze for Meta Quest 2/3: a NativeActivity (no Java code) that loads
+     libvredze.so; android-activity runs android_main in it. The package
+     name is from before the rename: changing it would make a second app. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.spatialplayer.app"
     android:versionCode="1"
@@ -39,7 +39,7 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
 
     <application
-        android:label="Just Video"
+        android:label="VRedze"
         android:icon="@drawable/icon"
         android:hasCode="false"
         android:allowBackup="false">
@@ -53,7 +53,7 @@
             android:excludeFromRecents="false"
             android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode">
-            <meta-data android:name="android.app.lib_name" android:value="just_video" />
+            <meta-data android:name="android.app.lib_name" android:value="vredze" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

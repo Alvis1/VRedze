@@ -102,7 +102,7 @@ fn player_survives_bad_files() {
             vec!["info"],
             vec!["bench", "--frames", "60", "--hw", "none"],
         ] {
-            let output = Command::new(env!("CARGO_BIN_EXE_just-video"))
+            let output = Command::new(env!("CARGO_BIN_EXE_vredze"))
                 .args(&args)
                 .arg(&path)
                 .output()
@@ -127,7 +127,7 @@ fn ten_bit_never_uses_v4l2() {
         eprintln!("skipping: run scripts/make-samples.sh");
         return;
     }
-    let output = Command::new(env!("CARGO_BIN_EXE_just-video"))
+    let output = Command::new(env!("CARGO_BIN_EXE_vredze"))
         .args([
             "--platform",
             "steam-frame",
@@ -156,7 +156,7 @@ fn ten_bit_never_uses_v4l2() {
 #[cfg(feature = "decode")]
 #[test]
 fn decoder_yields_frames_with_planes_and_pts() {
-    use just_video::media::{Media, PlaneLayout};
+    use vredze::media::{Media, PlaneLayout};
     for (name, bits) in [("h264-720p.mp4", 8), ("hevc-main10-720p.mp4", 10)] {
         let path = format!("{}/samples/{name}", env!("CARGO_MANIFEST_DIR"));
         let Ok(file) = std::fs::File::open(&path) else {

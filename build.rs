@@ -72,7 +72,7 @@ fn build_id() -> String {
 }
 
 fn main() {
-    println!("cargo:rustc-env=JUST_VIDEO_BUILD={}", build_id());
+    println!("cargo:rustc-env=VREDZE_BUILD={}", build_id());
     compile_shader();
     for source in [
         "native/decode.c",
@@ -90,9 +90,9 @@ fn main() {
         .file("native/decode.c")
         .file("native/media.c")
         .flag_if_supported("-std=c11");
-    println!("cargo:rerun-if-env-changed=JUST_VIDEO_STATIC_FFMPEG");
+    println!("cargo:rerun-if-env-changed=VREDZE_STATIC_FFMPEG");
     // The Steam Frame build bundles its own FFmpeg + dav1d (scripts/build-frame-media.sh).
-    let statik = std::env::var_os("JUST_VIDEO_STATIC_FFMPEG").is_some();
+    let statik = std::env::var_os("VREDZE_STATIC_FFMPEG").is_some();
     for library in ["libavformat", "libavcodec", "libswresample", "libavutil"] {
         let found = pkg_config::Config::new()
             .statik(statik)
@@ -104,5 +104,5 @@ fn main() {
             build.include(include);
         }
     }
-    build.compile("just_video_native");
+    build.compile("vredze_native");
 }

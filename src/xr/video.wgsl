@@ -1,4 +1,4 @@
-// Just Video: per-pixel ray casting from each eye into the video's projection.
+// VRedze: per-pixel ray casting from each eye into the video's projection.
 // One fullscreen triangle per eye; no meshes, so projections are exact.
 
 const PI: f32 = 3.14159265358979;

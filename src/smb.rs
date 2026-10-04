@@ -39,7 +39,7 @@ impl FromStr for SmbUrl {
         if let Some(userinfo) = userinfo {
             ensure!(
                 !userinfo.contains(':'),
-                "Do not put passwords in SMB URLs; use JUST_VIDEO_SMB_PASSWORD or the prompt"
+                "Do not put passwords in SMB URLs; use VREDZE_SMB_PASSWORD or the prompt"
             );
         }
         let (domain, user) = match userinfo.map(|u| u.split_once(';').unwrap_or(("", u))) {

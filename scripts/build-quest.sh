@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the Meta Quest (Android arm64) library, libjust_video.so: the player
+# Builds the Meta Quest (Android arm64) library, libvredze.so: the player
 # with FFmpeg + dav1d linked in statically (scripts/build-android-media.sh).
 # scripts/package-quest.sh then wraps it into an APK.
 set -euo pipefail
@@ -21,16 +21,16 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android$API-
 export PKG_CONFIG_ALLOW_CROSS=1
 export "PKG_CONFIG_LIBDIR_$t=$media/lib/pkgconfig"
 export "PKG_CONFIG_PATH_$t="
-export JUST_VIDEO_STATIC_FFMPEG=1
+export VREDZE_STATIC_FFMPEG=1
 if [ "${1:-}" = --cli ]; then
   # The command-line player (bench, info) to run over adb, e.g.
-  # adb push target/aarch64-linux-android/release/just-video /data/local/tmp/
+  # adb push target/aarch64-linux-android/release/vredze /data/local/tmp/
   shift
-  cargo build --release --target aarch64-linux-android --bin just-video "$@"
-  "$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/just-video
-  ls -l target/aarch64-linux-android/release/just-video
+  cargo build --release --target aarch64-linux-android --bin vredze "$@"
+  "$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/vredze
+  ls -l target/aarch64-linux-android/release/vredze
   exit
 fi
 cargo rustc --release --lib --target aarch64-linux-android --crate-type cdylib "$@"
-"$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/libjust_video.so
-ls -l target/aarch64-linux-android/release/libjust_video.so
+"$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/libvredze.so
+ls -l target/aarch64-linux-android/release/libvredze.so

@@ -60,9 +60,9 @@ impl XrContext {
         }
         let xr = entry.create_instance(
             &xr::ApplicationInfo {
-                application_name: "Just Video",
+                application_name: "VRedze",
                 application_version: 1,
-                engine_name: "just-video",
+                engine_name: "vredze",
                 engine_version: 1,
                 api_version: xr::Version::new(1, 0, 0),
             },
@@ -89,7 +89,7 @@ impl XrContext {
 
         let vk_entry = unsafe { ash::Entry::load() }.context("Load Vulkan")?;
         let app_info = vk::ApplicationInfo::default()
-            .application_name(c"Just Video")
+            .application_name(c"VRedze")
             .api_version(vk_target);
         let instance_info = vk::InstanceCreateInfo::default().application_info(&app_info);
         let get_instance_proc_addr: xr::sys::platform::VkGetInstanceProcAddr =

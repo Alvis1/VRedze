@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wraps the Quest library (scripts/build-quest.sh) into a signed APK:
-# target/quest/JustVideo.apk (the icon comes from android/res). Needs the Android SDK build-tools and a
+# target/quest/VRedze.apk (the icon comes from android/res). Needs the Android SDK build-tools and a
 # platform android.jar; downloads the Khronos OpenXR loader once (checked
 # against Maven Central's SHA-1) into .local-deps/openxr-loader.
 set -euo pipefail
@@ -9,7 +9,7 @@ LOADER=1.1.63
 sdk=${ANDROID_HOME:-$HOME/Library/Android/sdk}
 tools=$(ls -d "$sdk"/build-tools/* | sort -V | tail -1)
 jar=$(ls -d "$sdk"/platforms/android-*/android.jar | sort -V | tail -1)
-lib=target/aarch64-linux-android/release/libjust_video.so
+lib=target/aarch64-linux-android/release/libvredze.so
 [ -f "$lib" ] || { echo "Build first: scripts/build-quest.sh" >&2; exit 1; }
 
 loader_dir=.local-deps/openxr-loader
@@ -38,6 +38,6 @@ cp "$lib" "$loader" "$stage/lib/arm64-v8a/"
 (cd "$stage" && zip -q -0 -r ../unsigned.apk lib)
 "$tools/zipalign" -f -P 16 4 "$out/unsigned.apk" "$out/aligned.apk"
 "$tools/apksigner" sign --ks "$HOME/.android/debug.keystore" --ks-pass pass:android \
-  --key-pass pass:android --ks-key-alias androiddebugkey --out "$out/JustVideo.apk" "$out/aligned.apk"
+  --key-pass pass:android --ks-key-alias androiddebugkey --out "$out/VRedze.apk" "$out/aligned.apk"
 rm -f "$out/unsigned.apk" "$out/aligned.apk" "$out/res.zip"
-ls -l "$out/JustVideo.apk"
+ls -l "$out/VRedze.apk"

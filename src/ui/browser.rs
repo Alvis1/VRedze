@@ -25,7 +25,7 @@ const TOOL_GAP: f32 = 12.0;
 const ICON_TOOL_W: f32 = 84.0;
 
 /// Shown top right so installs can be told apart.
-pub const BUILD: &str = env!("JUST_VIDEO_BUILD");
+pub const BUILD: &str = env!("VREDZE_BUILD");
 
 const BG: Rgb = [0x15, 0x17, 0x1c];
 const ROW_BG: Rgb = [0x1d, 0x21, 0x28];
@@ -907,7 +907,7 @@ mod tests {
 
     fn view() -> View {
         View {
-            crumbs: vec!["Just Video".into(), "PC".into(), "media".into()],
+            crumbs: vec!["VRedze".into(), "PC".into(), "media".into()],
             rows: (0..30)
                 .map(|i| Row::new(Icon::Folder, format!("{i}")))
                 .collect(),

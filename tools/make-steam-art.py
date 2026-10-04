@@ -13,7 +13,7 @@ import sys
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-NAME = sys.argv[1] if len(sys.argv) > 1 else "Just Video"
+NAME = sys.argv[1] if len(sys.argv) > 1 else "VRedze"
 TAGLINE = "3D  ·  180°  ·  360°  ·  Spatial"
 OUT = os.path.join(os.path.dirname(__file__), "..", "assets", "steam")
 ICON = os.path.join(os.path.dirname(__file__), "..", "android", "res", "drawable-nodpi", "icon.png")

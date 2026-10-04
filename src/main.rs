@@ -1,19 +1,19 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use just_video::{
+use serde_json::json;
+use std::{io::Read, time::Instant};
+use vredze::{
     media::{Media, Source},
     playability::{self, Assessment, Platform, Verdict},
     readahead::ReadAhead,
     smb::{SmbSession, SmbUrl},
     vr,
 };
-use serde_json::json;
-use std::{io::Read, time::Instant};
 
-/// Just Video: VR playback straight from SMB shares.
+/// VRedze: VR video playback from the headset or straight from SMB shares.
 ///
 /// Inputs are `smb://[domain;]user@host[:port]/share/path` or local paths. The
-/// SMB password comes from JUST_VIDEO_SMB_PASSWORD or an interactive prompt.
+/// SMB password comes from VREDZE_SMB_PASSWORD or an interactive prompt.
 #[derive(Parser)]
 #[command(version)]
 struct Cli {
@@ -239,8 +239,16 @@ impl ReadAheadArgs {
     }
 }
 
+/// The SMB password from the environment: VREDZE_SMB_PASSWORD, or the name
+/// from before the rename to VRedze.
+fn env_password() -> Option<String> {
+    std::env::var("VREDZE_SMB_PASSWORD")
+        .or_else(|_| std::env::var("JUST_VIDEO_SMB_PASSWORD"))
+        .ok()
+}
+
 fn password() -> anyhow::Result<String> {
-    if let Ok(password) = std::env::var("JUST_VIDEO_SMB_PASSWORD") {
+    if let Some(password) = env_password() {
         return Ok(password);
     }
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -252,9 +260,9 @@ fn password() -> anyhow::Result<String> {
 fn connect(url: &str) -> anyhow::Result<SmbSession> {
     let url: SmbUrl = url.parse()?;
     // A saved server's password is used unless one is given explicitly.
-    let password = match std::env::var("JUST_VIDEO_SMB_PASSWORD") {
-        Ok(p) => p,
-        Err(_) => match just_video::config::password(&url.server_url())? {
+    let password = match env_password() {
+        Some(p) => p,
+        None => match vredze::config::password(&url.server_url())? {
             Some(p) => p,
             None => password()?,
         },
@@ -316,7 +324,7 @@ fn quit_on_ctrl_c() -> anyhow::Result<std::sync::Arc<std::sync::atomic::AtomicBo
 }
 
 /// When launched from Steam there is no terminal: send diagnostics to
-/// ~/.local/state/just-video/log.txt instead.
+/// ~/.local/state/vredze/log.txt instead.
 fn log_to_file_without_terminal() {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
@@ -325,7 +333,7 @@ fn log_to_file_without_terminal() {
     let Some(home) = std::env::var_os("HOME") else {
         return;
     };
-    let dir = std::path::Path::new(&home).join(".local/state/just-video");
+    let dir = std::path::Path::new(&home).join(".local/state/vredze");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -342,23 +350,23 @@ fn log_to_file_without_terminal() {
 fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
     log_to_file_without_terminal();
     eprintln!(
-        "Just Video {} ({}) starting",
+        "VRedze {} ({}) starting",
         env!("CARGO_PKG_VERSION"),
-        just_video::ui::browser::BUILD
+        vredze::ui::browser::BUILD
     );
-    let library = just_video::library::Library::start(just_video::media::default_hw_backend());
-    let navigator = just_video::ui::navigator::Navigator::new(library);
-    just_video::xr::app::run(
+    let library = vredze::library::Library::start(vredze::media::default_hw_backend());
+    let navigator = vredze::ui::navigator::Navigator::new(library);
+    vredze::xr::app::run(
         Some(navigator),
         None,
-        just_video::xr::app::AppOptions {
+        vredze::xr::app::AppOptions {
             view: Default::default(),
             play: Default::default(),
             quit,
             pump: None,
         },
     )?;
-    eprintln!("Just Video stopped");
+    eprintln!("VRedze stopped");
     Ok(())
 }
 
@@ -387,8 +395,8 @@ fn main() -> anyhow::Result<()> {
             let password = password()?;
             let session = SmbSession::connect(parsed.clone(), password.clone())?;
             let shares = session.shares()?;
-            just_video::config::save_server(
-                just_video::config::Server {
+            vredze::config::save_server(
+                vredze::config::Server {
                     name: name.unwrap_or_else(|| parsed.host.clone()),
                     url: parsed.server_url(),
                 },
@@ -402,12 +410,12 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Servers => {
-            for server in just_video::config::servers()? {
+            for server in vredze::config::servers()? {
                 println!("{}\t{}", server.name, server.url);
             }
         }
         Command::RemoveServer { server } => {
-            if !just_video::config::remove_server(&server)? {
+            if !vredze::config::remove_server(&server)? {
                 anyhow::bail!("No saved server named {server}");
             }
         }
@@ -523,18 +531,18 @@ fn main() -> anyhow::Result<()> {
             } else {
                 eprintln!("Decoder: {}", decoder.stats().decoder);
             }
-            let playback = just_video::xr::player::Playback::start(decoder, layout, start, 0.7);
-            let stats = just_video::xr::app::run(
+            let playback = vredze::xr::player::Playback::start(decoder, layout, start, 0.7);
+            let stats = vredze::xr::app::run(
                 None,
                 Some(playback),
-                just_video::xr::app::AppOptions {
-                    view: just_video::xr::player::ViewOptions {
+                vredze::xr::app::AppOptions {
+                    view: vredze::xr::player::ViewOptions {
                         fisheye_fov,
                         screen_width,
                         screen_distance,
                         debug_view,
                     },
-                    play: just_video::xr::player::PlayOptions {
+                    play: vredze::xr::player::PlayOptions {
                         screenshot: screenshot.map(|p| (p, start + screenshot_at)),
                         duration: duration.map(|d| start + d),
                         start,
@@ -552,13 +560,13 @@ fn main() -> anyhow::Result<()> {
             rounds,
             seeks,
         } => {
-            use just_video::library::{Library, Request, Response};
             use std::time::{Duration, Instant};
-            let index = just_video::config::servers()?
+            use vredze::library::{Library, Request, Response};
+            let index = vredze::config::servers()?
                 .into_iter()
                 .find(|s| s.name == server)
                 .ok_or_else(|| anyhow::anyhow!("No saved server {server}"))?;
-            let library = Library::start(just_video::media::default_hw_backend());
+            let library = Library::start(vredze::media::default_hw_backend());
             let path: Vec<String> = folder
                 .split('/')
                 .filter(|p| !p.is_empty())
@@ -594,7 +602,7 @@ fn main() -> anyhow::Result<()> {
             let videos: Vec<String> = result
                 .map_err(anyhow::Error::msg)?
                 .into_iter()
-                .filter(|e| !e.is_dir && just_video::ui::navigator::is_video(&e.name))
+                .filter(|e| !e.is_dir && vredze::ui::navigator::is_video(&e.name))
                 .map(|e| e.name)
                 .collect();
             anyhow::ensure!(!videos.is_empty(), "No videos in that folder");
@@ -628,12 +636,8 @@ fn main() -> anyhow::Result<()> {
                         _ => continue,
                     }
                 };
-                let mut playback = just_video::xr::player::Playback::start(
-                    opened.decoder,
-                    opened.layout,
-                    0.0,
-                    0.05,
-                );
+                let mut playback =
+                    vredze::xr::player::Playback::start(opened.decoder, opened.layout, 0.0, 0.05);
                 let started = Instant::now();
                 let mut shown = 0;
                 let play_for = Duration::from_millis(4000 + 1500 * seeks as u64);
@@ -664,7 +668,7 @@ fn main() -> anyhow::Result<()> {
                     std::thread::sleep(Duration::from_millis(11));
                 }
                 eprintln!("  played {shown} frames, stopping");
-                just_video::xr::app::drop_in_background(playback);
+                vredze::xr::app::drop_in_background(playback);
                 library.send(Request::List {
                     id: 2,
                     server: index.clone(),
@@ -724,15 +728,12 @@ fn main() -> anyhow::Result<()> {
                 println!("{:8.2} {:8.2}  {what}", c.start, c.end);
             }
             if let (Some(path), Some(image)) = (png, cues.iter().find_map(|c| c.image.clone())) {
-                let mut fonts = just_video::ui::canvas::Fonts::load()?;
-                let caption = just_video::subtitles::Caption {
+                let mut fonts = vredze::ui::canvas::Fonts::load()?;
+                let caption = vredze::subtitles::Caption {
                     text: None,
                     image: Some(image),
                 };
-                just_video::ui::save_png(
-                    &just_video::ui::captions::render(&caption, &mut fonts),
-                    &path,
-                )?;
+                vredze::ui::save_png(&vredze::ui::captions::render(&caption, &mut fonts), &path)?;
             }
             eprintln!("{} cues", cues.len());
         }
@@ -742,11 +743,10 @@ fn main() -> anyhow::Result<()> {
             volume,
             switch_to,
         } => {
-            use just_video::audio::{CHANNELS, Output, RATE};
+            use vredze::audio::{CHANNELS, Output, RATE};
             let (source, _session) = open_input(&input, ReadAhead::default())?;
             let media = Media::open(file_name(&input), source)?;
-            let mut decoder =
-                media.into_decoder(just_video::media::default_hw_backend(), true, "")?;
+            let mut decoder = media.into_decoder(vredze::media::default_hw_backend(), true, "")?;
             anyhow::ensure!(decoder.enable_audio(RATE, CHANNELS), "No audio track");
             let mut output = Output::open("audio-test")?;
             let (mut frames, mut written, mut expected, mut gaps) = (0u64, 0u64, None::<f64>, 0);
@@ -805,11 +805,9 @@ fn main() -> anyhow::Result<()> {
             }))?;
         }
         Command::UiPreview { dir } => {
-            use just_video::ui::browser::{
-                Action, Dialog, Icon, Row, Tool, ToolIcon, View, render,
-            };
-            use just_video::ui::form::{Field, Form};
-            let mut fonts = just_video::ui::canvas::Fonts::load()?;
+            use vredze::ui::browser::{Action, Dialog, Icon, Row, Tool, ToolIcon, View, render};
+            use vredze::ui::form::{Field, Form};
+            let mut fonts = vredze::ui::canvas::Fonts::load()?;
             std::fs::create_dir_all(&dir)?;
             let row = |icon, label: &str, detail: &str, right: &str| Row {
                 detail: detail.into(),
@@ -819,7 +817,7 @@ fn main() -> anyhow::Result<()> {
             };
             let crumbs = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             let folder = View {
-                crumbs: crumbs(&["Just Video", "NAS", "media", "Videos", "VR"]),
+                crumbs: crumbs(&["VRedze", "NAS", "media", "Videos", "VR"]),
                 tools: vec![Tool::text("Cancel", false), Tool::text("Delete 2", true)],
                 rows: vec![
                     Row {
@@ -860,19 +858,19 @@ fn main() -> anyhow::Result<()> {
                 ],
                 ..Default::default()
             };
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &render(&folder, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("folder.png"),
             )?;
             let servers = View {
-                crumbs: crumbs(&["Just Video"]),
+                crumbs: crumbs(&["VRedze"]),
                 rows: vec![
                     Row {
                         detail: "smb://user@192.168.1.10".into(),
                         lock: Some(true),
                         actions: vec![
-                            just_video::ui::browser::Action::Edit,
-                            just_video::ui::browser::Action::Remove,
+                            vredze::ui::browser::Action::Edit,
+                            vredze::ui::browser::Action::Remove,
                         ],
                         ..Row::new(Icon::Server, "NAS")
                     },
@@ -898,7 +896,7 @@ fn main() -> anyhow::Result<()> {
                 row.checked = None;
                 row.actions = vec![Action::Rename, Action::Delete];
             }
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &render(&editing, &mut fonts, Some((700.0, 400.0)), true),
                 &dir.join("editing.png"),
             )?;
@@ -917,11 +915,11 @@ fn main() -> anyhow::Result<()> {
                     .collect(),
                 "Connect",
             ));
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &render(&adding, &mut fonts, Some((700.0, 700.0)), true),
                 &dir.join("form.png"),
             )?;
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &render(&servers, &mut fonts, None, false),
                 &dir.join("servers.png"),
             )?;
@@ -935,18 +933,18 @@ fn main() -> anyhow::Result<()> {
                 buttons: vec!["OK".into()],
                 danger: false,
             });
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &render(&dialog, &mut fonts, Some((800.0, 790.0)), true),
                 &dir.join("dialog.png"),
             )?;
-            use just_video::ui::controls;
+            use vredze::ui::controls;
             let state = controls::State {
                 paused: true,
                 position: 754.0,
                 duration: 5530.0,
                 has_previous: true,
                 has_next: false,
-                loop_mode: just_video::config::LoopMode::Off,
+                loop_mode: vredze::config::LoopMode::Off,
                 hands: None,
                 views: 1,
                 curved: Some(true),
@@ -977,7 +975,7 @@ fn main() -> anyhow::Result<()> {
                 audio_tracks: vec!["English 7.1".into(), "English · Commentary".into()],
                 audio: Some(0),
                 list_page: 0,
-                image: just_video::config::ImageAdjust {
+                image: vredze::config::ImageAdjust {
                     brightness: 0.1,
                     contrast: 1.2,
                     saturation: 1.0,
@@ -986,7 +984,7 @@ fn main() -> anyhow::Result<()> {
                 dialog: None,
                 caption_edit: false,
             };
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &controls::render(&state, &mut fonts, controls::Hit::Seek(0.62)),
                 &dir.join("controls.png"),
             )?;
@@ -994,7 +992,7 @@ fn main() -> anyhow::Result<()> {
                 caption_edit: true,
                 ..state.clone()
             };
-            just_video::ui::save_png(
+            vredze::ui::save_png(
                 &controls::render(&editing, &mut fonts, controls::Hit::CaptionMove(1)),
                 &dir.join("controls-captions.png"),
             )?;
@@ -1019,21 +1017,21 @@ fn main() -> anyhow::Result<()> {
                     dialog: Some(dialog),
                     ..state.clone()
                 };
-                just_video::ui::save_png(
+                vredze::ui::save_png(
                     &controls::render_dialog(&open, &mut fonts, hover),
                     &dir.join(name),
                 )?;
             }
-            let caption = just_video::ui::captions::render(
-                &just_video::subtitles::Caption::text(
+            let caption = vredze::ui::captions::render(
+                &vredze::subtitles::Caption::text(
                     "Good morning, everyone.\nThe train leaves at noon.",
                 ),
                 &mut fonts,
             );
-            just_video::ui::save_png(&caption, &dir.join("caption.png"))?;
+            vredze::ui::save_png(&caption, &dir.join("caption.png"))?;
         }
         Command::XrProbe => {
-            let xr = just_video::xr::context::XrContext::new()?;
+            let xr = vredze::xr::context::XrContext::new()?;
             print(json!({
                 "system": xr.system_name,
                 "gpu": xr.gpu_name(),

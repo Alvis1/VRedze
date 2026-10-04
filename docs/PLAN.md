@@ -1,4 +1,4 @@
-# Spatial Player — plan
+# VRedze — plan
 
 A native Steam Frame (SteamOS, aarch64, OpenXR + Vulkan) player for stereoscopic and
 Apple spatial video. Forked from [just-video](https://github.com/kumorig/just-video) (MIT)

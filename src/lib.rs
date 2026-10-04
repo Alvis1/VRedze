@@ -1,5 +1,5 @@
-//! Just Video: standalone Steam Frame VR player reading directly from SMB shares
-//! or the headset's own storage.
+//! VRedze: VR video player for Steam Frame and Meta Quest, reading from the
+//! headset's own storage or directly from SMB shares. Forked from Just Video.
 
 #[cfg(all(target_os = "android", feature = "decode"))]
 mod android;

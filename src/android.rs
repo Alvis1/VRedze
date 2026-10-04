@@ -29,7 +29,7 @@ fn android_main(app: AndroidApp) {
         .map(Into::into)
         .unwrap_or_else(|| "/sdcard".into());
     crate::platform::init(Platform {
-        config_dir: data.join("just-video"),
+        config_dir: crate::config::settings_dir(&data),
         android: Android {
             vm: app.vm_as_ptr(),
             activity: app.activity_as_ptr(),
@@ -39,7 +39,7 @@ fn android_main(app: AndroidApp) {
     // SAFETY: the VM pointer is the process's JavaVM.
     unsafe { crate::media::android_init(app.vm_as_ptr()) };
     eprintln!(
-        "Just Video {} ({}) starting on Android",
+        "VRedze {} ({}) starting on Android",
         env!("CARGO_PKG_VERSION"),
         crate::ui::browser::BUILD
     );
@@ -85,8 +85,8 @@ fn android_main(app: AndroidApp) {
         },
     );
     match result {
-        Ok(_) => eprintln!("Just Video stopped"),
-        Err(e) => eprintln!("Just Video stopped with an error: {e:#}"),
+        Ok(_) => eprintln!("VRedze stopped"),
+        Err(e) => eprintln!("VRedze stopped with an error: {e:#}"),
     }
     // Android keeps the process after the activity finishes and runs
     // android_main again in it on the next launch, where the OpenXR loader,
@@ -106,7 +106,7 @@ fn exit_soon() -> ! {
 }
 
 /// Sends stdout and stderr (our eprintln!s and FFmpeg's messages) to logcat,
-/// one line at a time, tagged "JustVideo".
+/// one line at a time, tagged "VRedze".
 fn log_to_logcat() {
     unsafe extern "C" {
         fn __android_log_write(
@@ -133,7 +133,7 @@ fn log_to_logcat() {
             use std::os::fd::FromRawFd;
             // SAFETY: the read end of our own pipe, owned by this thread from now on.
             let pipe = unsafe { std::fs::File::from_raw_fd(read_end) };
-            let tag = c"JustVideo";
+            let tag = c"VRedze";
             for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
                 let text = std::ffi::CString::new(line.replace('\0', "")).unwrap_or_default();
                 // SAFETY: both strings are NUL-terminated.

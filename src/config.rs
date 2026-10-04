@@ -1,4 +1,4 @@
-//! Saved servers (`~/.config/just-video/servers.json`) and their passwords
+//! Saved servers (`~/.config/vredze/servers.json`) and their passwords
 //! (`credentials.json`, mode 0600 like a mount.cifs credentials file).
 //! SteamOS's game-mode session has no reachable Secret Service, so there is no
 //! encrypted keystore to use; the file is readable only by its owner.
@@ -29,7 +29,25 @@ pub fn dir() -> anyhow::Result<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .context("No home directory")?;
-    Ok(base.join("just-video"))
+    Ok(settings_dir(&base))
+}
+
+/// The settings folder in `base`: `vredze`. Before the rename to VRedze it
+/// was `just-video`; that one is moved over once, so saved servers,
+/// passwords, layouts and resume points stay.
+pub fn settings_dir(base: &std::path::Path) -> PathBuf {
+    let dir = base.join("vredze");
+    let old = base.join("just-video");
+    if !dir.exists() && old.is_dir() {
+        match std::fs::rename(&old, &dir) {
+            Ok(()) => eprintln!("Moved the settings to {}", dir.display()),
+            Err(e) => {
+                eprintln!("Can't move {} to {}: {e}", old.display(), dir.display());
+                return old;
+            }
+        }
+    }
+    dir
 }
 
 fn read_json<T: for<'de> Deserialize<'de> + Default>(name: &str) -> anyhow::Result<T> {
@@ -353,6 +371,22 @@ mod tests {
     }
 
     #[test]
+    fn settings_move_from_the_old_name() {
+        let base = std::env::temp_dir().join(format!("vredze-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("just-video")).unwrap();
+        std::fs::write(base.join("just-video/servers.json"), "[]").unwrap();
+        let dir = settings_dir(&base);
+        assert_eq!(dir, base.join("vredze"));
+        assert!(dir.join("servers.json").exists(), "moved with its files");
+        assert!(!base.join("just-video").exists());
+        // Once moved, a new "just-video" folder is left alone.
+        std::fs::create_dir_all(base.join("just-video")).unwrap();
+        assert_eq!(settings_dir(&base), dir);
+        assert!(base.join("just-video").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
     fn round_trip_with_private_credentials() {
         let dir = std::env::temp_dir().join(format!("jv-config-{}", std::process::id()));
         // SAFETY: single-threaded within this test; other tests don't read XDG_CONFIG_HOME.
@@ -364,7 +398,7 @@ mod tests {
         save_server(server.clone(), "secret").unwrap();
         assert_eq!(servers().unwrap(), vec![server.clone()]);
         assert_eq!(password(&server.url).unwrap().as_deref(), Some("secret"));
-        let mode = std::fs::metadata(dir.join("just-video/credentials.json"))
+        let mode = std::fs::metadata(dir.join("vredze/credentials.json"))
             .unwrap()
             .permissions()
             .mode();

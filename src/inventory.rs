@@ -21,7 +21,7 @@ fn vulkan() -> anyhow::Result<Value> {
     // SAFETY: The Vulkan loader owns function pointers for the lifetime of Entry.
     let entry = unsafe { Entry::load()? };
     let app = vk::ApplicationInfo::default()
-        .application_name(c"Just Video probe")
+        .application_name(c"VRedze probe")
         .api_version(vk::API_VERSION_1_1);
     // No surface, logical device, or active XR session is created.
     let instance = unsafe {

@@ -1,5 +1,5 @@
-#ifndef JUST_VIDEO_MEDIA_H
-#define JUST_VIDEO_MEDIA_H
+#ifndef VREDZE_MEDIA_H
+#define VREDZE_MEDIA_H
 #include <stddef.h>
 #include <stdint.h>
 

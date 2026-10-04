@@ -53,7 +53,7 @@ fn from_environment() -> Platform {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
     Platform {
-        config_dir: base.join("just-video"),
+        config_dir: crate::config::settings_dir(&base),
     }
 }
 

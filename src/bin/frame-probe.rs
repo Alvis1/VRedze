@@ -1,11 +1,11 @@
 #[cfg(feature = "decode")]
-use just_video::decode;
-use just_video::inventory;
+use vredze::decode;
+use vredze::inventory;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(version, about = "On-device decode feasibility checks for Just Video")]
+#[command(version, about = "On-device decode feasibility checks for VRedze")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

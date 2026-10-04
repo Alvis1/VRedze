@@ -244,7 +244,7 @@ impl Navigator {
     }
 
     fn crumbs(&self) -> Vec<String> {
-        let mut crumbs = vec!["Just Video".to_string()];
+        let mut crumbs = vec!["VRedze".to_string()];
         match &self.location {
             Location::Servers => {}
             Location::Shares { server } => crumbs.push(server.name.clone()),
@@ -1028,7 +1028,7 @@ impl Navigator {
         };
         self.view.dialog = Some(Dialog {
             title: format!("Remove {}?", s.name),
-            body: vec!["Removes this server and its saved password from Just Video. Nothing on the server changes.".into()],
+            body: vec!["Removes this server and its saved password from VRedze. Nothing on the server changes.".into()],
             buttons: vec!["Cancel".into(), "Remove".into()],
             danger: true,
         });
@@ -1286,7 +1286,7 @@ mod tests {
         let nav = Navigator::new(Library::start(None));
         let last = nav.view().rows.last().expect("rows");
         assert_eq!(last.icon, Icon::Add);
-        assert_eq!(nav.view().crumbs, vec!["Just Video".to_string()]);
+        assert_eq!(nav.view().crumbs, vec!["VRedze".to_string()]);
     }
 
     #[test]

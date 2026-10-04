@@ -1,6 +1,7 @@
-# Just Video
+# VRedze
 
-A VR video player for **Steam Frame** and **Meta Quest 2/3**. It plays flat,
+A VR video player for **Steam Frame** and **Meta Quest 2/3**. The name joins VR
+and *redze*, Latvian for "sight". It plays flat,
 3D (side by side or over-under), 180° and 360° video, and Apple spatial video
 (MV-HEVC), up to 8K. Videos come from the headset itself or from SMB shares.
 Forked from [kumorig/just-video](https://github.com/kumorig/just-video).
