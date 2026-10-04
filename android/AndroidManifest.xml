@@ -10,6 +10,10 @@
     <uses-sdk android:minSdkVersion="32" android:targetSdkVersion="33" />
 
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+    <!-- Hands work too (aim and pinch); without this Horizon OS won't start
+         the app until controllers are picked up. -->
+    <uses-feature android:name="oculus.software.handtracking" android:required="false" />
+    <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-feature android:glEsVersion="0x00030001" android:required="true" />
 
     <!-- OpenXR: what the Khronos loader's AAR would merge in under Gradle. -->

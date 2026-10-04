@@ -13,6 +13,8 @@ binary=target/aarch64-unknown-linux-gnu/release/just-video
 source scripts/frame-env.sh
 frame_ssh 'mkdir -p ~/Applications/JustVideo'
 rsync -a -e "$(frame_ssh_wrapper)" "$binary" "$FRAME_TARGET:Applications/JustVideo/just-video"
+# Library artwork (tools/make-steam-art.py).
+rsync -a -e "$(frame_ssh_wrapper)" assets/steam/ "$FRAME_TARGET:Applications/JustVideo/art/"
 frame_ssh "RESTART_STEAM=${FRAME_RESTART_STEAM:-0} bash -s" <<'REMOTE'
 set -euo pipefail
 dir=$HOME/Applications/JustVideo
@@ -29,6 +31,51 @@ else
     steamos-add-to-steam "$launcher"
     echo "Added Just Video to the Steam library (Non-Steam)."
 fi
+
+# Library artwork: Steam looks for grid/<appid>{p,,_hero,_logo}.png, the
+# appid being the shortcut's (an unsigned 32-bit number in shortcuts.vdf).
+python3 - <<'PY'
+import glob, os, shutil, struct
+art = os.path.expanduser("~/Applications/JustVideo/art")
+marker = "Applications/JustVideo/Just Video"
+
+def parse(data, i):
+    """Binary VDF map starting at data[i]: returns (dict, next index)."""
+    out = {}
+    while data[i] != 0x08:
+        kind = data[i]
+        end = data.index(0, i + 1)
+        key = data[i + 1:end].decode("utf-8", "replace")
+        i = end + 1
+        if kind == 0x00:
+            out[key], i = parse(data, i)
+        elif kind == 0x01:
+            end = data.index(0, i)
+            out[key] = data[i:end].decode("utf-8", "replace")
+            i = end + 1
+        elif kind == 0x02:
+            out[key] = struct.unpack_from("<i", data, i)[0]
+            i += 4
+        else:
+            raise ValueError(f"VDF type {kind} at {i}")
+    return out, i + 1
+
+for path in glob.glob(os.path.expanduser("~/.local/share/Steam/userdata/*/config/shortcuts.vdf")):
+    data = open(path, "rb").read()
+    root, _ = parse(data, 0)
+    for entry in root.get("shortcuts", {}).values():
+        exe = entry.get("Exe") or entry.get("exe") or ""
+        if marker not in exe:
+            continue
+        appid = entry.get("appid", 0) & 0xFFFFFFFF
+        grid = os.path.join(os.path.dirname(path), "grid")
+        os.makedirs(grid, exist_ok=True)
+        for source, name in (("capsule.png", f"{appid}p.png"), ("header.png", f"{appid}.png"),
+                             ("hero.png", f"{appid}_hero.png"), ("logo.png", f"{appid}_logo.png")):
+            if os.path.exists(os.path.join(art, source)):
+                shutil.copyfile(os.path.join(art, source), os.path.join(grid, name))
+        print(f"Library artwork set for app {appid}.")
+PY
 
 # Mark the entry as a VR app (OpenVR = 1). Prints the value it found.
 openvr() {

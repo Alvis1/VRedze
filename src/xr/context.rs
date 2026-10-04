@@ -38,6 +38,8 @@ impl XrContext {
         #[cfg(target_os = "android")]
         {
             extensions.khr_android_create_instance = true;
+            // Aim and pinch with bare hands (Quest), besides controllers.
+            extensions.ext_hand_interaction = available.ext_hand_interaction;
         }
         let names: Vec<String> = available
             .other

@@ -228,6 +228,16 @@ impl Input {
                 Ok(n) => eprintln!("Input: touch_controller: {n} bindings"),
                 Err(e) => eprintln!("Input: touch_controller not used: {e}"),
             }
+            // Bare hands (XR_EXT_hand_interaction): aim with the hand, pinch to click.
+            let hands_only = [("aim", "aim/pose"), ("select", "pinch_ext/value")];
+            match suggest(
+                "/interaction_profiles/ext/hand_interaction_ext",
+                &hands_only,
+                &["aim", "select"],
+            ) {
+                Ok(n) => eprintln!("Input: hand_interaction_ext: {n} bindings"),
+                Err(e) => eprintln!("Input: hand_interaction_ext not used: {e}"),
+            }
         }
         // Index bindings, which SteamVR maps Frame controllers onto when the
         // native profile isn't available. The Frame's left D-pad arrives as
