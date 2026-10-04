@@ -742,7 +742,11 @@ impl Navigator {
     fn adjacent(&self, delta: isize, wrap: bool) -> Option<usize> {
         let playing = self.playing? as isize;
         self.playable_after(playing, delta).or_else(|| {
-            let before_first = if delta > 0 { -1 } else { self.items.len() as isize };
+            let before_first = if delta > 0 {
+                -1
+            } else {
+                self.items.len() as isize
+            };
             wrap.then(|| self.playable_after(before_first, delta))
                 .flatten()
         })
@@ -803,7 +807,9 @@ impl Navigator {
         let before = self.pending;
         self.select(index);
         // Only an open that select() actually started counts as the loop's.
-        self.loop_open = (from_loop && self.pending != before).then_some(self.pending).flatten();
+        self.loop_open = (from_loop && self.pending != before)
+            .then_some(self.pending)
+            .flatten();
         true
     }
 

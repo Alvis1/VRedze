@@ -1,6 +1,8 @@
 //! Just Video: standalone Steam Frame VR player reading directly from SMB shares
 //! or the headset's own storage.
 
+#[cfg(all(target_os = "android", feature = "decode"))]
+mod android;
 #[cfg(feature = "decode")]
 pub mod audio;
 pub mod config;
@@ -9,12 +11,10 @@ pub mod decode;
 pub mod inventory;
 #[cfg(feature = "decode")]
 pub mod library;
-#[cfg(all(target_os = "android", feature = "decode"))]
-mod android;
 pub mod local;
-pub mod platform;
 #[cfg(feature = "decode")]
 pub mod media;
+pub mod platform;
 #[cfg(feature = "decode")]
 pub mod playability;
 pub mod readahead;

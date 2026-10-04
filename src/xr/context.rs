@@ -51,9 +51,9 @@ impl XrContext {
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
         if cfg!(not(target_os = "android"))
             && available
-            .other
-            .iter()
-            .any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes())
+                .other
+                .iter()
+                .any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes())
         {
             extensions.other.push(FRAME_CONTROLLER.into());
             eprintln!("OpenXR: enabled {FRAME_CONTROLLER}");

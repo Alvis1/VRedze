@@ -5,10 +5,10 @@ use super::context::{VIEW_TYPE, XrContext};
 use super::input::{Input, InputState, Ray};
 use super::player::{Placement, PlayOptions, PlayStats, Playback, ViewOptions, eye_params};
 use super::renderer::{QuadTarget, Renderer};
+use crate::config::LoopMode;
 use crate::ui::canvas::Fonts;
 use crate::ui::navigator::Navigator;
 use crate::ui::{browser, captions, controls};
-use crate::config::LoopMode;
 use crate::vr::Projection;
 use anyhow::Context;
 use openxr as xr;
@@ -108,8 +108,11 @@ impl Panel {
         ];
         let u = dot(local, right) / self.size[0] + 0.5;
         let v = 0.5 - dot(local, up) / self.size[1];
-        ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v))
-            .then_some((u * self.pixels[0] as f32, v * self.pixels[1] as f32, t))
+        ((0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v)).then_some((
+            u * self.pixels[0] as f32,
+            v * self.pixels[1] as f32,
+            t,
+        ))
     }
 
     /// World position of canvas pixel (x, y), `lift` metres towards the viewer.
@@ -1019,7 +1022,8 @@ pub fn run(
                     .map(|bar| dialog_panel(&bar));
                 // The dialog leans back less than the bar, so its lower edge can
                 // sit behind the bar: the nearer of the two along the ray wins.
-                let dialog_hit_at = dialog_at.and_then(|p| ray.and_then(|r| p.hit_at(r)).map(|h| (p, h)));
+                let dialog_hit_at =
+                    dialog_at.and_then(|p| ray.and_then(|r| p.hit_at(r)).map(|h| (p, h)));
                 let bar_hit_at =
                     controls_panel_at.and_then(|p| ray.and_then(|r| p.hit_at(r)).map(|h| (p, h)));
                 let (dialog_hit_at, bar_hit_at) = match (dialog_hit_at, bar_hit_at) {
@@ -1163,7 +1167,11 @@ pub fn run(
                             LoopMode::Folder
                         };
                         // A second click on the active one turns looping off.
-                        loop_mode = if loop_mode == picked { LoopMode::Off } else { picked };
+                        loop_mode = if loop_mode == picked {
+                            LoopMode::Off
+                        } else {
+                            picked
+                        };
                         let text = match loop_mode {
                             LoopMode::Off => "Loop off",
                             LoopMode::Video => "Looping this video",

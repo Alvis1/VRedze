@@ -627,7 +627,12 @@ impl Renderer {
         for plane in 0..frame.plane_count() {
             let (w, h, _) = frame.plane_size(plane);
             let format = plane_format(key.layout, key.bits, plane);
-            planes.push((self.create_texture(format, w * views, h)?, format, w * views, h));
+            planes.push((
+                self.create_texture(format, w * views, h)?,
+                format,
+                w * views,
+                h,
+            ));
         }
         let video = VideoTextures { key, planes };
         let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];

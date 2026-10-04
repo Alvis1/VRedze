@@ -505,7 +505,14 @@ fn hand_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, off: bool) {
         // A diagonal stroke, from small squares.
         for i in 0..36 {
             let t = i as f32 / 35.0;
-            c.rect(cx - 22.0 + t * 44.0, cy - 26.0 + t * 48.0, 5.0, 5.0, 2.5, [0xff, 0x6b, 0x6b]);
+            c.rect(
+                cx - 22.0 + t * 44.0,
+                cy - 26.0 + t * 48.0,
+                5.0,
+                5.0,
+                2.5,
+                [0xff, 0x6b, 0x6b],
+            );
         }
     }
 }
@@ -523,7 +530,9 @@ fn help_lines(hands: Option<bool>) -> [String; 2] {
         "D-pad left / right or flick the stick: 5 s back / forward"
     };
     [
-        format!("{select}  ·  Hold on the video and move: place it  ·  B: back  ·  Stick press: reset"),
+        format!(
+            "{select}  ·  Hold on the video and move: place it  ·  B: back  ·  Stick press: reset"
+        ),
         format!("Stick: screen size (while placing: nearer / farther)  ·  {seek}"),
     ]
 }
@@ -610,7 +619,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
 
     for (r, hit, mode, label) in [
         (LOOP_VIDEO, Hit::LoopVideo, LoopMode::Video, "Loop video"),
-        (LOOP_FOLDER, Hit::LoopFolder, LoopMode::Folder, "Loop folder"),
+        (
+            LOOP_FOLDER,
+            Hit::LoopFolder,
+            LoopMode::Folder,
+            "Loop folder",
+        ),
     ] {
         let active = state.loop_mode == mode;
         button(&mut c, r, hover == hit, active);
@@ -624,7 +638,14 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         let (cx, cy) = (r.0 + r.2 / 2.0, r.1 + r.3 / 2.0);
         loop_icon(&mut c, cx, cy, TEXT, fill);
         if mode == LoopMode::Video {
-            centered(&mut c, fonts, "1", (cx - 15.0, cy - 15.0, 30.0, 30.0), 26.0, TEXT);
+            centered(
+                &mut c,
+                fonts,
+                "1",
+                (cx - 15.0, cy - 15.0, 30.0, 30.0),
+                26.0,
+                TEXT,
+            );
         } else {
             folder_icon(&mut c, cx, cy + 1.0, TEXT);
         }
@@ -635,7 +656,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         button(&mut c, HANDS, hover == Hit::Hands, !on);
         let (cx, cy) = (HANDS.0 + HANDS.2 / 2.0, HANDS.1 + HANDS.3 / 2.0 + 4.0);
         hand_icon(&mut c, cx, cy, TEXT, !on);
-        label_under(&mut c, fonts, HANDS, if on { "Hands on" } else { "Hands off" });
+        label_under(
+            &mut c,
+            fonts,
+            HANDS,
+            if on { "Hands on" } else { "Hands off" },
+        );
     }
     let can_caption = !state.subtitle_tracks.is_empty() || state.audio_tracks.len() > 1;
     let subtitles_on = state.subtitle.is_some();
@@ -717,7 +743,15 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
     // Controller help.
     c.rect(24.0, 262.0, WIDTH as f32 - 48.0, 2.0, 1.0, FAINT);
     for (i, line) in help_lines(state.hands).iter().enumerate() {
-        fonts.draw(&mut c, line, 24.0, 298.0 + i as f32 * 32.0, 22.0, SUBTLE, WIDTH as f32 - 48.0);
+        fonts.draw(
+            &mut c,
+            line,
+            24.0,
+            298.0 + i as f32 * 32.0,
+            22.0,
+            SUBTLE,
+            WIDTH as f32 - 48.0,
+        );
     }
     c
 }
@@ -896,7 +930,11 @@ mod tests {
     fn spatial_formats_and_favourites() {
         assert_eq!(formats(1), FORMATS);
         assert_eq!(formats(2), SPATIAL_FORMATS);
-        let favourites = [FORMATS[0], FORMATS[3], (Projection::Flat, Stereo::MultiView)];
+        let favourites = [
+            FORMATS[0],
+            FORMATS[3],
+            (Projection::Flat, Stereo::MultiView),
+        ];
         // Spatial video: nothing starred (Screen steps through all four).
         assert!(favourites_for(2, &favourites).is_empty());
         // Other video: spatial favourites don't apply.
@@ -937,7 +975,9 @@ mod tests {
     #[test]
     #[ignore]
     fn preview() {
-        let Some(path) = std::env::var_os("CONTROLS_PNG") else { return };
+        let Some(path) = std::env::var_os("CONTROLS_PNG") else {
+            return;
+        };
         let mut fonts = Fonts::load().expect("fonts");
         let mut s = state();
         s.loop_mode = LoopMode::Folder;

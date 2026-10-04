@@ -1131,7 +1131,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     let seconds = started.elapsed().as_secs_f64();
-                    eprintln!("seek {i}: {target:.1} s in {:.0} ms ({decoded} pictures)", seconds * 1e3);
+                    eprintln!(
+                        "seek {i}: {target:.1} s in {:.0} ms ({decoded} pictures)",
+                        seconds * 1e3
+                    );
                     times.push(seconds);
                 }
                 let mean = times.iter().sum::<f64>() / times.len() as f64;

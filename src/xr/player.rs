@@ -270,7 +270,11 @@ fn spawn_decoder(
     // and it stalls when we hold too many of them (it needs about four free
     // for reference pictures). The shown picture is released once uploaded,
     // so with two queued at most three (next, queued) are held while it decodes.
-    let slack = if decoder.stats().hw_backend.is_some() { 2 } else { 4 };
+    let slack = if decoder.stats().hw_backend.is_some() {
+        2
+    } else {
+        4
+    };
     let (tx, frames) = mpsc::sync_channel(slack);
     let (control, commands) = mpsc::channel::<(u64, f64)>();
     let requested = Arc::new(AtomicU64::new(0));
@@ -953,7 +957,9 @@ impl Playback {
     fn shown_last_frame_for(&self, now: i64, seconds: f64) -> bool {
         self.ended
             && self.next.is_none()
-            && self.media_time(now).is_none_or(|t| t > self.last_pts + seconds)
+            && self
+                .media_time(now)
+                .is_none_or(|t| t > self.last_pts + seconds)
     }
 }
 

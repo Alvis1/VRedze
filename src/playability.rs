@@ -377,7 +377,8 @@ fn hint(platform: Platform, v: &VideoInfo) -> Option<String> {
             .into_iter()
             .find(|&w| w as f64 <= most)
             .unwrap_or(1920);
-        let height = ((v.height as f64 * width as f64 / v.width as f64 / 16.0).floor() * 16.0) as u32;
+        let height =
+            ((v.height as f64 * width as f64 / v.width as f64 / 16.0).floor() * 16.0) as u32;
         let smaller = VideoInfo {
             width,
             height,
@@ -528,14 +529,24 @@ mod tests {
         v.profile = Some("Main".into());
         v.pixel_format = Some("yuv420p".into());
         let a = assess(Platform::Quest, Some(&v));
-        assert_ne!(a.verdict, Verdict::Hardware, "7680x7680 is over 138240 blocks");
+        assert_ne!(
+            a.verdict,
+            Verdict::Hardware,
+            "7680x7680 is over 138240 blocks"
+        );
         assert!(a.hint.unwrap_or_default().contains("5760x5760"));
         let mut fits = video("hevc", 8192, 4096, 8, 30.0);
         fits.profile = Some("Main".into());
         fits.pixel_format = Some("yuv420p".into());
-        assert_eq!(assess(Platform::Quest, Some(&fits)).verdict, Verdict::Hardware);
+        assert_eq!(
+            assess(Platform::Quest, Some(&fits)).verdict,
+            Verdict::Hardware
+        );
         fits.fps = 60.0;
-        assert_ne!(assess(Platform::Quest, Some(&fits)).verdict, Verdict::Hardware);
+        assert_ne!(
+            assess(Platform::Quest, Some(&fits)).verdict,
+            Verdict::Hardware
+        );
     }
 
     #[test]

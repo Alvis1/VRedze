@@ -70,7 +70,9 @@ impl Output {
             }
             // Fill the buffer before starting, so playback starts without a gap.
             if !self.started {
-                self.stream.request_start().context("Start the AAudio output")?;
+                self.stream
+                    .request_start()
+                    .context("Start the AAudio output")?;
                 self.started = true;
             }
         }

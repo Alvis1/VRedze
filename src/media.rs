@@ -435,8 +435,7 @@ impl Media {
                     if kind == SphericalKind::HalfEquirectangular {
                         return 180.0;
                     }
-                    let covered =
-                        1.0 - (r.bound_left as f64 + r.bound_right as f64) / 4294967296.0;
+                    let covered = 1.0 - (r.bound_left as f64 + r.bound_right as f64) / 4294967296.0;
                     (covered * 360.0).clamp(0.0, 360.0)
                 }),
             multilayer: r.multilayer != 0,
@@ -445,8 +444,7 @@ impl Media {
             primary_eye: Eye::from_raw(r.primary_eye),
             spherical: SphericalKind::from_raw(r.projection_kind),
             baseline_mm: (r.baseline_um > 0).then(|| r.baseline_um as f64 / 1000.0),
-            disparity_adjustment: (r.disparity_adjustment != 0.0)
-                .then_some(r.disparity_adjustment),
+            disparity_adjustment: (r.disparity_adjustment != 0.0).then_some(r.disparity_adjustment),
             hfov_degrees: (r.hfov_degrees > 0.0).then_some(r.hfov_degrees),
             orientation: [r.yaw, r.pitch, r.roll],
             rotation_degrees: r.rotation,
@@ -892,7 +890,11 @@ impl<F: ViewTagged> ViewPairer<F> {
             (Some(Eye::Left), _) | (_, Some(Eye::Right)) => true,
             (Some(Eye::Right), _) | (_, Some(Eye::Left)) => false,
             _ => {
-                let fallback = if self.hints.order_reversed { Eye::Right } else { Eye::Left };
+                let fallback = if self.hints.order_reversed {
+                    Eye::Right
+                } else {
+                    Eye::Left
+                };
                 let base_eye = match self.hints.view_eyes {
                     [Some(eye), _] => Some(eye),
                     [None, Some(Eye::Left)] => Some(Eye::Right),
@@ -903,7 +905,11 @@ impl<F: ViewTagged> ViewPairer<F> {
                 base_eye == Eye::Left
             }
         };
-        if base_is_left { (base, second) } else { (second, base) }
+        if base_is_left {
+            (base, second)
+        } else {
+            (second, base)
+        }
     }
 }
 
@@ -943,11 +949,15 @@ impl Media {
             bail!("{}", text(&s.error));
         }
         OPEN_DECODERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let hints = self.info.video.as_ref().map_or(ViewHints::default(), |v| ViewHints {
-            view_eyes: v.view_eyes,
-            primary_eye: v.primary_eye,
-            order_reversed: v.stereo_inverted,
-        });
+        let hints = self
+            .info
+            .video
+            .as_ref()
+            .map_or(ViewHints::default(), |v| ViewHints {
+                view_eyes: v.view_eyes,
+                primary_eye: v.primary_eye,
+                order_reversed: v.stereo_inverted,
+            });
         Ok(VideoDecoder {
             raw: decoder,
             pairer: ViewPairer::new(hints),
@@ -1155,13 +1165,20 @@ mod tests {
     }
 
     fn view(id: u32, pts: f64) -> View {
-        View { id: Some(id), eye: None, pts }
+        View {
+            id: Some(id),
+            eye: None,
+            pts,
+        }
     }
 
     fn stereo(p: Option<Picture<View>>) -> (u32, u32) {
         match p {
             Some(Picture::Stereo { left, right }) => (left.id.unwrap(), right.id.unwrap()),
-            other => panic!("expected a stereo picture, got {:?}", other.map(|p| p.views().len())),
+            other => panic!(
+                "expected a stereo picture, got {:?}",
+                other.map(|p| p.views().len())
+            ),
         }
     }
 
@@ -1183,7 +1200,11 @@ mod tests {
             primary_eye: Some(Eye::Left),
             order_reversed: false,
         });
-        let tagged = |id, eye| View { id: Some(id), eye: Some(eye), pts: 0.0 };
+        let tagged = |id, eye| View {
+            id: Some(id),
+            eye: Some(eye),
+            pts: 0.0,
+        };
         pairer.push(tagged(0, Eye::Right));
         assert_eq!(stereo(pairer.push(tagged(1, Eye::Left))), (1, 0));
     }
@@ -1219,10 +1240,18 @@ mod tests {
         };
         let mut pairer = ViewPairer::new(reversed);
         pairer.push(view(0, 0.0));
-        assert_eq!(stereo(pairer.push(view(1, 0.0))), (1, 0), "base is the right eye");
+        assert_eq!(
+            stereo(pairer.push(view(1, 0.0))),
+            (1, 0),
+            "base is the right eye"
+        );
         // Frames that say which eye they are win over the flag.
         let mut pairer = ViewPairer::new(reversed);
-        let tagged = |id, eye| View { id: Some(id), eye: Some(eye), pts: 0.0 };
+        let tagged = |id, eye| View {
+            id: Some(id),
+            eye: Some(eye),
+            pts: 0.0,
+        };
         pairer.push(tagged(0, Eye::Left));
         assert_eq!(stereo(pairer.push(tagged(1, Eye::Right))), (0, 1));
     }
@@ -1257,7 +1286,11 @@ mod tests {
     #[test]
     fn single_view_video_passes_straight_through() {
         let mut pairer = ViewPairer::new(ViewHints::default());
-        let plain = |pts| View { id: None, eye: None, pts };
+        let plain = |pts| View {
+            id: None,
+            eye: None,
+            pts,
+        };
         assert!(matches!(pairer.push(plain(0.0)), Some(Picture::Mono(_))));
         assert!(matches!(pairer.push(plain(0.04)), Some(Picture::Mono(_))));
         assert!(pairer.flush().is_none());
@@ -1267,7 +1300,8 @@ mod tests {
     /// tools/make-spatial-samples.sh): red left eye, blue right eye.
     #[test]
     fn decodes_both_views_of_spatial_video() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/spatial-red-left.mov");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/spatial-red-left.mov");
         let Ok(file) = std::fs::File::open(&path) else {
             eprintln!("skipped: {} not found", path.display());
             return;
@@ -1280,7 +1314,9 @@ mod tests {
         let mut decoder = media.into_decoder(None, true, "").unwrap();
         let mut stereo_pictures = 0;
         for _ in 0..10 {
-            let Some(picture) = decoder.next_picture().unwrap() else { break };
+            let Some(picture) = decoder.next_picture().unwrap() else {
+                break;
+            };
             if let Picture::Stereo { left, right } = &picture {
                 assert_eq!(left.pts(), right.pts());
                 // Red is strong in the left view's V (Cr) plane, blue in the right's U (Cb).
@@ -1288,11 +1324,20 @@ mod tests {
                     let rows: Vec<u8> = f.rows(plane).flatten().copied().collect();
                     rows.iter().map(|&b| b as f64).sum::<f64>() / rows.len() as f64
                 };
-                assert!(mean(left, 2) > mean(right, 2), "left view should be the red one");
-                assert!(mean(right, 1) > mean(left, 1), "right view should be the blue one");
+                assert!(
+                    mean(left, 2) > mean(right, 2),
+                    "left view should be the red one"
+                );
+                assert!(
+                    mean(right, 1) > mean(left, 1),
+                    "right view should be the blue one"
+                );
                 stereo_pictures += 1;
             }
         }
-        assert!(stereo_pictures >= 8, "only {stereo_pictures} stereo pictures");
+        assert!(
+            stereo_pictures >= 8,
+            "only {stereo_pictures} stereo pictures"
+        );
     }
 }

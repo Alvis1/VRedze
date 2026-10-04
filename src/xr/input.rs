@@ -229,7 +229,11 @@ impl Input {
                 ("seek_back", "left:x/click"),
                 ("seek_forward", "left:y/click"),
             ];
-            match suggest("/interaction_profiles/oculus/touch_controller", &touch, &required) {
+            match suggest(
+                "/interaction_profiles/oculus/touch_controller",
+                &touch,
+                &required,
+            ) {
                 Ok(n) => eprintln!("Input: touch_controller: {n} bindings"),
                 Err(e) => eprintln!("Input: touch_controller not used: {e}"),
             }

@@ -4,9 +4,9 @@
 //! then we follow the loader spec's runtime discovery and negotiate with the
 //! runtime library directly.
 
+use anyhow::Context;
 #[cfg(not(target_os = "android"))]
 use anyhow::{bail, ensure};
-use anyhow::Context;
 #[cfg(not(target_os = "android"))]
 use openxr::sys;
 #[cfg(not(target_os = "android"))]
