@@ -7,10 +7,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+/// Set by the first `android_main` in this process.
+static STARTED: AtomicBool = AtomicBool::new(false);
+
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     log_to_logcat();
     std::panic::set_hook(Box::new(|info| eprintln!("Panic: {info}")));
+    if STARTED.swap(true, Ordering::SeqCst) {
+        // A new activity in a process whose player hasn't ended: its OpenXR
+        // loader, FFmpeg JNI state and `platform` belong to the old activity
+        // (starting again aborts in the loader). Android starts a fresh
+        // process for the activity instead.
+        eprintln!("A player is still running in this process; restarting it");
+        exit_soon();
+    }
     let data = app
         .internal_data_path()
         .unwrap_or_else(|| "/data/local/tmp".into());
@@ -42,8 +53,22 @@ fn android_main(app: AndroidApp) {
     // frame loop takes them every frame.
     let pump = Box::new(move || {
         lifecycle.poll_events(Some(Duration::ZERO), |event| {
-            if let PollEvent::Main(MainEvent::Destroy) = event {
-                destroyed.store(true, Ordering::Relaxed);
+            if let PollEvent::Main(MainEvent::Destroy) = event
+                && !destroyed.swap(true, Ordering::Relaxed)
+            {
+                // The activity is gone; the frame loop should end within a
+                // few frames. If the runtime blocks it (seen in xrEndFrame
+                // when the activity is destroyed during start-up), end the
+                // process anyway, or the next launch lands in it.
+                let _ = std::thread::Builder::new()
+                    .name("exit-deadline".into())
+                    .spawn(|| {
+                        std::thread::sleep(Duration::from_secs(4));
+                        eprintln!(
+                            "The player didn't stop after the activity was destroyed; exiting"
+                        );
+                        exit_soon();
+                    });
             }
         });
     });
@@ -63,6 +88,21 @@ fn android_main(app: AndroidApp) {
         Ok(_) => eprintln!("Just Video stopped"),
         Err(e) => eprintln!("Just Video stopped with an error: {e:#}"),
     }
+    // Android keeps the process after the activity finishes and runs
+    // android_main again in it on the next launch, where the OpenXR loader,
+    // FFmpeg's JNI state and `platform` still hold the first, finished
+    // activity: the app then never opens again. End the process instead, so
+    // every launch starts fresh (settings and resume points are written).
+    exit_soon();
+}
+
+/// Ends the process after giving the logcat thread a moment to pass on the
+/// last lines.
+fn exit_soon() -> ! {
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: _exit ends the process without running atexit handlers, which
+    // could race the worker threads still running.
+    unsafe { libc::_exit(0) }
 }
 
 /// Sends stdout and stderr (our eprintln!s and FFmpeg's messages) to logcat,

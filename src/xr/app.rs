@@ -233,6 +233,33 @@ fn cursor_image() -> Vec<u8> {
     pixels
 }
 
+/// A pose OpenXR accepts: a unit quaternion and a finite position. A single
+/// zero quaternion (an untracked pose) makes xrEndFrame reject the frame.
+fn valid_pose(pose: xr::Posef) -> xr::Posef {
+    let q = pose.orientation;
+    let len = (q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w).sqrt();
+    let orientation = if len.is_finite() && len > 1e-3 {
+        xr::Quaternionf {
+            x: q.x / len,
+            y: q.y / len,
+            z: q.z / len,
+            w: q.w / len,
+        }
+    } else {
+        xr::Posef::IDENTITY.orientation
+    };
+    let p = pose.position;
+    let position = if p.x.is_finite() && p.y.is_finite() && p.z.is_finite() {
+        p
+    } else {
+        xr::Posef::IDENTITY.position
+    };
+    xr::Posef {
+        orientation,
+        position,
+    }
+}
+
 fn quad_layer<'a>(
     space: &'a xr::Space,
     target: &'a QuadTarget,
@@ -255,7 +282,7 @@ fn quad_layer<'a>(
                     },
                 }),
         )
-        .pose(pose)
+        .pose(valid_pose(pose))
         .size(xr::Extent2Df {
             width: size[0],
             height: size[1],
@@ -697,6 +724,8 @@ pub fn run(
     // The last frame's display time: a jump of more than 1.5 display
     // periods means we missed one (counted per video).
     let mut last_display: Option<i64> = None;
+    // Frames xrEndFrame turned down (logged now and then).
+    let mut rejected_frames = 0u64;
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
@@ -772,7 +801,7 @@ pub fn run(
         let ray = buttons.rays[active_hand]
             .as_ref()
             .or(buttons.rays[1 - active_hand].as_ref());
-        let (_, views) =
+        let (view_flags, views) =
             ctx.session
                 .locate_views(VIEW_TYPE, state.predicted_display_time, &space)?;
 
@@ -1552,32 +1581,34 @@ pub fn run(
             quads.push((&cursor, pose, [size, size], true));
         }
         set_phase(7);
-        let projection_views: Vec<xr::CompositionLayerProjectionView<xr::Vulkan>> = if eyes_rendered
-        {
-            views
-                .iter()
-                .zip(&renderer.eyes)
-                .map(|(view, target)| {
-                    xr::CompositionLayerProjectionView::new()
-                        .pose(view.pose)
-                        .fov(view.fov)
-                        .sub_image(
-                            xr::SwapchainSubImage::new()
-                                .swapchain(&target.swapchain)
-                                .image_array_index(0)
-                                .image_rect(xr::Rect2Di {
-                                    offset: xr::Offset2Di { x: 0, y: 0 },
-                                    extent: xr::Extent2Di {
-                                        width: target.width as i32,
-                                        height: target.height as i32,
-                                    },
-                                }),
-                        )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Untracked views (the headset not on yet, tracking lost) come back
+        // as all-zero poses, which xrEndFrame rejects: no projection then.
+        let projection_views: Vec<xr::CompositionLayerProjectionView<xr::Vulkan>> =
+            if eyes_rendered && view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID) {
+                views
+                    .iter()
+                    .zip(&renderer.eyes)
+                    .map(|(view, target)| {
+                        xr::CompositionLayerProjectionView::new()
+                            .pose(valid_pose(view.pose))
+                            .fov(view.fov)
+                            .sub_image(
+                                xr::SwapchainSubImage::new()
+                                    .swapchain(&target.swapchain)
+                                    .image_array_index(0)
+                                    .image_rect(xr::Rect2Di {
+                                        offset: xr::Offset2Di { x: 0, y: 0 },
+                                        extent: xr::Extent2Di {
+                                            width: target.width as i32,
+                                            height: target.height as i32,
+                                        },
+                                    }),
+                            )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let projection = xr::CompositionLayerProjection::new()
             .space(&space)
             .views(&projection_views);
@@ -1592,8 +1623,21 @@ pub fn run(
         for quad in &quad_layers {
             layers.push(&**quad);
         }
-        ctx.frame_stream
-            .end(state.predicted_display_time, ctx.blend_mode, &layers)?;
+        match ctx
+            .frame_stream
+            .end(state.predicted_display_time, ctx.blend_mode, &layers)
+        {
+            // One bad layer drops this frame, not the app (it used to quit).
+            Err(
+                e @ (xr::sys::Result::ERROR_POSE_INVALID | xr::sys::Result::ERROR_LAYER_INVALID),
+            ) => {
+                rejected_frames += 1;
+                if rejected_frames.is_power_of_two() {
+                    eprintln!("OpenXR rejected a frame ({rejected_frames} so far): {e}");
+                }
+            }
+            result => result?,
+        }
     }
     options.quit.store(true, Ordering::Relaxed);
     if let Mode::Playing(playback) = mode {
