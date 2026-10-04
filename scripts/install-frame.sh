@@ -151,8 +151,11 @@ elif [ "$RESTART_STEAM" = 1 ]; then
     for _ in $(seq 60); do pgrep -x steam >/dev/null || break; sleep 1; done
     shortcuts fix
     echo "Done. Steam restarts on its own; if it doesn't, restart the headset."
+elif [ "$entry" = old ]; then
+    echo "Note: the library entry is called Just Video until Steam restarts. Run again"
+    echo "      with FRAME_RESTART_STEAM=1 to rename it (restarts Steam)."
 else
-    echo "Note: the library entry needs one Steam restart to be called VRedze and"
-    echo "      start as a VR app. Run again with FRAME_RESTART_STEAM=1 (restarts Steam)."
+    echo "Note: VRedze isn't marked as a VR app yet, so it starts in the background."
+    echo "      Run again with FRAME_RESTART_STEAM=1 to fix (restarts Steam once)."
 fi
 REMOTE
