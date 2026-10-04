@@ -27,6 +27,8 @@ pub struct AppOptions {
     pub view: ViewOptions,
     pub play: PlayOptions,
     pub quit: Arc<AtomicBool>,
+    /// Called every frame: the platform's own events (Android lifecycle).
+    pub pump: Option<Box<dyn FnMut()>>,
 }
 
 /// A flat UI panel floating in the LOCAL space.
@@ -614,7 +616,7 @@ fn wrap_angle(a: f32) -> f32 {
 pub fn run(
     mut navigator: Option<Navigator>,
     initial: Option<Playback>,
-    options: AppOptions,
+    mut options: AppOptions,
 ) -> anyhow::Result<PlayStats> {
     let mut ctx = XrContext::new()?;
     let mut renderer = Renderer::new(&ctx)?;
@@ -693,6 +695,9 @@ pub fn run(
 
     'main: loop {
         heartbeat.store(loop_started.elapsed().as_millis() as i64, Ordering::Relaxed);
+        if let Some(pump) = options.pump.as_mut() {
+            pump();
+        }
         set_phase(0);
         if options.quit.load(Ordering::Relaxed) && !exit_requested {
             exit_requested = true;

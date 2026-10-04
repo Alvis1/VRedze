@@ -12,11 +12,15 @@ pub enum Platform {
     SteamFrame,
     /// Desktop GPU with Vulkan video decoding (development machine).
     Desktop,
+    /// Meta Quest 2/3: CPU decoding for now (MediaCodec comes next).
+    Quest,
 }
 
 impl Platform {
     pub fn current() -> Self {
-        if cfg!(target_arch = "aarch64") {
+        if cfg!(target_os = "android") {
+            Self::Quest
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
             Self::SteamFrame
         } else {
             Self::Desktop
@@ -27,6 +31,7 @@ impl Platform {
         match self {
             Self::SteamFrame => "Steam Frame",
             Self::Desktop => "this PC",
+            Self::Quest => "Quest",
         }
     }
 
@@ -96,6 +101,9 @@ impl Platform {
                     )
                 })
             }
+            Self::Quest => Some(format!(
+                "this version of the player doesn't use the {name}'s hardware video decoder yet"
+            )),
         }
     }
 
@@ -116,6 +124,15 @@ impl Platform {
                 _ => 0.8e9,
             }),
             Self::Desktop => None,
+            // Estimates for Quest 3 (XR2 Gen 2, Cortex-X3/A715 cores, a little
+            // below the Frame's): to be measured. Quest 2 is slower.
+            Self::Quest => Some(match v.codec.as_str() {
+                "hevc" => 1.1e9,
+                "h264" => 1.0e9,
+                "av1" => 0.6e9,
+                "vp9" => 0.9e9,
+                _ => 0.6e9,
+            }),
         }
     }
 }

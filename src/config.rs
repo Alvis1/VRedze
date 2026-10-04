@@ -19,7 +19,12 @@ pub struct Server {
     pub url: String,
 }
 
+/// On Android (Quest) the app's private storage; elsewhere the XDG config
+/// directory, read on every call so tests can point it elsewhere.
 pub fn dir() -> anyhow::Result<PathBuf> {
+    if cfg!(target_os = "android") {
+        return Ok(crate::platform::get().config_dir.clone());
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))

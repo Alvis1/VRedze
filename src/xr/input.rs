@@ -210,6 +210,25 @@ impl Input {
                 Err(e) => eprintln!("Input: {profile} not used: {e}"),
             }
         }
+        // Meta Quest Touch (and Touch Plus) controllers: A/B on the right,
+        // X/Y on the left for seeking.
+        if cfg!(target_os = "android") {
+            let touch = [
+                ("aim", "aim/pose"),
+                ("select", "trigger/value"),
+                ("select", "right:a/click"),
+                ("back", "right:b/click"),
+                ("scroll", "thumbstick"),
+                ("reset", "thumbstick/click"),
+                ("grip", "squeeze/value"),
+                ("seek_back", "left:x/click"),
+                ("seek_forward", "left:y/click"),
+            ];
+            match suggest("/interaction_profiles/oculus/touch_controller", &touch, &required) {
+                Ok(n) => eprintln!("Input: touch_controller: {n} bindings"),
+                Err(e) => eprintln!("Input: touch_controller not used: {e}"),
+            }
+        }
         // Index bindings, which SteamVR maps Frame controllers onto when the
         // native profile isn't available. The Frame's left D-pad arrives as
         // the left A (down) and B (left/right/up), so A and B count only on

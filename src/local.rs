@@ -23,8 +23,27 @@ pub fn is_local(server: &Server) -> bool {
     server.url == URL
 }
 
+/// Root folders by name, existing ones only. On a Quest: Movies, Download,
+/// the headset's recordings and the whole shared storage.
+#[cfg(target_os = "android")]
+pub fn roots() -> Vec<(String, PathBuf)> {
+    let storage = crate::platform::get().android.external_storage.clone();
+    [
+        ("Movies", storage.join("Movies")),
+        ("Download", storage.join("Download")),
+        ("Recordings", storage.join("Oculus/VideoShots")),
+        ("Camera", storage.join("DCIM")),
+        ("Internal storage", storage),
+    ]
+    .into_iter()
+    .filter(|(_, dir)| dir.is_dir())
+    .map(|(name, dir)| (name.to_string(), dir))
+    .collect()
+}
+
 /// Root folders by name, existing ones only: Videos, Downloads, Home, then
 /// removable drives (`/run/media/<user>/<label>`, or `/run/media/<label>`).
+#[cfg(not(target_os = "android"))]
 pub fn roots() -> Vec<(String, PathBuf)> {
     let mut roots = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {

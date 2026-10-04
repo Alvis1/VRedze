@@ -1,19 +1,34 @@
-//! Connects to the active OpenXR runtime without a system loader. SteamOS on
-//! Steam Frame ships no `libopenxr_loader.so.1`, so we follow the loader spec's
-//! runtime discovery and negotiate with the runtime library directly.
+//! Connects to the OpenXR runtime. On Android (Meta Quest) through the
+//! Khronos loader bundled in the APK. Elsewhere through the system loader if
+//! there is one; SteamOS on Steam Frame ships no `libopenxr_loader.so.1`, so
+//! then we follow the loader spec's runtime discovery and negotiate with the
+//! runtime library directly.
 
-use anyhow::{Context, bail, ensure};
-use openxr::sys::{self, loader};
+#[cfg(not(target_os = "android"))]
+use anyhow::{bail, ensure};
+use anyhow::Context;
+#[cfg(not(target_os = "android"))]
+use openxr::sys;
+#[cfg(not(target_os = "android"))]
 use std::{
     env,
     path::{Path, PathBuf},
 };
 
+/// The bundled loader (`lib/arm64-v8a/libopenxr_loader.so`); loading it also
+/// initializes it with the JavaVM and Activity (XR_KHR_loader_init_android).
+#[cfg(target_os = "android")]
+pub fn entry() -> anyhow::Result<openxr::Entry> {
+    // SAFETY: the loader shipped in the APK is the Khronos OpenXR loader.
+    unsafe { openxr::Entry::load(&crate::platform::xr_info()) }.context("Load the OpenXR loader")
+}
+
 /// Returns an entry for the system loader if present, else the active runtime.
+#[cfg(not(target_os = "android"))]
 pub fn entry() -> anyhow::Result<openxr::Entry> {
     // SAFETY: loading a library runs its initializers; the OpenXR loader and
     // runtimes are trusted system components.
-    if let Ok(entry) = unsafe { openxr::Entry::load() } {
+    if let Ok(entry) = unsafe { openxr::Entry::load(&()) } {
         return Ok(entry);
     }
     let manifest = active_runtime_manifest()?;
@@ -22,6 +37,7 @@ pub fn entry() -> anyhow::Result<openxr::Entry> {
         .with_context(|| format!("Load OpenXR runtime {}", library.display()))
 }
 
+#[cfg(not(target_os = "android"))]
 /// Loader spec (Linux): XR_RUNTIME_JSON, then `active_runtime[.<arch>].json` in
 /// $XDG_CONFIG_HOME, $XDG_CONFIG_DIRS and /etc.
 fn active_runtime_manifest() -> anyhow::Result<PathBuf> {
@@ -55,6 +71,7 @@ fn active_runtime_manifest() -> anyhow::Result<PathBuf> {
     bail!("No active OpenXR runtime (is SteamVR installed and set as the OpenXR runtime?)")
 }
 
+#[cfg(not(target_os = "android"))]
 fn runtime_library(manifest: &Path) -> anyhow::Result<PathBuf> {
     // Resolve symlinks first: relative library paths are relative to the real file.
     let manifest = manifest
@@ -75,25 +92,26 @@ fn runtime_library(manifest: &Path) -> anyhow::Result<PathBuf> {
     )
 }
 
+#[cfg(not(target_os = "android"))]
 unsafe fn negotiate(path: &Path) -> anyhow::Result<openxr::Entry> {
     // The runtime must stay loaded for the life of the process.
     let library: &'static libloading::Library =
         Box::leak(Box::new(unsafe { libloading::Library::new(path) }?));
-    let negotiate: libloading::Symbol<loader::FnNegotiateLoaderRuntimeInterface> =
+    let negotiate: libloading::Symbol<sys::pfn::NegotiateLoaderRuntimeInterface> =
         unsafe { library.get(b"xrNegotiateLoaderRuntimeInterface\0") }?;
-    let info = loader::XrNegotiateLoaderInfo {
-        ty: loader::XrNegotiateLoaderInfo::TYPE,
-        struct_version: loader::XrNegotiateLoaderInfo::VERSION,
-        struct_size: size_of::<loader::XrNegotiateLoaderInfo>(),
+    let info = sys::NegotiateLoaderInfo {
+        struct_type: sys::NegotiateLoaderInfo::TYPE,
+        struct_version: sys::NegotiateLoaderInfo::VERSION,
+        struct_size: size_of::<sys::NegotiateLoaderInfo>(),
         min_interface_version: 1,
-        max_interface_version: loader::CURRENT_LOADER_RUNTIME_VERSION,
+        max_interface_version: sys::CURRENT_LOADER_RUNTIME_VERSION as u32,
         min_api_version: sys::Version::new(1, 0, 0),
         max_api_version: sys::Version::new(1, 0x3ff, 0xfff),
     };
-    let mut request = loader::XrNegotiateRuntimeRequest {
-        ty: loader::XrNegotiateRuntimeRequest::TYPE,
-        struct_version: loader::XrNegotiateRuntimeRequest::VERSION,
-        struct_size: size_of::<loader::XrNegotiateRuntimeRequest>(),
+    let mut request = sys::NegotiateRuntimeRequest {
+        struct_type: sys::NegotiateRuntimeRequest::TYPE,
+        struct_version: sys::NegotiateRuntimeRequest::VERSION,
+        struct_size: size_of::<sys::NegotiateRuntimeRequest>(),
         runtime_interface_version: 0,
         runtime_api_version: sys::Version::new(0, 0, 0),
         get_instance_proc_addr: None,
@@ -106,5 +124,5 @@ unsafe fn negotiate(path: &Path) -> anyhow::Result<openxr::Entry> {
     let gipa = request
         .get_instance_proc_addr
         .context("Runtime returned no xrGetInstanceProcAddr")?;
-    Ok(unsafe { openxr::Entry::from_get_instance_proc_addr(gipa) }?)
+    Ok(unsafe { openxr::Entry::from_get_instance_proc_addr(gipa, &()) }?)
 }

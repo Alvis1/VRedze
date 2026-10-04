@@ -138,6 +138,10 @@ const FONT_CANDIDATES: &[&[&str]] = &[
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        // Android (Meta Quest).
+        "/system/fonts/Roboto-Medium.ttf",
+        "/system/fonts/Roboto-Regular.ttf",
+        "/system/fonts/NotoSans-Regular.ttf",
         // macOS, for tests and previews on a development machine.
         "/System/Library/Fonts/Supplemental/Arial.ttf",
     ],
@@ -146,6 +150,7 @@ const FONT_CANDIDATES: &[&[&str]] = &[
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/system/fonts/NotoSansCJK-Regular.ttc",
     ],
 ];
 

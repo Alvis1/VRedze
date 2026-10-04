@@ -80,7 +80,7 @@ fn inspect_devices(instance: &ash::Instance) -> anyhow::Result<Value> {
 }
 
 fn openxr() -> anyhow::Result<Value> {
-    let entry = unsafe { openxr::Entry::load()? };
+    let entry = crate::xr::runtime::entry()?;
     let extensions = entry.enumerate_extensions()?;
     Ok(json!({
         "loader_available": true,

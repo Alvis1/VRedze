@@ -35,25 +35,26 @@ impl XrContext {
         );
         let mut extensions = xr::ExtensionSet::default();
         extensions.khr_vulkan_enable2 = true;
+        #[cfg(target_os = "android")]
+        {
+            extensions.khr_android_create_instance = true;
+        }
+        let names: Vec<String> = available
+            .other
+            .iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect();
+        eprintln!("OpenXR extensions: {}", names.join(", "));
         // Native Steam Frame controller bindings (otherwise SteamVR remaps Index ones).
         const FRAME_CONTROLLER: &str = "XR_VALVE_frame_controller_interaction";
-        if available
+        if cfg!(not(target_os = "android"))
+            && available
             .other
             .iter()
             .any(|e| e.as_slice() == FRAME_CONTROLLER.as_bytes())
         {
             extensions.other.push(FRAME_CONTROLLER.into());
             eprintln!("OpenXR: enabled {FRAME_CONTROLLER}");
-        } else {
-            let names: Vec<String> = available
-                .other
-                .iter()
-                .map(|e| String::from_utf8_lossy(e).into_owned())
-                .collect();
-            eprintln!(
-                "OpenXR: runtime does not offer {FRAME_CONTROLLER} (offers {})",
-                names.join(", ")
-            );
         }
         let xr = entry.create_instance(
             &xr::ApplicationInfo {
@@ -65,6 +66,7 @@ impl XrContext {
             },
             &extensions,
             &[],
+            &crate::platform::xr_info(),
         )?;
         let system = xr
             .system(xr::FormFactor::HEAD_MOUNTED_DISPLAY)

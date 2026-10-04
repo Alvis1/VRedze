@@ -9,7 +9,10 @@ pub mod decode;
 pub mod inventory;
 #[cfg(feature = "decode")]
 pub mod library;
+#[cfg(all(target_os = "android", feature = "decode"))]
+mod android;
 pub mod local;
+pub mod platform;
 #[cfg(feature = "decode")]
 pub mod media;
 #[cfg(feature = "decode")]

@@ -2,11 +2,9 @@
 //! SteamOS). libpulse-simple is loaded at runtime, so building needs no audio
 //! headers and a missing sound server only disables sound.
 
+use super::{CHANNELS, RATE};
 use anyhow::{Context, bail};
 use std::ffi::{c_char, c_int, c_void};
-
-pub const RATE: u32 = 48_000;
-pub const CHANNELS: u32 = 2;
 
 #[repr(C)]
 struct SampleSpec {

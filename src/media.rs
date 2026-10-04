@@ -9,13 +9,28 @@ use std::{
 };
 
 /// Hardware decoding backend for this platform: the V4L2 (Qualcomm iris)
-/// decoder on ARM64 / Steam Frame, Vulkan video elsewhere.
+/// decoder on Linux ARM64 / Steam Frame, Vulkan video on other Linux and
+/// macOS. On Android (Meta Quest) the CPU for now; MediaCodec comes next.
 pub fn default_hw_backend() -> Option<&'static str> {
-    if cfg!(target_arch = "aarch64") {
+    if cfg!(target_os = "android") {
+        None
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         Some("v4l2m2m")
     } else {
         Some("vulkan")
     }
+}
+
+/// Gives FFmpeg the JavaVM (for its MediaCodec decoders). Call once, early.
+///
+/// # Safety
+/// `vm` must be the process's `JavaVM*`.
+#[cfg(target_os = "android")]
+pub unsafe fn android_init(vm: *mut c_void) {
+    unsafe extern "C" {
+        fn jv_android_init(vm: *mut c_void);
+    }
+    unsafe { jv_android_init(vm) };
 }
 
 pub trait Source: Read + Seek + Send {}

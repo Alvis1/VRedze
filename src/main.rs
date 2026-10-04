@@ -208,7 +208,7 @@ enum StereoArg {
 
 fn hw_backend(hw: Hw) -> Option<&'static str> {
     match hw {
-        Hw::Auto if cfg!(target_arch = "aarch64") => Some("v4l2m2m"),
+        Hw::Auto if cfg!(all(target_os = "linux", target_arch = "aarch64")) => Some("v4l2m2m"),
         Hw::Auto | Hw::Vulkan => Some("vulkan"),
         Hw::V4l2 => Some("v4l2m2m"),
         Hw::Vaapi => Some("vaapi"),
@@ -351,6 +351,7 @@ fn run_app(quit: std::sync::Arc<std::sync::atomic::AtomicBool>) -> anyhow::Resul
             view: Default::default(),
             play: Default::default(),
             quit,
+            pump: None,
         },
     )?;
     eprintln!("Just Video stopped");
@@ -535,6 +536,7 @@ fn main() -> anyhow::Result<()> {
                         start,
                     },
                     quit: quit_on_ctrl_c()?,
+                    pump: None,
                 },
             )?;
             print(json!(stats))?;
