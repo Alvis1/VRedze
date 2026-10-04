@@ -29,6 +29,8 @@ pub struct InputState {
     pub seek: i32,
     /// Thumbstick vertical deflection (-1..1, up positive), strongest hand.
     pub scroll: f32,
+    /// Per hand: tracked as a bare hand (aim and pinch), not a controller.
+    pub bare_hands: [bool; 2],
 }
 
 pub struct Input {
@@ -47,6 +49,8 @@ pub struct Input {
     flick_ready: [bool; 2],
     /// Per hand: origin and direction filters.
     filters: [[OneEuro; 2]; 2],
+    /// The bare-hand profile (XR_EXT_hand_interaction), when bound.
+    bare_hand_profile: Option<xr::Path>,
 }
 
 /// One Euro filter (Casiez et al.): heavy smoothing while still, little lag
@@ -185,6 +189,7 @@ impl Input {
                 }
                 Ok(list.len())
             };
+        let mut bare_hand_profile = None;
         let required = ["aim", "select", "back"];
         // Steam Frame controllers: A/B on the right, a D-pad on the left.
         let frame = [
@@ -229,13 +234,13 @@ impl Input {
                 Err(e) => eprintln!("Input: touch_controller not used: {e}"),
             }
             // Bare hands (XR_EXT_hand_interaction): aim with the hand, pinch to click.
+            const HANDS: &str = "/interaction_profiles/ext/hand_interaction_ext";
             let hands_only = [("aim", "aim/pose"), ("select", "pinch_ext/value")];
-            match suggest(
-                "/interaction_profiles/ext/hand_interaction_ext",
-                &hands_only,
-                &["aim", "select"],
-            ) {
-                Ok(n) => eprintln!("Input: hand_interaction_ext: {n} bindings"),
+            match suggest(HANDS, &hands_only, &["aim", "select"]) {
+                Ok(n) => {
+                    eprintln!("Input: hand_interaction_ext: {n} bindings");
+                    bare_hand_profile = Some(xr_.string_to_path(HANDS)?);
+                }
                 Err(e) => eprintln!("Input: hand_interaction_ext not used: {e}"),
             }
         }
@@ -291,22 +296,43 @@ impl Input {
             flick_ready: [true; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
             filters: [[OneEuro::new(3.0, 6.0), OneEuro::new(1.5, 0.6)]; 2],
+            bare_hand_profile,
         })
     }
 
+    /// Whether bare hands can be used (the runtime offers hand interaction).
+    pub fn has_bare_hands(&self) -> bool {
+        self.bare_hand_profile.is_some()
+    }
+
+    /// The input this frame. With `allow_bare_hands` false, hands tracked
+    /// without a controller do nothing (exhibitions: visitors can't change
+    /// anything, the operator still can with a controller).
     pub fn poll(
         &mut self,
         ctx: &XrContext,
         space: &xr::Space,
         time: xr::Time,
+        allow_bare_hands: bool,
     ) -> anyhow::Result<InputState> {
         ctx.session.sync_actions(&[(&self.set).into()])?;
         let mut state = InputState::default();
+        if let Some(profile) = self.bare_hand_profile {
+            for (i, &hand) in self.hands.iter().enumerate() {
+                state.bare_hands[i] =
+                    ctx.session.current_interaction_profile(hand).ok() == Some(profile);
+            }
+        }
         let pressed = |action: &xr::Action<bool>, hand: xr::Path| -> anyhow::Result<bool> {
             let s = action.state(&ctx.session, hand)?;
             Ok(s.is_active && s.current_state && s.changed_since_last_sync)
         };
         for (i, &hand) in self.hands.iter().enumerate() {
+            if state.bare_hands[i] && !allow_bare_hands {
+                self.filters[i][0].reset();
+                self.filters[i][1].reset();
+                continue;
+            }
             state.select[i] = pressed(&self.select, hand)?;
             let held = self.select.state(&ctx.session, hand)?;
             state.select_held[i] = held.is_active && held.current_state;

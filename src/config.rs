@@ -236,6 +236,24 @@ struct Settings {
     captions: Option<CaptionSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     loop_mode: Option<LoopMode>,
+    /// Bare hands (no controller) may point and click.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bare_hands: Option<bool>,
+}
+
+/// Whether bare hands may point and click (default: yes). Off for
+/// exhibitions, where visitors shouldn't change anything.
+pub fn bare_hands() -> bool {
+    read_json::<Settings>("settings.json")
+        .ok()
+        .and_then(|s| s.bare_hands)
+        .unwrap_or(true)
+}
+
+pub fn save_bare_hands(enabled: bool) -> anyhow::Result<()> {
+    let mut settings: Settings = read_json("settings.json")?;
+    settings.bare_hands = Some(enabled);
+    write_json("settings.json", &settings, false)
 }
 
 /// What happens when a video reaches its end.

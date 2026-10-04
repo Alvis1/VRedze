@@ -689,6 +689,8 @@ pub fn run(
     let mut switch_video: Option<isize> = None;
     // At the end of a video: stop, play it again, or play the next in the folder.
     let mut loop_mode = crate::config::loop_mode();
+    // Bare hands may point and click (off for exhibitions).
+    let mut bare_hands = crate::config::bare_hands();
     // The last frame's display time: a jump of more than 1.5 display
     // periods means we missed one (counted per video).
     let mut last_display: Option<i64> = None;
@@ -754,7 +756,7 @@ pub fn run(
         }
         set_phase(2);
         let mut buttons = input
-            .poll(&ctx, &space, state.predicted_display_time)
+            .poll(&ctx, &space, state.predicted_display_time, bare_hands)
             .unwrap_or_else(|e| {
                 eprintln!("Input: {e:#}");
                 InputState::default()
@@ -996,6 +998,7 @@ pub fn run(
                         .as_ref()
                         .is_some_and(|n| n.has_adjacent(1, folder_loop)),
                     loop_mode,
+                    hands: input.has_bare_hands().then_some(bare_hands),
                     views: playback.views,
                     curved: curved_applies.then_some(placement.curved),
                     format: (playback.layout.projection, playback.layout.stereo),
@@ -1138,6 +1141,21 @@ pub fn run(
                     Some(controls::Hit::Seek(f)) => playback.seek(f as f64 * playback.duration),
                     Some(controls::Hit::Previous) => switch_video = Some(-1),
                     Some(controls::Hit::Next) => switch_video = Some(1),
+                    Some(controls::Hit::Hands) => {
+                        bare_hands = !bare_hands;
+                        playback.notice(
+                            if bare_hands {
+                                "Hands on: pinch to click"
+                            } else {
+                                "Hands off: only controllers work"
+                            }
+                            .to_string(),
+                            Duration::from_secs(3),
+                        );
+                        if let Err(e) = crate::config::save_bare_hands(bare_hands) {
+                            eprintln!("Can't save the hands setting: {e:#}");
+                        }
+                    }
                     Some(hit @ (controls::Hit::LoopVideo | controls::Hit::LoopFolder)) => {
                         let picked = if hit == controls::Hit::LoopVideo {
                             LoopMode::Video

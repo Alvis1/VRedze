@@ -21,7 +21,8 @@ use crate::config::{ImageAdjust, LoopMode};
 use crate::vr::{Projection, Stereo};
 
 pub const WIDTH: u32 = 1200;
-pub const HEIGHT: u32 = 264;
+/// Buttons and seek bar, then two lines of controller help.
+pub const HEIGHT: u32 = 344;
 pub const DIALOG_WIDTH: u32 = 1200;
 pub const DIALOG_HEIGHT: u32 = 640;
 
@@ -125,6 +126,8 @@ pub enum Hit {
     LoopVideo,
     /// Loop the folder: next video at the end, the first after the last (click again: off).
     LoopFolder,
+    /// Bare hands may click, or only controllers (exhibitions).
+    Hands,
     /// Fraction of the duration.
     Seek(f32),
     /// CC: click toggles subtitles, long press opens the track dialog.
@@ -178,6 +181,8 @@ pub struct State {
     pub has_previous: bool,
     pub has_next: bool,
     pub loop_mode: LoopMode,
+    /// Whether bare hands may click; None where hands can't be used at all.
+    pub hands: Option<bool>,
     /// Coded views: 2 for spatial video (the format choices differ).
     pub views: u32,
     /// None when the curve toggle does not apply (VR180/360).
@@ -204,9 +209,10 @@ type Rect = (f32, f32, f32, f32);
 const PREVIOUS: Rect = (24.0, 16.0, 96.0, 92.0);
 const PLAY: Rect = (136.0, 16.0, 96.0, 92.0);
 const NEXT: Rect = (248.0, 16.0, 96.0, 92.0);
-// The loop buttons, centred in the gap between Next and CC.
-const LOOP_VIDEO: Rect = (468.0, 16.0, 96.0, 92.0);
-const LOOP_FOLDER: Rect = (598.0, 16.0, 96.0, 92.0);
+// Loop video, loop folder and hands, in the gap between Next and CC.
+const LOOP_VIDEO: Rect = (383.0, 16.0, 96.0, 92.0);
+const LOOP_FOLDER: Rect = (513.0, 16.0, 96.0, 92.0);
+const HANDS: Rect = (643.0, 16.0, 96.0, 92.0);
 const CAPTIONS: Rect = (818.0, 16.0, 96.0, 92.0);
 const SCREEN: Rect = (948.0, 16.0, 96.0, 92.0);
 const IMAGE: Rect = (1078.0, 16.0, 96.0, 92.0);
@@ -246,6 +252,7 @@ pub fn hit(state: &State, x: f32, y: f32) -> Hit {
         (NEXT, Hit::Next, state.has_next),
         (LOOP_VIDEO, Hit::LoopVideo, true),
         (LOOP_FOLDER, Hit::LoopFolder, true),
+        (HANDS, Hit::Hands, state.hands.is_some()),
         (CAPTIONS, Hit::Captions, can_caption),
         (SCREEN, Hit::Screen, true),
         (IMAGE, Hit::Image, true),
@@ -486,6 +493,41 @@ fn loop_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, fill: Rgb) {
     triangle(c, cx - 8.0, cy - 18.0, 12.0, 18.0, false, color);
 }
 
+/// A raised hand: palm, four fingers and a thumb; crossed out when `off`.
+fn hand_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb, off: bool) {
+    c.rect(cx - 13.0, cy - 2.0, 26.0, 22.0, 8.0, color);
+    for (i, height) in [20.0, 25.0, 24.0, 18.0].into_iter().enumerate() {
+        let x = cx - 13.0 + i as f32 * 7.0;
+        c.rect(x, cy - 2.0 - height, 5.5, height + 4.0, 2.75, color);
+    }
+    c.rect(cx - 21.0, cy - 2.0, 10.0, 5.5, 2.75, color);
+    if off {
+        // A diagonal stroke, from small squares.
+        for i in 0..36 {
+            let t = i as f32 / 35.0;
+            c.rect(cx - 22.0 + t * 44.0, cy - 26.0 + t * 48.0, 5.0, 5.0, 2.5, [0xff, 0x6b, 0x6b]);
+        }
+    }
+}
+
+/// What the controller buttons do, two lines under the bar.
+fn help_lines(hands: Option<bool>) -> [String; 2] {
+    let select = if hands == Some(true) {
+        "Trigger, A or pinch: select"
+    } else {
+        "Trigger or A: select"
+    };
+    let seek = if cfg!(target_os = "android") {
+        "X / Y: 5 s back / forward"
+    } else {
+        "D-pad left / right or flick the stick: 5 s back / forward"
+    };
+    [
+        format!("{select}  ·  Hold on the video and move: place it  ·  B: back  ·  Stick press: reset"),
+        format!("Stick: screen size (while placing: nearer / farther)  ·  {seek}"),
+    ]
+}
+
 /// A small folder: a tab and a body.
 fn folder_icon(c: &mut Canvas, cx: f32, cy: f32, color: Rgb) {
     c.rect(cx - 12.0, cy - 9.0, 10.0, 5.0, 1.5, color);
@@ -588,6 +630,13 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         }
         label_under(&mut c, fonts, r, label);
     }
+
+    if let Some(on) = state.hands {
+        button(&mut c, HANDS, hover == Hit::Hands, !on);
+        let (cx, cy) = (HANDS.0 + HANDS.2 / 2.0, HANDS.1 + HANDS.3 / 2.0 + 4.0);
+        hand_icon(&mut c, cx, cy, TEXT, !on);
+        label_under(&mut c, fonts, HANDS, if on { "Hands on" } else { "Hands off" });
+    }
     let can_caption = !state.subtitle_tracks.is_empty() || state.audio_tracks.len() > 1;
     let subtitles_on = state.subtitle.is_some();
     button(
@@ -664,6 +713,12 @@ pub fn render(state: &State, fonts: &mut Fonts, hover: Hit) -> Canvas {
         fonts.draw(&mut c, &label, lx, sy + 6.0, 24.0, SUBTLE, w + 4.0);
     }
     c.circle(sx + sw * fraction, track_y, 14.0, TEXT);
+
+    // Controller help.
+    c.rect(24.0, 262.0, WIDTH as f32 - 48.0, 2.0, 1.0, FAINT);
+    for (i, line) in help_lines(state.hands).iter().enumerate() {
+        fonts.draw(&mut c, line, 24.0, 298.0 + i as f32 * 32.0, 22.0, SUBTLE, WIDTH as f32 - 48.0);
+    }
     c
 }
 
@@ -816,6 +871,7 @@ mod tests {
             has_previous: true,
             has_next: false,
             loop_mode: LoopMode::Off,
+            hands: None,
             views: 1,
             curved: Some(false),
             format: FORMATS[0],
@@ -862,10 +918,18 @@ mod tests {
         assert_eq!(hit(&s, x, y), Hit::LoopVideo);
         let (x, y) = center(LOOP_FOLDER);
         assert_eq!(hit(&s, x, y), Hit::LoopFolder);
-        // Clear of their neighbours, with room for the labels underneath.
-        assert!(LOOP_VIDEO.0 > NEXT.0 + NEXT.2 + 60.0);
-        assert!(LOOP_FOLDER.0 + LOOP_FOLDER.2 + 60.0 < CAPTIONS.0);
-        assert!(LOOP_VIDEO.0 + LOOP_VIDEO.2 + 17.0 <= LOOP_FOLDER.0 - 17.0, "labels overlap");
+        // Clear of their neighbours, with room for the labels (17 px either side).
+        assert!(LOOP_VIDEO.0 - 17.0 >= NEXT.0 + NEXT.2);
+        assert!(HANDS.0 + HANDS.2 + 17.0 <= CAPTIONS.0 - 17.0);
+        for (a, b) in [(LOOP_VIDEO, LOOP_FOLDER), (LOOP_FOLDER, HANDS)] {
+            assert!(a.0 + a.2 + 17.0 <= b.0 - 17.0, "labels overlap");
+        }
+        // No hands button where hands can't be used.
+        let (x, y) = center(HANDS);
+        assert_eq!(hit(&s, x, y), Hit::Nothing);
+        let mut with_hands = state();
+        with_hands.hands = Some(true);
+        assert_eq!(hit(&with_hands, x, y), Hit::Hands);
     }
 
     /// Writes the bar as a PNG for a look at the layout:
@@ -877,6 +941,7 @@ mod tests {
         let mut fonts = Fonts::load().expect("fonts");
         let mut s = state();
         s.loop_mode = LoopMode::Folder;
+        s.hands = Some(false);
         let canvas = render(&s, &mut fonts, Hit::LoopVideo);
         let file = std::fs::File::create(path).expect("create png");
         let mut encoder = png::Encoder::new(file, WIDTH, HEIGHT);

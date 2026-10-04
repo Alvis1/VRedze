@@ -947,6 +947,7 @@ fn main() -> anyhow::Result<()> {
                 has_previous: true,
                 has_next: false,
                 loop_mode: just_video::config::LoopMode::Off,
+                hands: None,
                 views: 1,
                 curved: Some(true),
                 format: controls::FORMATS[3],
