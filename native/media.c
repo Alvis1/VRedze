@@ -70,6 +70,12 @@ static int64_t io_seek(void *opaque, int64_t offset, int whence) {
     return cb->seek(cb->opaque, offset, whence & ~AVSEEK_FORCE);
 }
 
+#ifdef __ANDROID__
+#include <libavcodec/jni.h>
+// Android: FFmpeg's MediaCodec decoders find codecs through Java.
+void jv_android_init(void *vm) { av_jni_set_java_vm(vm, NULL); }
+#endif
+
 size_t jv_media_info_size(void) { return sizeof(JVMediaInfo); }
 size_t jv_frame_size(void) { return sizeof(JVFrame); }
 
