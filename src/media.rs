@@ -10,10 +10,10 @@ use std::{
 
 /// Hardware decoding backend for this platform: the V4L2 (Qualcomm iris)
 /// decoder on Linux ARM64 / Steam Frame, Vulkan video on other Linux and
-/// macOS. On Android (Meta Quest) the CPU for now; MediaCodec comes next.
+/// macOS, and MediaCodec on Android (Meta Quest).
 pub fn default_hw_backend() -> Option<&'static str> {
     if cfg!(target_os = "android") {
-        None
+        Some("mediacodec")
     } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
         Some("v4l2m2m")
     } else {
@@ -1100,15 +1100,22 @@ impl Drop for VideoDecoder {
 /// stream: opening a new one before the last closed falls back to the CPU.
 static OPEN_DECODERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+/// A decoder that didn't close in time is still open: later waits don't
+/// wait for it again (it may never close), until it does.
+static STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Waits (up to `limit`) until every earlier decoder has closed.
 pub fn wait_for_decoders_closed(limit: std::time::Duration) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
     let started = std::time::Instant::now();
-    while OPEN_DECODERS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
-        if started.elapsed() > limit {
+    while OPEN_DECODERS.load(SeqCst) > 0 {
+        if STUCK.load(SeqCst) || started.elapsed() > limit {
+            STUCK.store(true, SeqCst);
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    STUCK.store(false, SeqCst);
     true
 }
 

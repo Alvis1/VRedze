@@ -39,9 +39,14 @@ struct JVMedia {
 typedef struct {
     enum AVPixelFormat hw_format;
     int allow_software;
-    // Hardware decoder that returns ordinary frames (V4L2 mem2mem wrappers).
+    // Hardware decoder wrapper that returns ordinary frames: WRAPPER_*.
     int hardware_wrapper;
 } FormatChoice;
+
+// FFmpeg's hardware decoder wrappers: the V4L2 stateful decoders (Steam
+// Frame's iris) and Android's MediaCodec (Meta Quest), both copying pictures
+// into ordinary frames.
+enum { WRAPPER_NONE = 0, WRAPPER_V4L2 = 1, WRAPPER_MEDIACODEC = 2 };
 
 static void set_error(char *out, int size, const char *operation, int code) {
     char message[AV_ERROR_MAX_STRING_SIZE];
@@ -326,6 +331,27 @@ static const char *v4l2_unsuitable(const AVStream *st) {
     return eight_bit_profile(par->codec_id, profile)
                ? NULL
                : "cannot confirm the stream is 8-bit, so the hardware decoder is not used";
+}
+
+// Why Android's MediaCodec decoder (through FFmpeg's copying wrapper) must
+// not get this stream, or NULL if it may. The wrapper hands back 8-bit
+// pictures only (no P010), so 10-bit stays on the CPU for now.
+static const char *mediacodec_unsuitable(const AVStream *st) {
+    const AVCodecParameters *par = st->codecpar;
+    if (par->codec_id != AV_CODEC_ID_H264 && par->codec_id != AV_CODEC_ID_HEVC &&
+        par->codec_id != AV_CODEC_ID_VP9 && par->codec_id != AV_CODEC_ID_AV1)
+        return "hardware decoder is used for H.264/HEVC/VP9/AV1 only";
+    if (is_multilayer(st))
+        return "spatial (MV-HEVC) video needs both views, which only the software decoder outputs";
+    if (par->width <= 0 || par->height <= 0 || par->width > 8192 || par->height > 8192)
+        return "frame size outside the hardware decoder's 8192x8192 limit";
+    if ((par->codec_id == AV_CODEC_ID_H264 || par->codec_id == AV_CODEC_ID_HEVC) &&
+        par->profile != AV_PROFILE_UNKNOWN && !eight_bit_profile(par->codec_id, par->profile))
+        return "this player hands the hardware decoder 8-bit video only for now";
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(par->format);
+    if (!desc || desc->comp[0].depth != 8 || desc->log2_chroma_w != 1 || desc->log2_chroma_h != 1)
+        return "this player hands the hardware decoder 8-bit 4:2:0 video only for now";
+    return NULL;
 }
 
 struct JVDecoder {
@@ -623,25 +649,32 @@ JVDecoder *jv_decoder_open(JVMedia *media, const char *hw_backend, int allow_sof
         hw_backend = NULL;
         codec = avcodec_find_decoder(id);
     }
-    if (hw_backend && !strcmp(hw_backend, "v4l2m2m")) {
-        const char *why = v4l2_unsuitable(video);
+    int wrapper_kind = !hw_backend                        ? WRAPPER_NONE
+                     : !strcmp(hw_backend, "v4l2m2m")     ? WRAPPER_V4L2
+                     : !strcmp(hw_backend, "mediacodec")  ? WRAPPER_MEDIACODEC
+                     : WRAPPER_NONE;
+    if (wrapper_kind) {
+        const char *suffix = wrapper_kind == WRAPPER_V4L2 ? "v4l2m2m" : "mediacodec";
+        const char *why = wrapper_kind == WRAPPER_V4L2 ? v4l2_unsuitable(video) : mediacodec_unsuitable(video);
         const AVCodec *wrapper = NULL;
         if (!why) {
             char name[48];
-            snprintf(name, sizeof(name), "%s_v4l2m2m", avcodec_get_name(id));
+            snprintf(name, sizeof(name), "%s_%s", avcodec_get_name(id), suffix);
             wrapper = avcodec_find_decoder_by_name(name);
-            if (!wrapper) why = "FFmpeg build lacks the V4L2 decoder for this codec";
+            if (!wrapper) why = "FFmpeg build lacks the hardware decoder for this codec";
         }
-        hw_backend = NULL;  // no hwdevice context: the wrapper talks to /dev/video* itself
+        hw_backend = NULL;  // no hwdevice context: the wrapper drives the device itself
         if (wrapper) {
             codec = wrapper;
-            d->choice.hardware_wrapper = 1;
-            copy_name(s->hw_backend, sizeof(s->hw_backend), "v4l2m2m");
-            // FFmpeg's default of 20 capture buffers fails to allocate (ENOMEM)
-            // above 4096x2304; 8 work up to 8K, and smaller frames can have more.
-            int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
-            av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
-            av_dict_set_int(&open_options, "num_output_buffers", 6, 0);
+            d->choice.hardware_wrapper = wrapper_kind;
+            copy_name(s->hw_backend, sizeof(s->hw_backend), suffix);
+            if (wrapper_kind == WRAPPER_V4L2) {
+                // FFmpeg's default of 20 capture buffers fails to allocate (ENOMEM)
+                // above 4096x2304; 8 work up to 8K, and smaller frames can have more.
+                int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
+                av_dict_set_int(&open_options, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
+                av_dict_set_int(&open_options, "num_output_buffers", 6, 0);
+            }
         } else if (!allow_software) {
             ret = AVERROR(ENOSYS);
             snprintf(s->error, sizeof(s->error), "%s", why);
@@ -856,7 +889,7 @@ static int open_codec_once(JVDecoder *d, const AVCodec *codec, AVStream *video) 
     d->ctx->opaque = &d->choice;
     d->ctx->get_format = choose_format;
     d->ctx->thread_count = 0;
-    if (d->choice.hardware_wrapper) {
+    if (d->choice.hardware_wrapper == WRAPPER_V4L2) {
         int64_t pixels = (int64_t)video->codecpar->width * video->codecpar->height;
         av_dict_set_int(&opts, "num_capture_buffers", pixels > 4096 * 2304 ? 8 : 12, 0);
         av_dict_set_int(&opts, "num_output_buffers", 6, 0);
@@ -954,7 +987,7 @@ int jv_decoder_seek(JVDecoder *d, double seconds) {
     int64_t ts = start + (int64_t)(seconds / av_q2d(video->time_base));
     int ret = av_seek_frame(d->media->format, d->media->video_stream, ts, AVSEEK_FLAG_BACKWARD);
     if (ret < 0) return ret;
-    if (d->choice.hardware_wrapper && d->fed) {
+    if (d->choice.hardware_wrapper == WRAPPER_V4L2 && d->fed) {
         // FFmpeg's V4L2 wrapper has no flush: after a seek it would keep
         // returning pictures from the old position, get fed mid-stream data
         // ("driver decode error"), and stall; drained at the end it can't

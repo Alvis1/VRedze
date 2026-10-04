@@ -22,6 +22,15 @@ export PKG_CONFIG_ALLOW_CROSS=1
 export "PKG_CONFIG_LIBDIR_$t=$media/lib/pkgconfig"
 export "PKG_CONFIG_PATH_$t="
 export JUST_VIDEO_STATIC_FFMPEG=1
+if [ "${1:-}" = --cli ]; then
+  # The command-line player (bench, info) to run over adb, e.g.
+  # adb push target/aarch64-linux-android/release/just-video /data/local/tmp/
+  shift
+  cargo build --release --target aarch64-linux-android --bin just-video "$@"
+  "$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/just-video
+  ls -l target/aarch64-linux-android/release/just-video
+  exit
+fi
 cargo rustc --release --lib --target aarch64-linux-android --crate-type cdylib "$@"
 "$TC/llvm-strip" --strip-debug target/aarch64-linux-android/release/libjust_video.so
 ls -l target/aarch64-linux-android/release/libjust_video.so

@@ -6,3 +6,9 @@ Patches applied to FFmpeg by `scripts/build-frame-media.sh` (Steam Frame build o
   Verified bit-exact with `checkasm --test=hevc_pel` (376/376) on the headset.
   Steam Frame: 4K60 HEVC Main10 142 → 178 fps; 8K60 unchanged (memory-latency bound).
   Upstream candidate.
+- `0002-v4l2m2m-bounded-capture-wait.patch`: `h264/hevc_v4l2m2m` waited for a
+  decoded picture with an unbounded `poll()`. On Steam Frame (iris) the decoding
+  thread could hang there for good (all capture buffers held, or the driver no
+  longer returning them after decode errors), so the decoder never closed and every
+  later video waited 10 s and fell back to the CPU. Now a 500 ms wait that returns
+  `AVERROR(EAGAIN)`, which callers already handle by sending more input.

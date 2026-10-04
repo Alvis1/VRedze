@@ -183,6 +183,8 @@ enum Hw {
     Vulkan,
     /// V4L2 stateful decoder (Steam Frame's Qualcomm iris).
     V4l2,
+    /// Android MediaCodec (Meta Quest).
+    Mediacodec,
     Vaapi,
     None,
 }
@@ -208,9 +210,11 @@ enum StereoArg {
 
 fn hw_backend(hw: Hw) -> Option<&'static str> {
     match hw {
+        Hw::Auto if cfg!(target_os = "android") => Some("mediacodec"),
         Hw::Auto if cfg!(all(target_os = "linux", target_arch = "aarch64")) => Some("v4l2m2m"),
         Hw::Auto | Hw::Vulkan => Some("vulkan"),
         Hw::V4l2 => Some("v4l2m2m"),
+        Hw::Mediacodec => Some("mediacodec"),
         Hw::Vaapi => Some("vaapi"),
         Hw::None => None,
     }

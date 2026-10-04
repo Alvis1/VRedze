@@ -36,11 +36,16 @@ fi
 
 [ -d "$src/dav1d-$DAV1D" ] || curl -sL "https://downloads.videolan.org/pub/videolan/dav1d/$DAV1D/dav1d-$DAV1D.tar.xz" | tar xJ -C "$src"
 [ -d "$src/zlib-$ZLIB" ] || curl -sfL "https://github.com/madler/zlib/releases/download/v$ZLIB/zlib-$ZLIB.tar.gz" | tar xz -C "$src"
-if [ ! -d "$src/ffmpeg-$FFMPEG" ]; then
-  curl -sL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz" | tar xJ -C "$src"
+# Re-extract when the patches change: a tree patched by an older set would
+# silently miss the new ones.
+stamp=$(cat "$PWD"/third_party/ffmpeg-patches/*.patch | shasum | cut -d' ' -f1)
+if [ "$(cat "$src/ffmpeg-$FFMPEG/.patches" 2>/dev/null)" != "$stamp" ]; then
+  rm -rf "$src/ffmpeg-$FFMPEG"
+  curl -sfL "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz" | tar xJ -C "$src"
   for patch in "$PWD"/third_party/ffmpeg-patches/*.patch; do
     patch -d "$src/ffmpeg-$FFMPEG" -p1 < "$patch"
   done
+  echo "$stamp" > "$src/ffmpeg-$FFMPEG/.patches"
 fi
 
 cat > "$deps/aarch64-cross.ini" <<INI

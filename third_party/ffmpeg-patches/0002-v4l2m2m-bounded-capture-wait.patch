@@ -1,0 +1,15 @@
+--- a/libavcodec/v4l2_m2m_dec.c	2026-10-04 10:01:22
++++ b/libavcodec/v4l2_m2m_dec.c	2026-10-04 10:01:22
+@@ -172,7 +172,11 @@
+     }
+ 
+ dequeue:
+-    return ff_v4l2_context_dequeue_frame(capture, frame, -1);
++    /* A bounded wait: with every capture buffer held by the caller, or a
++     * driver that stops returning them (e.g. after decode errors), an
++     * unbounded poll never returns and the decoding thread hangs for good.
++     * A timeout returns AVERROR(EAGAIN): the caller sends more input. */
++    return ff_v4l2_context_dequeue_frame(capture, frame, 500);
+ fail:
+     av_packet_unref(&s->buf_pkt);
+     return ret;

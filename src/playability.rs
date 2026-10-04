@@ -101,9 +101,48 @@ impl Platform {
                     )
                 })
             }
-            Self::Quest => Some(format!(
-                "this version of the player doesn't use the {name}'s hardware video decoder yet"
-            )),
+            // Mirrors mediacodec_unsuitable in native/media.c.
+            Self::Quest => {
+                if !matches!(v.codec.as_str(), "h264" | "hevc" | "vp9" | "av1") {
+                    return Some(format!(
+                        "{name}'s hardware video decoder doesn't support {}",
+                        codec_label(&v.codec)
+                    ));
+                }
+                // Quest 3 (media_codecs.xml): at most 138240 macroblocks per
+                // picture (8192x4320) and 7776000 per second (8K at 56 fps).
+                // 7680x7680 360° video is 1.7 times over: the decoder fails to start.
+                let blocks = v.width.div_ceil(16) as f64 * v.height.div_ceil(16) as f64;
+                if v.width > 8192 || v.height > 8192 || blocks > 138_240.0 {
+                    return Some(format!(
+                        "{name}'s hardware video decoder takes at most 8192x4320 pixels (or 5760x5760 for square 360° video), and this video is {}x{}",
+                        v.width, v.height
+                    ));
+                }
+                let fps = if v.fps > 0.0 { v.fps } else { 30.0 };
+                if blocks * fps > 7_776_000.0 {
+                    return Some(format!(
+                        "{name}'s hardware video decoder can't keep up with {}x{} at {:.0} fps",
+                        v.width, v.height, fps
+                    ));
+                }
+                let pix = v.pixel_format.as_deref().unwrap_or("");
+                if v.bit_depth != 8 || pix.contains("422") || pix.contains("444") {
+                    return Some(
+                        "this player hands the hardware decoder 8-bit 4:2:0 video only for now"
+                            .into(),
+                    );
+                }
+                if matches!(v.codec.as_str(), "h264" | "hevc")
+                    && v.profile.is_some()
+                    && !known_8bit_profile(v)
+                {
+                    return Some(
+                        "this player hands the hardware decoder 8-bit video only for now".into(),
+                    );
+                }
+                None
+            }
         }
     }
 
@@ -124,11 +163,13 @@ impl Platform {
                 _ => 0.8e9,
             }),
             Self::Desktop => None,
-            // Estimates for Quest 3 (XR2 Gen 2, Cortex-X3/A715 cores, a little
-            // below the Frame's): to be measured. Quest 2 is slower.
+            // Measured 2026-10-04 on Quest 3 (bundled FFmpeg 8.1.3): H.264
+            // 7680x7680 at 26 fps (1.55 Gpx/s); MV-HEVC, both views counted,
+            // 1080p at 99 and 4K at 28 pictures per second (~0.45 Gpx/s).
+            // Others are estimates. Quest 2 is slower.
             Self::Quest => Some(match v.codec.as_str() {
-                "hevc" => 1.1e9,
-                "h264" => 1.0e9,
+                "hevc" => 0.45e9,
+                "h264" => 1.5e9,
                 "av1" => 0.6e9,
                 "vp9" => 0.9e9,
                 _ => 0.6e9,
@@ -327,6 +368,31 @@ fn hint(platform: Platform, v: &VideoInfo) -> Option<String> {
             codec_label(&eight_bit.codec)
         ));
     }
+    // Quest: the largest size its hardware decoder takes, same shape.
+    let blocks = v.width.div_ceil(16) as f64 * v.height.div_ceil(16) as f64;
+    if platform == Platform::Quest && blocks > 138_240.0 {
+        // The largest common width that fits, the height in proportion.
+        let most = v.width as f64 * (138_240.0 / blocks).sqrt();
+        let width = [7680, 6144, 5760, 5120, 4096, 3840, 2880, 1920]
+            .into_iter()
+            .find(|&w| w as f64 <= most)
+            .unwrap_or(1920);
+        let height = ((v.height as f64 * width as f64 / v.width as f64 / 16.0).floor() * 16.0) as u32;
+        let smaller = VideoInfo {
+            width,
+            height,
+            bit_depth: 8,
+            codec: "hevc".into(),
+            profile: Some("Main".into()),
+            ..v.clone()
+        };
+        if platform.hardware_gap(&smaller).is_none() {
+            options.push(format!(
+                "an 8-bit HEVC version at {}x{}",
+                smaller.width, smaller.height
+            ));
+        }
+    }
     if v.width.max(v.height) > 4096 {
         let scale = 4096.0 / v.width.max(v.height) as f64;
         let smaller = VideoInfo {
@@ -454,6 +520,22 @@ mod tests {
         let mut mixed = video("hevc", 3840, 2160, 8, 30.0);
         mixed.profile = Some("Main 10".into());
         assert_ne!(frame(&mixed).verdict, Verdict::Hardware);
+    }
+
+    #[test]
+    fn quest_limits_and_hint() {
+        let mut v = video("h264", 7680, 7680, 8, 30.0);
+        v.profile = Some("Main".into());
+        v.pixel_format = Some("yuv420p".into());
+        let a = assess(Platform::Quest, Some(&v));
+        assert_ne!(a.verdict, Verdict::Hardware, "7680x7680 is over 138240 blocks");
+        assert!(a.hint.unwrap_or_default().contains("5760x5760"));
+        let mut fits = video("hevc", 8192, 4096, 8, 30.0);
+        fits.profile = Some("Main".into());
+        fits.pixel_format = Some("yuv420p".into());
+        assert_eq!(assess(Platform::Quest, Some(&fits)).verdict, Verdict::Hardware);
+        fits.fps = 60.0;
+        assert_ne!(assess(Platform::Quest, Some(&fits)).verdict, Verdict::Hardware);
     }
 
     #[test]
