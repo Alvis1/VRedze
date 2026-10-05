@@ -147,10 +147,27 @@ if [ "$entry" = new ] && [ "$vr" = 1 ]; then
     :
 elif [ "$RESTART_STEAM" = 1 ]; then
     echo "Restarting Steam to name the library entry VRedze and mark it as a VR app…"
-    steam -shutdown >/dev/null 2>&1 || true
+    # Steam reads shortcuts.vdf at startup and writes its own copy back on
+    # exit. On the Frame it runs as steam.service, which starts it again at
+    # once after `steam -shutdown` (before the file is changed): stop the
+    # unit, change the file while Steam is closed, then start it.
+    service=0
+    if systemctl --user is-active --quiet steam.service; then
+        service=1
+        systemctl --user stop steam.service
+    else
+        steam -shutdown >/dev/null 2>&1 || true
+    fi
     for _ in $(seq 60); do pgrep -x steam >/dev/null || break; sleep 1; done
-    shortcuts fix
-    echo "Done. Steam restarts on its own; if it doesn't, restart the headset."
+    if pgrep -x steam >/dev/null; then
+        echo "Steam didn't close; the library entry is unchanged." >&2
+    else
+        shortcuts fix
+    fi
+    if [ "$service" = 1 ]; then
+        systemctl --user start steam.service
+    fi
+    echo "Done. If Steam doesn't come back, restart the headset."
 elif [ "$entry" = old ]; then
     echo "Note: the library entry is called Just Video until Steam restarts. Run again"
     echo "      with FRAME_RESTART_STEAM=1 to rename it (restarts Steam)."
