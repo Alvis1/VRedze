@@ -117,6 +117,16 @@ fn check_name(name: &str) -> anyhow::Result<()> {
 /// Symlinks are followed; entries that can't be read are left out.
 pub fn list(share: &str, path: &[String]) -> anyhow::Result<Vec<Entry>> {
     let dir = resolve(share, path)?;
+    // Without the permission Android shows every folder as empty: say so
+    // (and ask again) instead of listing nothing.
+    #[cfg(all(target_os = "android", feature = "decode"))]
+    if crate::android::video_permission(false) == Some(false) {
+        crate::android::video_permission(true);
+        bail!(
+            "VRedze may not read the videos on this headset yet. Allow it when asked \
+             (or in Settings, under VRedze's app permissions), then open the folder again."
+        );
+    }
     let mut entries = Vec::new();
     for entry in fs::read_dir(&dir).with_context(|| format!("Can't open {}", dir.display()))? {
         let Ok(entry) = entry else { continue };

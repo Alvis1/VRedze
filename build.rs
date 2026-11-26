@@ -1,8 +1,9 @@
-/// Compiles the WGSL video shader to SPIR-V (pure Rust, works when cross-compiling).
-fn compile_shader() {
-    let source_path = "src/xr/video.wgsl";
+/// Compiles a WGSL shader (`src/xr/<name>.wgsl`) to SPIR-V in OUT_DIR
+/// (pure Rust, works when cross-compiling).
+fn compile_shader(name: &str) {
+    let source_path = format!("src/xr/{name}.wgsl");
     println!("cargo:rerun-if-changed={source_path}");
-    let source = std::fs::read_to_string(source_path).unwrap();
+    let source = std::fs::read_to_string(&source_path).unwrap();
     let module = naga::front::wgsl::parse_str(&source)
         .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
     let info = naga::valid::Validator::new(
@@ -21,7 +22,7 @@ fn compile_shader() {
         .flags
         .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
     let words = naga::back::spv::write_vec(&module, &info, &options, None).unwrap();
-    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join("video.spv");
+    let out = std::path::Path::new(&std::env::var("OUT_DIR").unwrap()).join(format!("{name}.spv"));
     std::fs::write(
         out,
         words
@@ -73,12 +74,14 @@ fn build_id() -> String {
 
 fn main() {
     println!("cargo:rustc-env=VREDZE_BUILD={}", build_id());
-    compile_shader();
+    compile_shader("video");
+    compile_shader("overlay");
     for source in [
         "native/decode.c",
         "native/decode.h",
         "native/media.c",
         "native/media.h",
+        "native/android.c",
     ] {
         println!("cargo:rerun-if-changed={source}");
     }
@@ -90,6 +93,10 @@ fn main() {
         .file("native/decode.c")
         .file("native/media.c")
         .flag_if_supported("-std=c11");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // The storage permission, asked for through JNI (src/android.rs).
+        build.file("native/android.c");
+    }
     println!("cargo:rerun-if-env-changed=VREDZE_STATIC_FFMPEG");
     // The Steam Frame build bundles its own FFmpeg + dav1d (scripts/build-frame-media.sh).
     let statik = std::env::var_os("VREDZE_STATIC_FFMPEG").is_some();

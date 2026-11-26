@@ -19,9 +19,9 @@ the Quest, `VRedze` for the Steam Frame.
    headset.
 3. Drag `VRedze.apk` into [SideQuest](https://sidequestvr.com).
 
-VRedze is under **Unknown Sources** in the app library. If your videos don't
-show up, allow VRedze to access files in the Quest's settings, under app
-permissions.
+VRedze is under **Unknown Sources** in the app library. On its first start it
+asks to read the videos on the headset: allow it. If you said no, allow it in
+the Quest's settings, under VRedze's app permissions.
 
 ### Steam Frame
 

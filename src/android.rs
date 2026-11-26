@@ -45,6 +45,12 @@ fn android_main(app: AndroidApp) {
     );
     // Let the activity finish starting before the (slower) XR setup.
     app.poll_events(Some(Duration::ZERO), |_| {});
+    // Ask for the videos on the headset now, while nothing else is on screen.
+    match video_permission(true) {
+        Some(true) => eprintln!("Storage: may read videos"),
+        Some(false) => eprintln!("Storage: asking for permission to read videos"),
+        None => eprintln!("Storage: can't check the permission to read videos"),
+    }
 
     let quit = Arc::new(AtomicBool::new(false));
     let destroyed = quit.clone();
@@ -94,6 +100,30 @@ fn android_main(app: AndroidApp) {
     // activity: the app then never opens again. End the process instead, so
     // every launch starts fresh (settings and resume points are written).
     exit_soon();
+}
+
+/// Whether the app may read videos in shared storage (Movies, Download, …),
+/// `None` if that can't be found out. Android grants this at runtime only:
+/// an install through SideQuest (unlike `adb install -g`) leaves it off, and
+/// the folders then look empty. With `ask`, a missing permission brings up
+/// the system dialog; the answer counts from the next call. Android stops
+/// showing the dialog after the user turns it down twice.
+pub fn video_permission(ask: bool) -> Option<bool> {
+    unsafe extern "C" {
+        fn vz_video_permission(
+            vm: *mut std::ffi::c_void,
+            activity: *mut std::ffi::c_void,
+            ask: i32,
+        ) -> i32;
+    }
+    let android = &crate::platform::get().android;
+    // SAFETY: the process's JavaVM and the activity's global reference (see
+    // `platform::Android`); the shim attaches this thread when it isn't.
+    match unsafe { vz_video_permission(android.vm, android.activity, ask.into()) } {
+        1 => Some(true),
+        0 => Some(false),
+        _ => None,
+    }
 }
 
 /// Ends the process after giving the logcat thread a moment to pass on the

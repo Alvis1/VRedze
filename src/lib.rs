@@ -2,7 +2,7 @@
 //! headset's own storage or directly from SMB shares. Forked from Just Video.
 
 #[cfg(all(target_os = "android", feature = "decode"))]
-mod android;
+pub mod android;
 #[cfg(feature = "decode")]
 pub mod audio;
 pub mod config;
