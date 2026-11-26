@@ -41,6 +41,8 @@ impl XrContext {
             // Aim and pinch with bare hands (Quest), besides controllers.
             extensions.ext_hand_interaction = available.ext_hand_interaction;
         }
+        // Hand joints, to draw bare hands (the runtime doesn't draw them).
+        extensions.ext_hand_tracking = available.ext_hand_tracking;
         let names: Vec<String> = available
             .other
             .iter()

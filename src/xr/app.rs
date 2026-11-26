@@ -3,6 +3,7 @@
 
 use super::context::{VIEW_TYPE, XrContext};
 use super::input::{Input, InputState, Ray};
+use super::overlay::{self, Overlay};
 use super::player::{Placement, PlayOptions, PlayStats, Playback, ViewOptions, eye_params};
 use super::renderer::{QuadTarget, Renderer};
 use crate::config::LoopMode;
@@ -651,6 +652,10 @@ pub fn run(
     let mut ctx = XrContext::new()?;
     let mut renderer = Renderer::new(&ctx)?;
     let mut input = Input::new(&ctx)?;
+    // Hands and controllers: the player works without them if this fails.
+    let mut overlay = Overlay::new(&ctx)
+        .map_err(|e| eprintln!("Hands and controllers won't be drawn: {e:#}"))
+        .ok();
     let heartbeat = Arc::new(AtomicI64::new(0));
     let phase = Arc::new(AtomicU8::new(0));
     let loop_started = Instant::now();
@@ -1520,6 +1525,51 @@ pub fn run(
             }
         }
 
+        // Hands, controllers and beams, while there is a panel to point at:
+        // not over a video being watched (where the extra full-size layer
+        // would also cost the bandwidth an 8K video needs).
+        let pointable: Vec<Panel> = match &mode {
+            Mode::Browser => vec![BROWSER_PANEL],
+            Mode::Playing(_) => controls_panel_at
+                .iter()
+                .flat_map(|bar| [Some(*bar), dialog.is_some().then(|| dialog_panel(bar))])
+                .flatten()
+                .collect(),
+        };
+        let mut capsules = Vec::new();
+        if !pointable.is_empty() {
+            for (controller, joints) in buttons.controllers.iter().zip(&buttons.hand_joints) {
+                if let Some(grip) = controller {
+                    capsules.extend(overlay::controller(*grip));
+                } else if let Some(joints) = joints {
+                    capsules.extend(overlay::hand(joints));
+                }
+            }
+            // Beams after the hands: they are see-through.
+            for (hand, r) in buttons.rays.iter().enumerate() {
+                let Some(r) = r else { continue };
+                let hit = pointable
+                    .iter()
+                    .filter_map(|p| p.hit_at(r))
+                    .map(|(_, _, t)| t)
+                    .reduce(f32::min);
+                capsules.extend(overlay::beam(r, hit, hand == active_hand));
+            }
+        }
+        let mut overlay_drawn = false;
+        if let Some(o) = overlay.as_mut()
+            && !capsules.is_empty()
+            && view_flags.contains(xr::ViewStateFlags::ORIENTATION_VALID)
+        {
+            match o.draw(&views, &capsules) {
+                Ok(()) => overlay_drawn = true,
+                Err(e) => {
+                    eprintln!("Hands and controllers no longer drawn: {e:#}");
+                    overlay = None;
+                }
+            }
+        }
+
         // Quad layers to show this frame: (target, pose, size, blend).
         let mut quads: Vec<(&QuadTarget, xr::Posef, [f32; 2], bool)> = Vec::new();
         match &mode {
@@ -1620,12 +1670,28 @@ pub fn run(
             .iter()
             .map(|(target, pose, size, blend)| quad_layer(&space, target, *pose, *size, *blend))
             .collect();
+        let overlay_poses: Vec<(xr::Posef, xr::Fovf)> = views
+            .iter()
+            .map(|view| (valid_pose(view.pose), view.fov))
+            .collect();
+        let overlay_views = match &overlay {
+            Some(o) if overlay_drawn => o.projection_views(&overlay_poses),
+            _ => Vec::new(),
+        };
+        let overlay_layer = xr::CompositionLayerProjection::new()
+            .space(&space)
+            .layer_flags(xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA)
+            .views(&overlay_views);
         let mut layers: Vec<&xr::CompositionLayerBase<xr::Vulkan>> = Vec::new();
         if !projection_views.is_empty() {
             layers.push(&projection);
         }
         for quad in &quad_layers {
             layers.push(&**quad);
+        }
+        // Last, so hands stay in front of the panels they point at.
+        if !overlay_views.is_empty() {
+            layers.push(&overlay_layer);
         }
         match ctx
             .frame_stream
@@ -1657,6 +1723,7 @@ pub fn run(
         stats.skipped_frames += playback.stats.skipped_frames;
         stats.media_seconds = playback.stats.media_seconds;
     }
+    drop(overlay);
     drop(renderer);
     Ok(stats)
 }

@@ -3,6 +3,7 @@
 pub mod app;
 pub mod context;
 pub mod input;
+pub mod overlay;
 pub mod player;
 pub mod renderer;
 pub mod runtime;

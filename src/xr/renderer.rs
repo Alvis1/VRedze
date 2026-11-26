@@ -106,7 +106,7 @@ pub struct Renderer {
     pub eyes: Vec<EyeTarget>,
 }
 
-fn find_memory(
+pub(super) fn find_memory(
     props: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
     wanted: vk::MemoryPropertyFlags,

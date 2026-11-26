@@ -31,6 +31,10 @@ pub struct InputState {
     pub scroll: f32,
     /// Per hand: tracked as a bare hand (aim and pinch), not a controller.
     pub bare_hands: [bool; 2],
+    /// Per hand: where the controller is held (its grip pose), to draw it.
+    pub controllers: [Option<xr::Posef>; 2],
+    /// Per hand: the joints of a tracked bare hand, to draw it.
+    pub hand_joints: [Option<xr::HandJointLocations>; 2],
 }
 
 pub struct Input {
@@ -43,8 +47,13 @@ pub struct Input {
     seek_back: xr::Action<bool>,
     seek_forward: xr::Action<bool>,
     scroll: xr::Action<xr::Vector2f>,
+    /// The grip pose: where a controller is, for drawing it.
+    controller: xr::Action<xr::Posef>,
     hands: [xr::Path; 2],
     spaces: [xr::Space; 2],
+    controller_spaces: [xr::Space; 2],
+    /// Joint trackers for bare hands (XR_EXT_hand_tracking), when available.
+    hand_trackers: Option<[xr::HandTracker; 2]>,
     /// Per hand: a sideways stick flick must return to centre before the next.
     flick_ready: [bool; 2],
     /// Per hand: origin and direction filters.
@@ -105,7 +114,7 @@ impl OneEuro {
     }
 }
 
-fn rotate(q: xr::Quaternionf, v: [f32; 3]) -> [f32; 3] {
+pub(super) fn rotate(q: xr::Quaternionf, v: [f32; 3]) -> [f32; 3] {
     // v' = v + 2w(q×v) + 2 q×(q×v)
     let (qx, qy, qz, w) = (q.x, q.y, q.z, q.w);
     let t = [
@@ -137,6 +146,7 @@ impl Input {
         let seek_forward =
             set.create_action::<bool>("seek_forward", "Forward 5 seconds", &hands)?;
         let scroll = set.create_action::<xr::Vector2f>("scroll", "Scroll", &hands)?;
+        let controller = set.create_action::<xr::Posef>("controller", "Controller", &hands)?;
 
         let binding = |action: &str, path: xr::Path| match action {
             "aim" => xr::Binding::new(&aim, path),
@@ -146,6 +156,7 @@ impl Input {
             "grip" => xr::Binding::new(&grip, path),
             "seek_back" => xr::Binding::new(&seek_back, path),
             "seek_forward" => xr::Binding::new(&seek_forward, path),
+            "controller" => xr::Binding::new(&controller, path),
             _ => xr::Binding::new(&scroll, path),
         };
         // Suggests every binding the runtime accepts for `profile` (each is
@@ -194,6 +205,7 @@ impl Input {
         // Steam Frame controllers: A/B on the right, a D-pad on the left.
         let frame = [
             ("aim", "aim/pose"),
+            ("controller", "grip/pose"),
             ("select", "trigger/click"),
             ("select", "trigger/value"),
             ("select", "right:a/click"),
@@ -220,6 +232,7 @@ impl Input {
         if cfg!(target_os = "android") {
             let touch = [
                 ("aim", "aim/pose"),
+                ("controller", "grip/pose"),
                 ("select", "trigger/value"),
                 ("select", "right:a/click"),
                 ("back", "right:b/click"),
@@ -254,6 +267,7 @@ impl Input {
         // the right: the D-pad must not stop the video.
         let index = [
             ("aim", "aim/pose"),
+            ("controller", "grip/pose"),
             ("select", "trigger/click"),
             ("select", "trigger/value"),
             ("select", "right:a/click"),
@@ -275,6 +289,7 @@ impl Input {
             "/interaction_profiles/khr/simple_controller",
             &[
                 ("aim", "aim/pose"),
+                ("controller", "grip/pose"),
                 ("select", "select/click"),
                 ("back", "menu/click"),
             ],
@@ -285,6 +300,32 @@ impl Input {
             aim.create_space(&ctx.session, hands[0], xr::Posef::IDENTITY)?,
             aim.create_space(&ctx.session, hands[1], xr::Posef::IDENTITY)?,
         ];
+        let controller_spaces = [
+            controller.create_space(&ctx.session, hands[0], xr::Posef::IDENTITY)?,
+            controller.create_space(&ctx.session, hands[1], xr::Posef::IDENTITY)?,
+        ];
+        let hand_trackers = if xr_.supports_hand_tracking(ctx.system).unwrap_or(false) {
+            match (
+                ctx.session.create_hand_tracker(xr::Hand::LEFT),
+                ctx.session.create_hand_tracker(xr::Hand::RIGHT),
+            ) {
+                (Ok(left), Ok(right)) => Some([left, right]),
+                (Err(e), _) | (_, Err(e)) => {
+                    eprintln!("Input: no hand joints: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        eprintln!(
+            "Input: hands are {}",
+            if hand_trackers.is_some() {
+                "drawn from their joints"
+            } else {
+                "not tracked"
+            }
+        );
         Ok(Self {
             set,
             aim,
@@ -295,8 +336,11 @@ impl Input {
             seek_back,
             seek_forward,
             scroll,
+            controller,
             hands,
             spaces,
+            controller_spaces,
+            hand_trackers,
             flick_ready: [true; 2],
             // Direction: unit vector (rad/s-ish speeds); origin: metres.
             filters: [[OneEuro::new(3.0, 6.0), OneEuro::new(1.5, 0.6)]; 2],
@@ -325,6 +369,24 @@ impl Input {
             for (i, &hand) in self.hands.iter().enumerate() {
                 state.bare_hands[i] =
                     ctx.session.current_interaction_profile(hand).ok() == Some(profile);
+            }
+        }
+        // What to draw: a controller where one is held, else the bare hand.
+        // Also with bare hands off (they still show, they just do nothing).
+        for (i, &hand) in self.hands.iter().enumerate() {
+            if !state.bare_hands[i] && self.controller.is_active(&ctx.session, hand)? {
+                let location = self.controller_spaces[i].locate(space, time)?;
+                let flags = location.location_flags;
+                if flags.contains(xr::SpaceLocationFlags::POSITION_VALID)
+                    && flags.contains(xr::SpaceLocationFlags::ORIENTATION_VALID)
+                {
+                    state.controllers[i] = Some(location.pose);
+                    continue;
+                }
+            }
+            if let Some(trackers) = &self.hand_trackers {
+                // A tracking hiccup only hides the hand for a frame.
+                state.hand_joints[i] = space.locate_hand_joints(&trackers[i], time).ok().flatten();
             }
         }
         let pressed = |action: &xr::Action<bool>, hand: xr::Path| -> anyhow::Result<bool> {
