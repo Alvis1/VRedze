@@ -1,6 +1,6 @@
 [package]
 name = "vredze"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 publish = false
 description = "VRedze: VR video player for Steam Frame and Meta Quest"
